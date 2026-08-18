@@ -109,6 +109,15 @@ STATE_FIELD_BY_CHANNEL: Final[dict[str, str]] = {
     "S": "state_S",
 }
 
+# Card templates are identified by stable template names, never by ordinal.
+CARD_TEMPLATE_NAMES: Final[tuple[str, ...]] = ("R", "L", "W", "S")
+CHANNEL_BY_TEMPLATE_NAME: Final[dict[str, str]] = {
+    "R": "R",
+    "L": "L",
+    "W": "W",
+    "S": "S",
+}
+
 DEFAULT_TARGET_FIELD: Final[str] = "Target_R"
 
 TARGET_FIELDS_REQUIRING_JUSTIFICATION: Final[tuple[str, ...]] = (
@@ -152,6 +161,8 @@ FORGE_CONTEXT_COUNT: Final[int] = 5
 CTX_MUST_CONTAIN_LEMMA: Final[bool] = True
 CTX_MUST_BE_PAIRWISE_DISTINCT: Final[bool] = True
 CTX_MAX_SOURCE_TOKEN_OVERLAP: Final[float] = 0.60
+CTX_OVERLAP_EXCLUDES_UNIT_TOKENS: Final[bool] = True
+CTX_MIN_TOKENS: Final[int] = 8
 
 # "Different topic" remains a FORGE prompt requirement; it is intentionally
 # not claimed as a deterministic validator invariant.
@@ -187,6 +198,7 @@ EVENT_TYPES: Final[tuple[str, ...]] = (
 EVENT_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
     "v",
     "ts",
+    "day",
     "event",
     "unit_key",
     "payload",
@@ -202,8 +214,15 @@ MODEL_METADATA_FIELDS: Final[tuple[str, ...]] = (
     "model_version",
 )
 
-# ts must be ISO 8601 with an explicit UTC offset, never naive local time.
-EVENT_TIMESTAMP_REQUIRES_OFFSET: Final[bool] = True
+# Event time has two separate meanings:
+# - ts: one globally comparable instant, always normalized to UTC (+00:00)
+# - day: the local calendar day used for daily reports
+EVENT_TIMESTAMP_UTC_OFFSET: Final[str] = "+00:00"
+EVENT_LOCAL_TIMEZONE: Final[str] = "Asia/Ho_Chi_Minh"
+EVENT_DAY_FORMAT: Final[str] = "%Y-%m-%d"
+
+# STATE events are channel-scoped; aggregate state is never persisted.
+STATE_EVENT_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = ("channel",)
 
 
 # ============================================================
@@ -216,6 +235,10 @@ STATE_STABLE: Final[str] = "STABLE"
 STATE_MASTERED: Final[str] = "MASTERED"
 STATE_DORMANT: Final[str] = "DORMANT"
 STATE_RELAPSE: Final[str] = "RELAPSE"
+
+# Diagnostic sentinel returned by derived_state() for corrupted active-channel
+# data. UNKNOWN is deliberately NOT a lifecycle state and has no transitions.
+STATE_UNKNOWN: Final[str] = "UNKNOWN"
 
 STATES: Final[tuple[str, ...]] = (
     STATE_NEW,
@@ -295,17 +318,8 @@ STATE_TRANSITIONS: Final[tuple[tuple[str, str], ...]] = (
     TRANSITION_MASTERED_TO_RELAPSE,
 )
 
-# Leech is intentionally not a wildcard transition. LEARNING->LEARNING is a
-# no-op and must not emit repeated STATE events.
-LEECH_SOURCE_STATES: Final[tuple[str, ...]] = (
-    STATE_STABLE,
-    STATE_MASTERED,
-)
-LEECH_TARGET_STATE: Final[str] = STATE_LEARNING
-EMIT_STATE_EVENT_ON_NOOP: Final[bool] = False
-
-# Reactivation is channel-specific. UnitProgress therefore carries
-# failed_channels explicitly.
+# Leech is a note-level rescue signal from Anki, not a lifecycle transition.
+# Degradation is represented by explicit per-channel state transitions above.
 RELAPSE_REACTIVATE_FAILED_CHANNEL_ONLY: Final[bool] = True
 
 # Unit-level dormancy is only valid once every enabled channel has reached

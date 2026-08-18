@@ -15,7 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .contracts import DERIVED_STATE_PRIORITY, UNIT_KEY_SEPARATOR
+from .contracts import (
+    DERIVED_STATE_PRIORITY,
+    STATE_UNKNOWN,
+    STATES,
+    UNIT_KEY_SEPARATOR,
+)
 
 
 # ============================================================
@@ -86,9 +91,9 @@ class VocabUnit:
     audio_3: str = ""
     VisualCue: str = ""
 
-    # Per-channel lifecycle state.
-    # R is the default enabled channel; inactive channels stay empty.
-    state_R: str = "NEW"
+    # Per-channel lifecycle state. A channel is disabled when its Target_* and
+    # state_* are both empty. FORGE enables a channel by setting both together.
+    state_R: str = ""
     state_L: str = ""
     state_W: str = ""
     state_S: str = ""
@@ -174,12 +179,16 @@ class VocabUnit:
         if not active_states:
             return ""
 
+        if any(state not in STATES for state in active_states):
+            return STATE_UNKNOWN
+
         for candidate in DERIVED_STATE_PRIORITY:
             if candidate in active_states:
                 return candidate
 
-        # Unknown states are intentionally not guessed into a valid state.
-        return ""
+        # Defensive fail-closed fallback. With valid contracts this branch is
+        # unreachable because DERIVED_STATE_PRIORITY covers every lifecycle state.
+        return STATE_UNKNOWN
 
     def to_note_fields(self) -> dict[str, str]:
         """
@@ -231,6 +240,7 @@ class Event:
 
     v: int
     ts: str
+    day: str
     event: str
     unit_key: str
     payload: dict[str, Any] = field(default_factory=dict)
@@ -239,6 +249,7 @@ class Event:
         return {
             "v": self.v,
             "ts": self.ts,
+            "day": self.day,
             "event": self.event,
             "unit_key": self.unit_key,
             "payload": dict(self.payload),
@@ -319,10 +330,11 @@ class ForgeRejection:
 @dataclass(frozen=True, slots=True)
 class ChannelProgress:
     """
-    Observed review state for one enabled target channel.
+    Observed review/assessment state for one enabled target channel.
 
-    It contains enough information for reconcile.py to evaluate the STABLE
-    gate without smuggling policy into the caller.
+    Data that gates a per-channel transition lives at the same per-channel
+    level. This keeps one channel's evidence from promoting or degrading a
+    different channel.
     """
 
     channel: str
@@ -331,29 +343,26 @@ class ChannelProgress:
     lapses_last_30_days: int
     age_days: int
 
-
-@dataclass(frozen=True, slots=True)
-class UnitProgress:
-    """
-    Snapshot consumed by reconciliation logic.
-
-    No transition is performed here. failed_channels makes selective relapse
-    reactivation implementable.
-    """
-
-    unit_key: str
-    channels: tuple[ChannelProgress, ...] = ()
-
-    failed_channels: tuple[str, ...] = ()
-
     session_passes_consecutive: int = 0
     last_session_date: str = ""
     last_session_result: str = "NONE"  # PASS | FAIL | NONE
 
-    days_all_active_channels_mastered: int = 0
-
     encountered_and_failed: bool = False
     corpus_misuse_detected: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class UnitProgress:
+    """
+    Unit-level snapshot consumed by reconciliation logic.
+
+    Per-channel transition gates live in ChannelProgress. Selective failed
+    channels are a reconciliation result, not duplicated as an input field.
+    """
+
+    unit_key: str
+    channels: tuple[ChannelProgress, ...] = ()
+    days_all_active_channels_mastered: int = 0
     has_leech_tag: bool = False
 
 

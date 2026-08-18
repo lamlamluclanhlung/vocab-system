@@ -1,3 +1,9 @@
+# Vocabulary Learning System — Historical Design Narrative (Non-Normative)
+
+> **Source precedence:** machine-checkable invariants in `vocab/contracts.py` and `vocab/models.py` come first; accepted decisions in `DECISIONS.md` come second. This document preserves design history, lane guidance, build order, and earlier proposals. When it conflicts with those normative sources, it does **not** override them.
+
+---
+
 Trước khi vào từng bước, có một thứ phải nói vì nó quyết định toàn bộ cách bạn dùng Codex ở dự án này.
 
 # §0 — Một quy tắc
