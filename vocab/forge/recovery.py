@@ -94,13 +94,19 @@ def abandon_intent(
         )
 
     note_ids = tuple(anki.find_notes(unit_key_query(state.unit_key)))
-    if note_ids:
+    if len(note_ids) == 1:
+        return RepairResult(
+            status=RepairStatus.NOTE_EXISTS,
+            forge_attempt_id=forge_attempt_id,
+            unit_key=state.unit_key,
+            note_id=note_ids[0],
+        )
+    if len(note_ids) > 1:
         return RepairResult(
             status=RepairStatus.AMBIGUOUS,
             forge_attempt_id=forge_attempt_id,
             unit_key=state.unit_key,
-            note_id=note_ids[0] if len(note_ids) == 1 else None,
-            ambiguous_note_ids=note_ids if len(note_ids) > 1 else (),
+            ambiguous_note_ids=note_ids,
         )
 
     event_log.log(
