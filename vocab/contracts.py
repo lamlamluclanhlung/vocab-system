@@ -119,6 +119,7 @@ CHANNEL_BY_TEMPLATE_NAME: Final[dict[str, str]] = {
 }
 
 DEFAULT_TARGET_FIELD: Final[str] = "Target_R"
+TARGET_FLAG_VALUE: Final[str] = "1"
 
 TARGET_FIELDS_REQUIRING_JUSTIFICATION: Final[tuple[str, ...]] = (
     "Target_W",
@@ -127,6 +128,15 @@ TARGET_FIELDS_REQUIRING_JUSTIFICATION: Final[tuple[str, ...]] = (
 
 CONTEXT_FIELDS: Final[tuple[str, ...]] = (
     "Ctx_1",
+    "Ctx_2",
+    "Ctx_3",
+    "Ctx_4",
+    "Ctx_5",
+)
+
+ANKI_REVIEW_CONTEXT_FIELD: Final[str] = "Ctx_1"
+
+NOVEL_CONTEXT_FIELDS: Final[tuple[str, ...]] = (
     "Ctx_2",
     "Ctx_3",
     "Ctx_4",
@@ -339,6 +349,8 @@ DORMANT_PRESERVE_REVLOG: Final[bool] = True
 # ============================================================
 # 8. ANKI CONTRACT
 # ============================================================
+ANKI_NOTE_TYPE_NAME: Final[str] = "VocabularyUnit"
+ANKI_SORT_FIELD: Final[str] = "unit_key"
 
 ANKI_LEECH_THRESHOLD: Final[int] = 4
 ANKI_LEECH_ACTION: Final[str] = "tag_only"

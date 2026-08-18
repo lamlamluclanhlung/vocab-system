@@ -66,3 +66,21 @@ If any enabled channel has an empty or unrecognized lifecycle state, `VocabUnit.
 Data that gates a per-channel transition must live at the per-channel level. Therefore session evidence, encounter failure, and corpus misuse are represented in `ChannelProgress`, not `UnitProgress`.
 
 Unit-level data is reserved for genuinely Unit-level facts such as the note-level leech tag and timing that requires all active channels to be mastered.
+
+## D15 — Stable context in normal FSRS review
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Blocks:** T3, T8, T12
+
+Normal Anki/FSRS review uses one stable context field:
+
+- `Ctx_1` is the fixed context used during normal card review.
+- `Ctx_2` through `Ctx_5` are reserved for novel-context/generalization assessment.
+- Normal Anki card templates must not randomly rotate among `Ctx_1..Ctx_5`.
+
+**Reason:** FSRS review should primarily measure memory under a stable stimulus. Randomly changing context can change item difficulty and introduce variance that is unrelated to memory strength.
+
+Generalization is measured separately using contexts that were not used in normal review. This also preserves a pool of novel contexts for Reading and productive-language checkpoints.
+
+Surface variability may be introduced in explicit assessment sessions, but it is not mixed into the normal FSRS scheduling loop.

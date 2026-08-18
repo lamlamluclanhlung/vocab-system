@@ -12,6 +12,11 @@ from vocab.contracts import (
     STATE_UNKNOWN,
     UNIT_KEY_PATTERN,
     UNIT_KEY_SEPARATOR,
+    ANKI_NOTE_TYPE_NAME,
+    ANKI_REVIEW_CONTEXT_FIELD,
+    ANKI_SORT_FIELD,
+    NOVEL_CONTEXT_FIELDS,
+    TARGET_FLAG_VALUE,
 )
 from vocab.models import ChannelProgress, ForgeCandidate, UnitProgress, VocabUnit
 
@@ -180,3 +185,14 @@ def test_per_channel_transition_gate_data_lives_on_channel_progress() -> None:
     assert per_channel_gate_fields.issubset(channel_field_names)
     assert per_channel_gate_fields.isdisjoint(unit_field_names)
     assert "failed_channels" not in unit_field_names
+
+def test_anki_note_type_contract_is_stable() -> None:
+    assert ANKI_NOTE_TYPE_NAME == "VocabularyUnit"
+    assert ANKI_SORT_FIELD == "unit_key"
+    assert TARGET_FLAG_VALUE == "1"
+
+
+def test_normal_review_context_is_separate_from_novel_context_pool() -> None:
+    assert ANKI_REVIEW_CONTEXT_FIELD == "Ctx_1"
+    assert NOVEL_CONTEXT_FIELDS == ("Ctx_2", "Ctx_3", "Ctx_4", "Ctx_5")
+    assert ANKI_REVIEW_CONTEXT_FIELD not in NOVEL_CONTEXT_FIELDS
