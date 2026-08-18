@@ -14,11 +14,13 @@ from .contracts import (
     CHANNELS,
     EVENT_DAY_FORMAT,
     EVENT_LOCAL_TIMEZONE,
+    EVENT_PAYLOAD_REQUIRED_FIELDS,
     EVENT_REQUIRED_FIELDS,
     EVENT_SCHEMA_VERSION,
     EVENT_TYPES,
     EVENTS_REQUIRING_MODEL_METADATA,
     MODEL_METADATA_FIELDS,
+    RESERVED_EVENT_TYPES,
 )
 from .models import Event
 
@@ -101,6 +103,12 @@ def _validate_event_values(event: str, unit_key: str, payload: dict[str, Any]) -
         if channel not in CHANNELS:
             raise ValueError(f"STATE payload channel must be one of {CHANNELS}")
 
+    for field_name in EVENT_PAYLOAD_REQUIRED_FIELDS[event]:
+        if field_name not in payload:
+            raise ValueError(
+                f"{event} payload missing required field {field_name!r}"
+            )
+
 
 def _decode_v1_event(record: dict[str, Any], *, location: str) -> Event:
     """Decode and validate the version 1 event envelope."""
@@ -182,6 +190,8 @@ class EventLog:
     def log(self, event: str, unit_key: str, payload: dict[str, Any]) -> Event:
         """Validate, construct, and append one complete event record."""
         _validate_event_values(event, unit_key, payload)
+        if event in RESERVED_EVENT_TYPES:
+            raise ValueError(f"event type {event!r} is reserved for emission")
 
         instant = _now_utc()
         if instant.tzinfo is None or instant.utcoffset() is None:
@@ -198,7 +208,11 @@ class EventLog:
 
         # Serialize before opening for append so encoding/type failures cannot
         # leave a partial prefix in the log.
-        line = json.dumps(stored_event.to_dict(), ensure_ascii=False)
+        line = json.dumps(
+            stored_event.to_dict(),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
         self._validate_trailing_record_for_append()
         with self.path.open("a", encoding="utf-8", newline="") as handle:
             handle.write(line + "\n")
