@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any
 
 from .card_contract import (
@@ -104,7 +105,6 @@ _INLINE_HANDLER_RE = re.compile(
     r"<[^>]*(?:\s|/)+on[a-z][a-z0-9_:-]*\s*=",
     re.IGNORECASE | re.DOTALL,
 )
-_JAVASCRIPT_URL_RE = re.compile(r"\bjavascript\s*:", re.IGNORECASE)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _STYLE_BLOCK_RE = re.compile(
     r"<\s*style\b[^>]*>.*?<\s*/\s*style\s*>",
@@ -159,6 +159,31 @@ _NON_CONTENT_HTML_TAGS = frozenset(
         "ul",
     }
 )
+
+_URL_ATTRIBUTES = frozenset(
+    {"href", "src", "action", "formaction", "xlink:href"}
+)
+
+
+class _JavascriptURLAttributeParser(HTMLParser):
+    """Detect javascript: schemes only in selected HTML URL attributes."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.found = False
+
+    def handle_starttag(
+        self,
+        _tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        for name, value in attrs:
+            if name.casefold() not in _URL_ATTRIBUTES or value is None:
+                continue
+            normalized = html.unescape(value).lstrip().casefold()
+            if normalized.startswith("javascript:"):
+                self.found = True
+                return
 
 
 def parse_mustache(template: str) -> ParsedMustache:
@@ -347,7 +372,15 @@ def verify_model_snapshot(snapshot: object) -> tuple[AnkiTemplateViolation, ...]
             continue
         _verify_template_semantics(matching[0], violations)
 
-    if "req" in snapshot:
+    if "req" not in snapshot:
+        violations.append(
+            AnkiTemplateViolation(
+                "MODEL_REQ_MALFORMED",
+                "model.req",
+                "req metadata is required in a rich model snapshot",
+            )
+        )
+    else:
         _verify_requirements(
             snapshot["req"],
             templates,
@@ -644,7 +677,7 @@ def _verify_javascript(
                 "inline event-handler attributes are forbidden",
             )
         )
-    if _JAVASCRIPT_URL_RE.search(template):
+    if _contains_javascript_url(template):
         violations.append(
             AnkiTemplateViolation(
                 "TEMPLATE_JAVASCRIPT_URL_FORBIDDEN",
@@ -652,6 +685,13 @@ def _verify_javascript(
                 "javascript: URLs are forbidden",
             )
         )
+
+
+def _contains_javascript_url(template: str) -> bool:
+    parser = _JavascriptURLAttributeParser()
+    parser.feed(template)
+    parser.close()
+    return parser.found
 
 
 def _verify_target_gate(
@@ -798,7 +838,7 @@ def _verify_requirements(
 
     template_ordinals = {record.ordinal for record in templates}
     known_field_ordinals = set(field_ordinals.values())
-    branches_by_template: dict[int, list[tuple[str, tuple[int, ...], int]]] = {}
+    records_by_template: dict[int, list[tuple[str, tuple[int, ...], int]]] = {}
 
     for index, branch in enumerate(raw_requirements):
         location = f"model.req[{index}]"
@@ -845,7 +885,7 @@ def _verify_requirements(
             )
             continue
 
-        branches_by_template.setdefault(template_ordinal, []).append(
+        records_by_template.setdefault(template_ordinal, []).append(
             (mode, ordinals, index)
         )
 
@@ -858,8 +898,8 @@ def _verify_requirements(
         if len(records) != 1:
             continue
         record = records[0]
-        branches = branches_by_template.get(record.ordinal, [])
-        if not branches:
+        requirements = records_by_template.get(record.ordinal, [])
+        if not requirements:
             violations.append(
                 AnkiTemplateViolation(
                     "MODEL_REQ_TEMPLATE_MISSING",
@@ -868,23 +908,33 @@ def _verify_requirements(
                 )
             )
             continue
+        if len(requirements) > 1:
+            violations.append(
+                AnkiTemplateViolation(
+                    "MODEL_REQ_MALFORMED",
+                    f"model.req[{template_name}]",
+                    "req metadata must contain exactly one record for this "
+                    f"card template, got {len(requirements)}",
+                )
+            )
+            continue
 
         target_field = TARGET_FIELD_BY_TEMPLATE_NAME[template_name]
         target_ordinal = field_ordinals.get(target_field)
         if target_ordinal is None or target_field not in field_names:
             continue
-        for mode, ordinals, branch_index in branches:
-            target_is_necessary = (
-                mode == "all" and target_ordinal in ordinals
-            ) or (
-                mode == "any" and ordinals == (target_ordinal,)
-            )
-            if not target_is_necessary:
-                violations.append(
-                    AnkiTemplateViolation(
-                        "MODEL_REQ_TARGET_NOT_NECESSARY",
-                        f"model.req[{branch_index}]",
-                        f"{target_field!r} is not necessary for card "
-                        f"{template_name!r}",
-                    )
+        mode, ordinals, requirement_index = requirements[0]
+        target_is_necessary = (
+            mode == "all" and target_ordinal in ordinals
+        ) or (
+            mode == "any" and ordinals == (target_ordinal,)
+        )
+        if not target_is_necessary:
+            violations.append(
+                AnkiTemplateViolation(
+                    "MODEL_REQ_TARGET_NOT_NECESSARY",
+                    f"model.req[{requirement_index}]",
+                    f"{target_field!r} is not necessary for card "
+                    f"{template_name!r}",
                 )
+            )

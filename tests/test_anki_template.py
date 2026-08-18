@@ -241,12 +241,8 @@ def test_unbalanced_mustache_section_fails_closed() -> None:
             '<img OnErRoR="alert(1)" src="x">',
             "TEMPLATE_INLINE_HANDLER_FORBIDDEN",
         ),
-        (
-            '<a href="JaVaScRiPt:alert(1)">open</a>',
-            "TEMPLATE_JAVASCRIPT_URL_FORBIDDEN",
-        ),
     ],
-    ids=["script", "inline-handler", "javascript-url"],
+    ids=["script", "inline-handler"],
 )
 def test_executable_javascript_fails(markup: str, expected_code: str) -> None:
     model = valid_model()
@@ -255,6 +251,52 @@ def test_executable_javascript_fails(markup: str, expected_code: str) -> None:
     )
 
     assert expected_code in codes(model)
+
+
+def test_visible_javascript_scheme_text_passes() -> None:
+    model = valid_model()
+    template(model, "R")["qfmt"] = (
+        "{{#Target_R}}{{Ctx_1}}"
+        "<div>javascript: is a URI scheme</div>"
+        "{{/Target_R}}"
+    )
+
+    assert verify_model_snapshot(model) == ()
+
+
+@pytest.mark.parametrize(
+    "attribute_value",
+    [
+        "javascript:alert(1)",
+        "JaVaScRiPt:alert(1)",
+        "java&#x73;cript:alert(1)",
+    ],
+    ids=["lowercase", "mixed-case", "entity-encoded"],
+)
+def test_javascript_href_fails(attribute_value: str) -> None:
+    model = valid_model()
+    template(model, "R")["qfmt"] = (
+        "{{#Target_R}}{{Ctx_1}}"
+        f'<a href="{attribute_value}">open</a>'
+        "{{/Target_R}}"
+    )
+
+    assert "TEMPLATE_JAVASCRIPT_URL_FORBIDDEN" in codes(model)
+
+
+@pytest.mark.parametrize(
+    "attribute_name",
+    ["href", "src", "action", "formaction", "xlink:href"],
+)
+def test_javascript_url_attributes_fail(attribute_name: str) -> None:
+    model = valid_model()
+    template(model, "R")["qfmt"] = (
+        "{{#Target_R}}{{Ctx_1}}"
+        f'<div {attribute_name}="javascript:alert(1)">open</div>'
+        "{{/Target_R}}"
+    )
+
+    assert "TEMPLATE_JAVASCRIPT_URL_FORBIDDEN" in codes(model)
 
 
 def test_wrong_sort_field_fails() -> None:
@@ -362,17 +404,24 @@ def test_req_allows_additional_legitimate_requirements() -> None:
     assert verify_model_snapshot(model) == ()
 
 
-def test_req_alternative_branch_without_target_fails() -> None:
+def test_duplicate_req_record_for_template_fails_closed() -> None:
     model = valid_model()
     model["req"].append(
-        [0, "all", [NOTE_FIELDS.index("Ctx_1")]]
+        [0, "any", [NOTE_FIELDS.index("Target_R")]]
     )
 
-    assert "MODEL_REQ_TARGET_NOT_NECESSARY" in codes(model)
+    assert "MODEL_REQ_MALFORMED" in codes(model)
 
 
-def test_absent_req_metadata_does_not_invent_a_requirement_shape() -> None:
+def test_exactly_one_req_record_per_template_passes() -> None:
+    model = valid_model()
+
+    assert len(model["req"]) == len(CARD_TEMPLATE_NAMES)
+    assert verify_model_snapshot(model) == ()
+
+
+def test_absent_req_metadata_fails_closed() -> None:
     model = valid_model()
     del model["req"]
 
-    assert verify_model_snapshot(model) == ()
+    assert "MODEL_REQ_MALFORMED" in codes(model)
