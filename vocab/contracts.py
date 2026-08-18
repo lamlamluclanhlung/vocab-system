@@ -158,6 +158,16 @@ MEDIA_FIELDS: Final[tuple[str, ...]] = (
 # ============================================================
 # 3. FORGE / CONTEXT CONTRACT
 # ============================================================
+UNIT_TYPE_VALUES: Final[tuple[str, ...]] = (
+    "word",
+    "chunk",
+    "frame",
+)
+
+SOURCE_REF_KINDS: Final[tuple[str, ...]] = (
+    "dictionary",
+    "corpus",
+)
 
 DEFINITION_FIELD: Final[str] = "definition_en"
 SOURCE_REFERENCE_FIELD: Final[str] = "source_ref"
@@ -205,6 +215,38 @@ EVENT_TYPES: Final[tuple[str, ...]] = (
     "ENCOUNTER",
 )
 
+EVENT_PAYLOAD_REQUIRED_FIELDS: Final[dict[str, tuple[str, ...]]] = {
+    "REVIEW": (),
+    "JUDGE": (
+        "channel",
+        "passed",
+        "model_id",
+        "model_version",
+    ),
+    "FORGE": (
+        "source_ref",
+        "accepted",
+    ),
+    "STATE": (
+        "channel",
+        "from",
+        "to",
+        "trigger",
+    ),
+    "SPEAK": (
+        "audio_path",
+        "transcript",
+        "passed",
+        "model_id",
+        "model_version",
+    ),
+    "ENCOUNTER": (
+        "count",
+        "source",
+        "month",
+    ),
+}
+
 EVENT_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
     "v",
     "ts",
@@ -232,8 +274,9 @@ EVENT_LOCAL_TIMEZONE: Final[str] = "Asia/Ho_Chi_Minh"
 EVENT_DAY_FORMAT: Final[str] = "%Y-%m-%d"
 
 # STATE events are channel-scoped; aggregate state is never persisted.
-STATE_EVENT_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = ("channel",)
-
+STATE_EVENT_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    EVENT_PAYLOAD_REQUIRED_FIELDS["STATE"]
+)
 
 # ============================================================
 # 6. STATE MACHINE CONTRACT
@@ -273,7 +316,7 @@ DERIVED_STATE_PRIORITY: Final[tuple[str, ...]] = (
 # Engineering parameters.
 STABLE_MIN_INTERVAL_DAYS: Final[int] = 21
 STABLE_ZERO_LAPSE_WINDOW_DAYS: Final[int] = 30
-STABLE_MIN_AGE_DAYS: Final[int] = 30
+STABLE_MIN_AGE_DAYS: Final[int] = STABLE_MIN_INTERVAL_DAYS
 
 MASTERED_MIN_SESSION_PASSES: Final[int] = 2
 MASTERED_MIN_DELAY_BETWEEN_PASSES_DAYS: Final[int] = 7

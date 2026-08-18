@@ -17,6 +17,12 @@ from vocab.contracts import (
     ANKI_SORT_FIELD,
     NOVEL_CONTEXT_FIELDS,
     TARGET_FLAG_VALUE,
+    EVENT_PAYLOAD_REQUIRED_FIELDS,
+    SOURCE_REF_KINDS,
+    STABLE_MIN_AGE_DAYS,
+    STABLE_MIN_INTERVAL_DAYS,
+    STATE_EVENT_REQUIRED_PAYLOAD_FIELDS,
+    UNIT_TYPE_VALUES,
 )
 from vocab.models import ChannelProgress, ForgeCandidate, UnitProgress, VocabUnit
 
@@ -196,3 +202,61 @@ def test_normal_review_context_is_separate_from_novel_context_pool() -> None:
     assert ANKI_REVIEW_CONTEXT_FIELD == "Ctx_1"
     assert NOVEL_CONTEXT_FIELDS == ("Ctx_2", "Ctx_3", "Ctx_4", "Ctx_5")
     assert ANKI_REVIEW_CONTEXT_FIELD not in NOVEL_CONTEXT_FIELDS
+
+def test_unit_type_values_are_frozen() -> None:
+    assert UNIT_TYPE_VALUES == (
+        "word",
+        "chunk",
+        "frame",
+    )
+
+
+def test_source_ref_kinds_are_evidence_sources_only() -> None:
+    assert SOURCE_REF_KINDS == (
+        "dictionary",
+        "corpus",
+    )
+
+
+def test_event_payload_minimums_are_frozen() -> None:
+    assert EVENT_PAYLOAD_REQUIRED_FIELDS == {
+        "REVIEW": (),
+        "JUDGE": (
+            "channel",
+            "passed",
+            "model_id",
+            "model_version",
+        ),
+        "FORGE": (
+            "source_ref",
+            "accepted",
+        ),
+        "STATE": (
+            "channel",
+            "from",
+            "to",
+            "trigger",
+        ),
+        "SPEAK": (
+            "audio_path",
+            "transcript",
+            "passed",
+            "model_id",
+            "model_version",
+        ),
+        "ENCOUNTER": (
+            "count",
+            "source",
+            "month",
+        ),
+    }
+
+    assert (
+        STATE_EVENT_REQUIRED_PAYLOAD_FIELDS
+        == EVENT_PAYLOAD_REQUIRED_FIELDS["STATE"]
+    )
+
+
+def test_stable_min_age_tracks_stable_interval() -> None:
+    assert STABLE_MIN_INTERVAL_DAYS == 21
+    assert STABLE_MIN_AGE_DAYS == STABLE_MIN_INTERVAL_DAYS
