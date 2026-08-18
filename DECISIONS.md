@@ -296,6 +296,8 @@ A v0 frame must:
 
 - contain exactly one `___` placeholder;
 - contain at least two fixed lexical tokens in total;
+- contain at least one fixed lexical token before the placeholder and at least
+  one fixed lexical token after the placeholder;
 - contain no other placeholder syntax.
 
 During matching, the placeholder must consume at least 1 and at most 6 lexical
