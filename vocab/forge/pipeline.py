@@ -41,21 +41,52 @@ _UNIT_KEY_RE = re.compile(UNIT_KEY_PATTERN)
 
 
 class _AttemptAllocator:
-    def __init__(self, factory: Callable[[], str]) -> None:
+    """Lazily allocate one globally unused FORGE attempt ID."""
+
+    def __init__(
+        self,
+        factory: Callable[[], str],
+        event_log: EventLogPort,
+    ) -> None:
         self._factory = factory
+        self._event_log = event_log
         self._called = False
         self._value = ""
+        self._failure_outcome = ""
+
+    @property
+    def failure_outcome(self) -> str:
+        return self._failure_outcome or "ATTEMPT_ID_INVALID"
 
     def get(self) -> str | None:
         if self._called:
             return self._value or None
         self._called = True
+
+        # Collision detection must consult durable history before an event can
+        # reuse an old correlation ID. The factory remains lazy, so pre-identity
+        # ABORTED outcomes still allocate no attempt ID.
+        try:
+            existing_events = read_forge_events(self._event_log)
+        except Exception:
+            self._failure_outcome = "EVENTLOG_UNAVAILABLE"
+            return None
+
         try:
             candidate = self._factory()
         except Exception:
+            self._failure_outcome = "ATTEMPT_ID_INVALID"
             return None
         if not is_valid_attempt_id(candidate):
+            self._failure_outcome = "ATTEMPT_ID_INVALID"
             return None
+        if any(
+            event.payload.get("forge_attempt_id") == candidate
+            for event in existing_events
+        ):
+            self._failure_outcome = "ATTEMPT_ID_INVALID"
+            return None
+
         self._value = candidate
         return candidate
 
@@ -116,7 +147,7 @@ def _emit_rejection(
     attempt_id = attempts.get()
     if attempt_id is None:
         return _abort(
-            "ATTEMPT_ID_INVALID",
+            attempts.failure_outcome,
             unit_key=unit.unit_key,
             violations=violations,
         )
@@ -235,7 +266,7 @@ def forge(
         return _abort("IDENTITY_INVALID", violations=violations)
 
     provenance = build_provenance(request, metadata, structured_output)
-    attempts = _AttemptAllocator(attempt_id_factory)
+    attempts = _AttemptAllocator(attempt_id_factory, event_log)
     if violations:
         return _emit_rejection(
             unit=unit,
@@ -340,7 +371,7 @@ def forge(
 
     attempt_id = attempts.get()
     if attempt_id is None:
-        return _abort("ATTEMPT_ID_INVALID", unit_key=unit.unit_key)
+        return _abort(attempts.failure_outcome, unit_key=unit.unit_key)
     intent = commit_intent_payload(
         request=request,
         forge_attempt_id=attempt_id,
