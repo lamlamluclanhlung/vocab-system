@@ -331,3 +331,301 @@ word/chunk/frame matching.
 rules, the same Unit could be accepted as present in its evidence sentence but
 later be reported as absent from the corpus. One deterministic matcher prevents
 that semantic drift.
+
+## D20 — Validators return stable ordered violation codes
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Blocks:** T5, T6
+
+Deterministic validators report invalid vocabulary artifacts as stable
+violation codes rather than raising exceptions for ordinary validation failure.
+
+The public validator boundary is:
+
+```python
+validate_forge_unit(unit: VocabUnit) -> tuple[str, ...]
+validate_context_bank(unit: VocabUnit) -> tuple[str, ...]
+```
+
+An empty tuple means the artifact passes that validation stage.
+
+Example:
+
+```python
+()
+```
+
+means PASS, while:
+
+```python
+(
+    "F_SOURCE_REF_INVALID",
+    "F_SOURCE_SENTENCE_EMPTY",
+)
+```
+
+means FAIL.
+
+### Stability
+
+Violation codes are part of the internal protocol.
+
+They must be:
+
+- deterministic;
+- returned in a fixed contract-defined order;
+- independent of dictionary/set iteration order;
+- suitable for persistence in FORGE rejection events;
+- changed only through an explicit contract change.
+
+Human-readable error wording is not part of the stable protocol.
+
+### Exhaustive validation
+
+A validator should report all independent violations it can determine in one
+pass rather than stopping at the first failure.
+
+However, dependent checks are suppressed when their prerequisite has already
+failed.
+
+Example:
+
+If `source_sentence` is empty, report:
+
+`F_SOURCE_SENTENCE_EMPTY`
+
+but do not additionally report:
+
+`F_SOURCE_UNIT_MISSING`
+
+because containment cannot be meaningfully evaluated without a source sentence.
+
+Likewise, if `unit_type` itself is invalid, checks whose semantics depend on a
+valid unit type must not run.
+
+### Exceptions
+
+Exceptions are reserved for programming errors or misuse of the validator API,
+not for an ordinary invalid `VocabUnit`.
+
+**Reason:** T6 must be able to reject an AI-generated artifact deterministically,
+show all meaningful reasons to the user, and persist machine-stable rejection
+evidence without depending on mutable human-readable messages.
+
+## D21 — Forge validator has a fixed violation inventory
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Blocks:** T5, T6
+
+`validate_forge_unit()` validates only the artifact that must be valid at the
+T6 Forge acceptance boundary.
+
+It returns violation codes in the following fixed order:
+
+```python
+(
+    "F_LEMMA_SLUG_INVALID",
+    "F_SENSE_SLUG_INVALID",
+    "F_UNIT_KEY_INVALID",
+    "F_UNIT_KEY_MISMATCH",
+    "F_LEMMA_EMPTY",
+    "F_UNIT_TYPE_INVALID",
+    "F_UNIT_SHAPE_INVALID",
+    "F_TARGET_R_INVALID",
+    "F_TARGET_L_INVALID",
+    "F_TARGET_W_INVALID",
+    "F_TARGET_S_INVALID",
+    "F_NO_TARGET_ENABLED",
+    "F_STATE_R_INVALID",
+    "F_STATE_L_INVALID",
+    "F_STATE_W_INVALID",
+    "F_STATE_S_INVALID",
+    "F_TARGET_STATE_R_MISMATCH",
+    "F_TARGET_STATE_L_MISMATCH",
+    "F_TARGET_STATE_W_MISMATCH",
+    "F_TARGET_STATE_S_MISMATCH",
+    "F_REGISTER_INVALID",
+    "F_DEFINITION_EMPTY",
+    "F_SOURCE_REF_INVALID",
+    "F_SOURCE_SENTENCE_EMPTY",
+    "F_SOURCE_UNIT_MISSING",
+)
+```
+
+Only codes whose rule is violated are returned. A code is never returned more
+than once.
+
+### Identity rules
+
+`F_LEMMA_SLUG_INVALID`
+
+`lemma_slug` does not match the frozen slug grammar.
+
+`F_SENSE_SLUG_INVALID`
+
+`sense_slug` does not match the frozen slug grammar.
+
+`F_UNIT_KEY_INVALID`
+
+`unit_key` does not match `UNIT_KEY_PATTERN`.
+
+`F_UNIT_KEY_MISMATCH`
+
+`unit_key` is not exactly:
+
+```text
+lemma_slug + "::" + sense_slug
+```
+
+No normalization or automatic repair is allowed.
+
+### Lexical rules
+
+`F_LEMMA_EMPTY`
+
+`lemma` is empty after trimming whitespace.
+
+`F_UNIT_TYPE_INVALID`
+
+`unit_type` is not one of `UNIT_TYPE_VALUES`.
+
+`F_UNIT_SHAPE_INVALID`
+
+The lexical Unit does not satisfy the frozen D19 shape for its valid
+`unit_type`.
+
+Examples include:
+
+- a `word` that normalizes to more than one lexical token;
+- a `chunk` with fewer than two lexical tokens;
+- an invalid v0 `frame` placeholder structure.
+
+This check runs only when:
+
+- `lemma` is non-empty; and
+- `unit_type` is valid.
+
+A shape failure must become this violation code. It must not leak a normal
+matcher `ValueError` through the public validator boundary.
+
+### Target rules
+
+Each `Target_*` field must be exactly one of:
+
+```python
+("", "1")
+```
+
+Invalid fields map to their channel-specific code:
+
+```text
+Target_R -> F_TARGET_R_INVALID
+Target_L -> F_TARGET_L_INVALID
+Target_W -> F_TARGET_W_INVALID
+Target_S -> F_TARGET_S_INVALID
+```
+
+`F_NO_TARGET_ENABLED`
+
+is returned only when all four target flags are individually valid and none is
+`"1"`.
+
+If any target flag is invalid, this aggregate check is suppressed because the
+validator cannot safely determine whether the Unit has no intended target.
+
+### State rules
+
+Each `state_*` field must be either:
+
+- `""`; or
+- one of the persisted `STATES`.
+
+`UNKNOWN` is diagnostic only and is not a valid persisted state.
+
+Invalid states map to:
+
+```text
+state_R -> F_STATE_R_INVALID
+state_L -> F_STATE_L_INVALID
+state_W -> F_STATE_W_INVALID
+state_S -> F_STATE_S_INVALID
+```
+
+For each channel, target/state presence must satisfy:
+
+```text
+Target_X == "1"  <=>  state_X is non-empty
+```
+
+Mismatch codes are:
+
+```text
+R -> F_TARGET_STATE_R_MISMATCH
+L -> F_TARGET_STATE_L_MISMATCH
+W -> F_TARGET_STATE_W_MISMATCH
+S -> F_TARGET_STATE_S_MISMATCH
+```
+
+A channel's mismatch check runs only when both its target flag and its state
+value are individually valid.
+
+T5 does not decide lifecycle transitions or graduation. Those remain owned by
+T9 reconciliation.
+
+### Register and definition rules
+
+`F_REGISTER_INVALID`
+
+`register` is not one of the frozen `REGISTER_VALUES`.
+
+`F_DEFINITION_EMPTY`
+
+The English learner definition is empty after trimming whitespace.
+
+T5 deliberately introduces no arbitrary minimum character count as a proxy for
+definition quality.
+
+### Evidence rules
+
+`F_SOURCE_REF_INVALID`
+
+`source_ref` does not fully match `SOURCE_REF_PATTERN`.
+
+This is syntax-only validation. The validator must not resolve the reference or
+check that the external resource exists.
+
+`F_SOURCE_SENTENCE_EMPTY`
+
+`source_sentence` is empty after trimming whitespace.
+
+`F_SOURCE_UNIT_MISSING`
+
+The source sentence does not contain the lexical Unit according to the shared
+D19 `contains_unit()` semantics.
+
+The containment check runs only when all of these prerequisites pass:
+
+- `source_sentence` is non-empty;
+- `lemma` is non-empty;
+- `unit_type` is valid;
+- the Unit shape is valid.
+
+### Explicitly outside this validator
+
+`validate_forge_unit()` does not require or validate:
+
+- `Ctx_1..Ctx_5`;
+- audio or other media;
+- lifecycle/graduation timing;
+- `target_justification`.
+
+`target_justification` is FORGE event provenance under D16 and is validated by
+the T6 producer when a productive target is enabled. It is not a `VocabUnit`
+field.
+
+**Reason:** The Forge validator must be strict enough to prevent an invalid
+lexical Unit from entering Anki while remaining aligned with the staged
+T6 -> T8 -> T9 pipeline. A fixed code inventory also gives T6 a deterministic
+rejection protocol that can be tested and persisted.

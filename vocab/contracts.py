@@ -32,9 +32,9 @@ UNIT_KEY_SEPARATOR: Final[str] = "::"
 # - alphanumeric segments separated by "-"
 # - lemma_slug and sense_slug are human-approved once at creation time;
 #   no automatic slug regeneration is allowed later.
-_SLUG_PATTERN: Final[str] = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+SLUG_PATTERN: Final[str] = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 UNIT_KEY_PATTERN: Final[str] = (
-    rf"^{_SLUG_PATTERN}{re.escape(UNIT_KEY_SEPARATOR)}{_SLUG_PATTERN}$"
+    rf"^{SLUG_PATTERN}{re.escape(UNIT_KEY_SEPARATOR)}{SLUG_PATTERN}$"
 )
 
 
@@ -129,7 +129,10 @@ CHANNEL_BY_TEMPLATE_NAME: Final[dict[str, str]] = {
 
 DEFAULT_TARGET_FIELD: Final[str] = "Target_R"
 TARGET_FLAG_VALUE: Final[str] = "1"
-
+TARGET_FLAG_VALUES: Final[tuple[str, ...]] = (
+    "",
+    TARGET_FLAG_VALUE,
+)
 # Productive-channel targeting requires explicit provenance from FORGE.
 # The justification is NOT stored in the Anki note. It belongs in the
 # FORGE event payload so the note keeps current state while the event log
@@ -247,6 +250,34 @@ SOURCE_REF_PATTERN: Final[str] = (
     rf"^(?:{_SOURCE_REF_KIND_PATTERN}):"
     rf"{_SOURCE_REF_NAMESPACE_PATTERN}:"
     rf"{_SOURCE_REF_RESOURCE_PATTERN}$"
+)
+
+FORGE_VIOLATION_CODES: Final[tuple[str, ...]] = (
+    "F_LEMMA_SLUG_INVALID",
+    "F_SENSE_SLUG_INVALID",
+    "F_UNIT_KEY_INVALID",
+    "F_UNIT_KEY_MISMATCH",
+    "F_LEMMA_EMPTY",
+    "F_UNIT_TYPE_INVALID",
+    "F_UNIT_SHAPE_INVALID",
+    "F_TARGET_R_INVALID",
+    "F_TARGET_L_INVALID",
+    "F_TARGET_W_INVALID",
+    "F_TARGET_S_INVALID",
+    "F_NO_TARGET_ENABLED",
+    "F_STATE_R_INVALID",
+    "F_STATE_L_INVALID",
+    "F_STATE_W_INVALID",
+    "F_STATE_S_INVALID",
+    "F_TARGET_STATE_R_MISMATCH",
+    "F_TARGET_STATE_L_MISMATCH",
+    "F_TARGET_STATE_W_MISMATCH",
+    "F_TARGET_STATE_S_MISMATCH",
+    "F_REGISTER_INVALID",
+    "F_DEFINITION_EMPTY",
+    "F_SOURCE_REF_INVALID",
+    "F_SOURCE_SENTENCE_EMPTY",
+    "F_SOURCE_UNIT_MISSING",
 )
 
 DEFINITION_FIELD: Final[str] = "definition_en"
