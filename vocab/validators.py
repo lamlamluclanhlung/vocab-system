@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 
 from .contracts import (
     APOSTROPHE_EQUIVALENTS,
     CANONICAL_APOSTROPHE,
     CHANNELS,
     CHUNK_MAX_INSERTED_TOKENS,
+    CONTEXT_FIELDS,
+    CONTEXT_VIOLATION_CODES,
+    CTX_MAX_SOURCE_TOKEN_OVERLAP,
+    CTX_MIN_RESIDUAL_TOKENS,
+    CTX_MIN_TOKENS,
     FORGE_VIOLATION_CODES,
     FRAME_MIN_FIXED_TOKENS,
     FRAME_PLACEHOLDER,
@@ -245,4 +251,93 @@ def validate_forge_unit(unit: VocabUnit) -> tuple[str, ...]:
 
     return tuple(
         code for code in FORGE_VIOLATION_CODES if code in discovered
+    )
+
+
+def _fixed_unit_tokens(lemma: str, unit_type: str) -> tuple[str, ...]:
+    """Return the fixed lexical-token multiset for one valid Unit."""
+    if unit_type == "frame":
+        before_tokens, after_tokens = _frame_parts(lemma)
+        return before_tokens + after_tokens
+    return normalize_tokens(lemma)
+
+
+def _subtract_fixed_unit_tokens(
+    tokens: tuple[str, ...],
+    fixed_unit_tokens: tuple[str, ...],
+) -> Counter[str]:
+    """Subtract at most one fixed Unit-token multiset from *tokens*."""
+    residual = Counter(tokens)
+    for token, required_count in Counter(fixed_unit_tokens).items():
+        remaining_count = residual[token] - required_count
+        if remaining_count > 0:
+            residual[token] = remaining_count
+        else:
+            del residual[token]
+    return residual
+
+
+def _source_copy_ratio(
+    context_residual: Counter[str],
+    source_residual: Counter[str],
+) -> float | None:
+    """Return directional residual overlap, or None for no context residual."""
+    context_total = context_residual.total()
+    if context_total == 0:
+        return None
+
+    shared_total = sum(
+        min(context_count, source_residual[token])
+        for token, context_count in context_residual.items()
+    )
+    return shared_total / context_total
+
+
+def validate_context_bank(unit: VocabUnit) -> tuple[str, ...]:
+    """Return ordered deterministic context-stage violations for *unit*."""
+    discovered: set[str] = set()
+    fixed_unit_tokens = _fixed_unit_tokens(unit.lemma, unit.unit_type)
+    source_residual = _subtract_fixed_unit_tokens(
+        normalize_tokens(unit.source_sentence),
+        fixed_unit_tokens,
+    )
+    normalized_nonempty_contexts: list[tuple[str, ...]] = []
+
+    for index, field_name in enumerate(CONTEXT_FIELDS, start=1):
+        context = getattr(unit, field_name)
+        if not _is_nonempty_text(context):
+            discovered.add(f"C_CTX_{index}_EMPTY")
+            continue
+
+        context_tokens = normalize_tokens(context)
+        normalized_nonempty_contexts.append(context_tokens)
+
+        if not contains_unit(context, unit.lemma, unit.unit_type):
+            discovered.add(f"C_CTX_{index}_UNIT_MISSING")
+            continue
+
+        context_residual = _subtract_fixed_unit_tokens(
+            context_tokens,
+            fixed_unit_tokens,
+        )
+        if (
+            len(context_tokens) < CTX_MIN_TOKENS
+            or context_residual.total() < CTX_MIN_RESIDUAL_TOKENS
+        ):
+            discovered.add(f"C_CTX_{index}_TOO_SHORT")
+
+        copy_ratio = _source_copy_ratio(context_residual, source_residual)
+        if (
+            copy_ratio is not None
+            and copy_ratio > CTX_MAX_SOURCE_TOKEN_OVERLAP
+        ):
+            discovered.add(f"C_CTX_{index}_SOURCE_COPY")
+
+    if len(normalized_nonempty_contexts) != len(
+        set(normalized_nonempty_contexts)
+    ):
+        discovered.add("C_CONTEXTS_NOT_DISTINCT")
+
+    return tuple(
+        code for code in CONTEXT_VIOLATION_CODES if code in discovered
     )

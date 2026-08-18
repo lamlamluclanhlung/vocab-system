@@ -1,11 +1,16 @@
 import pytest
 
-from vocab.contracts import FORGE_VIOLATION_CODES
+from vocab.contracts import (
+    CONTEXT_VIOLATION_CODES,
+    FORGE_VIOLATION_CODES,
+)
+
 from vocab.models import VocabUnit
 from vocab.validators import (
     contains_unit,
     normalize_tokens,
     validate_forge_unit,
+    validate_context_bank,
 )
 
 @pytest.mark.parametrize(
@@ -340,6 +345,262 @@ def test_forge_violations_are_returned_in_global_contract_order() -> None:
     expected = tuple(
         code
         for code in FORGE_VIOLATION_CODES
+        if code in actual
+    )
+
+    assert actual == expected
+    assert len(actual) == len(set(actual))
+
+def valid_context_unit(**overrides) -> VocabUnit:
+    values = {
+        "unit_key": "art::creative-work",
+        "lemma": "art",
+        "lemma_slug": "art",
+        "sense_slug": "creative-work",
+        "unit_type": "word",
+        "Target_R": "1",
+        "state_R": "NEW",
+        "register": "neutral",
+        "definition_en": "creative activity that expresses ideas or feelings",
+        "source_ref": "dictionary:cambridge:art",
+        "source_sentence": (
+            "Art alpha beta gamma delta epsilon zeta eta theta iota kappa."
+        ),
+        "Ctx_1": (
+            "Art inspires curious learners through museums and thoughtful "
+            "discussion every weekend."
+        ),
+        "Ctx_2": (
+            "Young students explore art while sharing creative ideas during "
+            "collaborative classroom projects."
+        ),
+        "Ctx_3": (
+            "Digital artists use art to communicate complex emotions across "
+            "different communities online."
+        ),
+        "Ctx_4": (
+            "Public art can transform ordinary spaces into memorable places "
+            "for local residents."
+        ),
+        "Ctx_5": (
+            "Studying art encourages patience observation imagination and "
+            "careful attention over time."
+        ),
+    }
+    values.update(overrides)
+    return VocabUnit(**values)
+
+
+def test_valid_context_bank_passes() -> None:
+    unit = valid_context_unit()
+
+    assert validate_forge_unit(unit) == ()
+    assert validate_context_bank(unit) == ()
+
+
+def test_empty_context_suppresses_dependent_context_checks() -> None:
+    unit = valid_context_unit(Ctx_1="   ")
+
+    violations = validate_context_bank(unit)
+
+    assert "C_CTX_1_EMPTY" in violations
+    assert "C_CTX_1_UNIT_MISSING" not in violations
+    assert "C_CTX_1_TOO_SHORT" not in violations
+    assert "C_CTX_1_SOURCE_COPY" not in violations
+
+
+def test_nonempty_context_must_contain_unit() -> None:
+    unit = valid_context_unit(
+        Ctx_1=(
+            "Music inspires curious learners through museums and thoughtful "
+            "discussion every weekend."
+        )
+    )
+
+    violations = validate_context_bank(unit)
+
+    assert "C_CTX_1_UNIT_MISSING" in violations
+    assert "C_CTX_1_TOO_SHORT" not in violations
+    assert "C_CTX_1_SOURCE_COPY" not in violations
+
+
+def test_word_context_must_meet_total_and_residual_length() -> None:
+    unit = valid_context_unit(
+        Ctx_1="Art helps people learn quickly today."
+    )
+
+    assert "C_CTX_1_TOO_SHORT" in validate_context_bank(unit)
+
+
+def test_chunk_length_requires_six_tokens_beyond_fixed_unit() -> None:
+    unit = valid_context_unit(
+        unit_key="pose::threat",
+        lemma="pose a threat to",
+        lemma_slug="pose",
+        sense_slug="threat",
+        unit_type="chunk",
+        source_ref="dictionary:cambridge:pose-threat",
+        source_sentence=(
+            "Climate change may pose a serious threat to food security."
+        ),
+        Ctx_1="Teams pose a serious threat to local systems today.",
+        Ctx_2=(
+            "New policies may pose a growing threat to independent "
+            "research institutions worldwide."
+        ),
+        Ctx_3=(
+            "Poor planning can pose a major threat to long term "
+            "community development efforts."
+        ),
+        Ctx_4=(
+            "Unexpected delays may pose a serious threat to successful "
+            "delivery across regional projects."
+        ),
+        Ctx_5=(
+            "Weak oversight can pose a substantial threat to public "
+            "confidence in complex institutions."
+        ),
+    )
+
+    assert validate_forge_unit(unit) == ()
+    assert "C_CTX_1_TOO_SHORT" in validate_context_bank(unit)
+
+
+def test_contexts_are_distinct_after_normalization() -> None:
+    first = (
+        "Art inspires curious learners through museums and thoughtful "
+        "discussion every weekend."
+    )
+    second = (
+        "ART inspires curious learners through museums, and thoughtful "
+        "discussion every weekend!"
+    )
+
+    unit = valid_context_unit(
+        Ctx_1=first,
+        Ctx_2=second,
+    )
+
+    violations = validate_context_bank(unit)
+
+    assert violations.count("C_CONTEXTS_NOT_DISTINCT") == 1
+
+
+def test_source_copy_ratio_exactly_point_six_is_allowed() -> None:
+    unit = valid_context_unit(
+        Ctx_1=(
+            "Art alpha beta gamma delta epsilon zeta novel one two three"
+        )
+    )
+
+    assert "C_CTX_1_SOURCE_COPY" not in validate_context_bank(unit)
+
+
+def test_source_copy_ratio_above_point_six_is_rejected() -> None:
+    unit = valid_context_unit(
+        Ctx_1=(
+            "Art alpha beta gamma delta epsilon zeta eta novel one two"
+        )
+    )
+
+    assert "C_CTX_1_SOURCE_COPY" in validate_context_bank(unit)
+
+
+def test_source_copy_overlap_uses_token_multisets() -> None:
+    unit = valid_context_unit(
+        Ctx_1=(
+            "Art alpha alpha alpha alpha alpha alpha alpha novel one two"
+        )
+    )
+
+    # source_sentence contains only one residual "alpha".
+    # Correct multiset overlap therefore counts only one shared alpha,
+    # rather than treating all seven context copies as shared.
+    assert "C_CTX_1_SOURCE_COPY" not in validate_context_bank(unit)
+
+
+def test_source_copy_subtracts_exactly_one_unit_multiset() -> None:
+    unit = valid_context_unit(
+        source_sentence=(
+            "Art art alpha beta gamma delta epsilon zeta eta theta."
+        ),
+        Ctx_1=(
+            "Art art alpha beta gamma delta epsilon zeta novel one two three"
+        ),
+    )
+
+    # Exactly one fixed "art" is removed from each side.
+    # The second "art" remains residual and contributes to copying:
+    # 7 shared residual tokens / 11 context residual tokens > 0.60.
+    assert "C_CTX_1_SOURCE_COPY" in validate_context_bank(unit)
+
+
+def test_frame_slot_content_remains_residual_for_source_copy() -> None:
+    unit = valid_context_unit(
+        unit_key="it-is::claim-frame",
+        lemma="it is ___ that",
+        lemma_slug="it-is",
+        sense_slug="claim-frame",
+        unit_type="frame",
+        source_ref="corpus:examples:claim-frame",
+        source_sentence=(
+            "It is widely believed that alpha beta gamma delta epsilon zeta."
+        ),
+        Ctx_1="It is widely believed that alpha beta novel one",
+        Ctx_2=(
+            "It is often argued that careful planning improves long term "
+            "team outcomes."
+        ),
+        Ctx_3=(
+            "It is sometimes assumed that regular practice builds confidence "
+            "across unfamiliar situations."
+        ),
+        Ctx_4=(
+            "It is generally accepted that clear feedback supports better "
+            "learning over time."
+        ),
+        Ctx_5=(
+            "It is increasingly recognized that strong routines improve "
+            "consistent performance at work."
+        ),
+    )
+
+    assert validate_forge_unit(unit) == ()
+
+    # Fixed frame tokens are: it / is / that.
+    # "widely believed" belongs to the slot, so it remains residual.
+    assert "C_CTX_1_SOURCE_COPY" in validate_context_bank(unit)
+
+
+def test_empty_contexts_do_not_participate_in_distinctness() -> None:
+    unit = valid_context_unit(
+        Ctx_1="",
+        Ctx_2="",
+    )
+
+    violations = validate_context_bank(unit)
+
+    assert "C_CTX_1_EMPTY" in violations
+    assert "C_CTX_2_EMPTY" in violations
+    assert "C_CONTEXTS_NOT_DISTINCT" not in violations
+
+
+def test_context_violations_follow_global_contract_order() -> None:
+    unit = valid_context_unit(
+        Ctx_1="",
+        Ctx_2=(
+            "Music inspires curious learners through museums and thoughtful "
+            "discussion every weekend."
+        ),
+        Ctx_3=(
+            "Art alpha beta gamma delta epsilon zeta eta novel one two"
+        ),
+    )
+
+    actual = validate_context_bank(unit)
+    expected = tuple(
+        code
+        for code in CONTEXT_VIOLATION_CODES
         if code in actual
     )
 
