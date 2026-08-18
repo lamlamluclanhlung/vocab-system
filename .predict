@@ -1,0 +1,13 @@
+T2 — events.py
+
+Prediction before implementation:
+
+I predict Codex may use json.dumps() without ensure_ascii=False,
+causing Vietnamese text in event payloads to be stored as Unicode escape sequences
+instead of readable UTF-8 text.
+
+I will also check specifically for:
+- accidental file rewriting/truncation instead of append-only writes
+- non-UTC ts values
+- missing local day field
+- silent handling of malformed JSON in the middle of the log
