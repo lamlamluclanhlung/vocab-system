@@ -88,14 +88,21 @@ def _emit_rejection(
 ) -> ForgeResult:
     try:
         states = _read_attempts(event_log)
+    except Exception:
+        return _aborted("EVENTLOG_UNAVAILABLE")
+    try:
         attempt_id = _new_attempt_id(attempt_id_factory, states)
-        provenance = provenance_payload(
-            attempt_id=attempt_id,
-            metadata=metadata,
-            generation_request_sha256=request_hash,
-            structured_output_sha256=output_hash,
-            structured_output=structured_output,
-        )
+    except (TypeError, ValueError):
+        return _aborted("ATTEMPT_ID_INVALID")
+
+    provenance = provenance_payload(
+        attempt_id=attempt_id,
+        metadata=metadata,
+        generation_request_sha256=request_hash,
+        structured_output_sha256=output_hash,
+        structured_output=structured_output,
+    )
+    try:
         event_log.log(
             "FORGE",
             unit_key,
@@ -112,6 +119,7 @@ def _emit_rejection(
         )
     except Exception:
         return _aborted("EVENTLOG_UNAVAILABLE")
+
     return ForgeResult(
         status=ForgeStatus.REJECTED,
         unit_key=unit_key,
