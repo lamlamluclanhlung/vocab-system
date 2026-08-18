@@ -16,6 +16,7 @@ from vocab.anki import (
     AnkiCardTemplateError,
     AnkiConnectClient,
     AnkiConnectionError,
+    AnkiLeechConfigMismatchError,
     AnkiNoteCreationError,
     AnkiNoteTypeMismatchError,
     AnkiResponseError,
@@ -284,6 +285,123 @@ def test_get_revlog_maps_to_get_reviews_of_cards(monkeypatch) -> None:
         "version": 6,
         "params": {"cards": [201]},
     }
+
+
+def valid_deck_config() -> dict[str, Any]:
+    return {
+        "id": 1723456789,
+        "name": "Runtime preset",
+        "lapse": {"leechFails": 4, "leechAction": 1},
+    }
+
+
+def test_get_deck_config_uses_exact_action_and_supplied_deck(
+    monkeypatch,
+) -> None:
+    config = valid_deck_config()
+    calls = install_responses(monkeypatch, [response_body(config)])
+
+    assert AnkiConnectClient().get_deck_config("Vocabulary Runtime") == config
+    assert len(calls) == 1
+    assert request_envelope(calls[0]) == {
+        "action": "getDeckConfig",
+        "version": 6,
+        "params": {"deck": "Vocabulary Runtime"},
+    }
+
+
+@pytest.mark.parametrize("result", [False, None, [], "bad result"])
+def test_get_deck_config_rejects_non_mapping_result(
+    monkeypatch,
+    result,
+) -> None:
+    install_responses(monkeypatch, [response_body(result)])
+
+    with pytest.raises(AnkiResponseError) as captured:
+        AnkiConnectClient().get_deck_config("Vocabulary Runtime")
+
+    assert captured.value.action == "getDeckConfig"
+    assert captured.value.response == result
+
+
+def test_get_deck_config_connection_error_remains_connection_error(
+    monkeypatch,
+) -> None:
+    cause = urllib.error.URLError("connection refused")
+
+    def fail(*args, **kwargs):
+        raise cause
+
+    monkeypatch.setattr(anki_module.urllib.request, "urlopen", fail)
+
+    with pytest.raises(AnkiConnectionError) as captured:
+        AnkiConnectClient().get_deck_config("Vocabulary Runtime")
+
+    assert captured.value.action == "getDeckConfig"
+    assert captured.value.cause is cause
+
+
+def test_get_deck_config_does_not_retry(monkeypatch) -> None:
+    attempts = 0
+
+    def fail(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(anki_module.urllib.request, "urlopen", fail)
+
+    with pytest.raises(AnkiConnectionError):
+        AnkiConnectClient().get_deck_config("Vocabulary Runtime")
+
+    assert attempts == 1
+
+
+@pytest.mark.parametrize("deck_name", ["", None])
+def test_get_deck_config_rejects_invalid_deck_name_before_http(
+    monkeypatch,
+    deck_name,
+) -> None:
+    calls = install_responses(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        AnkiConnectClient().get_deck_config(deck_name)
+
+    assert calls == []
+
+
+def test_verify_leech_config_accepts_valid_readback(monkeypatch) -> None:
+    calls = install_responses(
+        monkeypatch,
+        [response_body(valid_deck_config())],
+    )
+
+    assert AnkiConnectClient().verify_leech_config("Vocabulary Runtime") is True
+    assert [request_envelope(call)["action"] for call in calls] == [
+        "getDeckConfig"
+    ]
+
+
+def test_verify_leech_config_exposes_all_violations_without_writes(
+    monkeypatch,
+) -> None:
+    config = valid_deck_config()
+    config["lapse"]["leechFails"] = 8
+    config["lapse"]["leechAction"] = 0
+    calls = install_responses(monkeypatch, [response_body(config)])
+
+    with pytest.raises(AnkiLeechConfigMismatchError) as captured:
+        AnkiConnectClient().verify_leech_config("Vocabulary Runtime")
+
+    assert tuple(
+        violation.code for violation in captured.value.violations
+    ) == (
+        "L7_THRESHOLD_MISMATCH",
+        "L7_ACTION_SUSPEND",
+    )
+    assert [request_envelope(call)["action"] for call in calls] == [
+        "getDeckConfig"
+    ]
 
 
 def test_store_media_file_encodes_bytes_and_disables_overwrite(monkeypatch) -> None:

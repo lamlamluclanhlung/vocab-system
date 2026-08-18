@@ -17,6 +17,10 @@ from .contracts import (
     IMMUTABLE_NOTE_FIELDS,
     NOTE_FIELDS,
 )
+from .leech import (
+    LeechConfigViolation,
+    verify_leech_config as verify_leech_config_snapshot,
+)
 
 from .models import VocabUnit
 
@@ -102,6 +106,23 @@ class AnkiCardTemplateError(AnkiNoteTypeMismatchError):
         super().__init__(
             "Anki note type semantic verification failed: "
             + "; ".join(str(violation) for violation in self.violations)
+        )
+
+
+class AnkiLeechConfigMismatchError(AnkiConnectError):
+    """Raised with all deterministic leech-configuration violations."""
+
+    def __init__(
+        self,
+        violations: Sequence[LeechConfigViolation],
+    ) -> None:
+        self.violations = tuple(violations)
+        super().__init__(
+            "Anki leech configuration verification failed: "
+            + "; ".join(
+                f"{violation.code}: {violation.message}"
+                for violation in self.violations
+            )
         )
 
 
@@ -324,6 +345,28 @@ class AnkiConnectClient:
                 response=result,
             )
         return result
+
+    def get_deck_config(self, deck_name: str) -> dict[str, Any]:
+        """Return one caller-selected deck's Anki option configuration."""
+        if not isinstance(deck_name, str) or not deck_name:
+            raise ValueError("deck_name must be a non-empty string")
+
+        result = self._invoke("getDeckConfig", {"deck": deck_name})
+        if not isinstance(result, Mapping):
+            raise AnkiResponseError(
+                "getDeckConfig",
+                "result must be a deck configuration object",
+                response=result,
+            )
+        return dict(result)
+
+    def verify_leech_config(self, deck_name: str) -> bool:
+        """Read and verify one deck's leech options without mutation."""
+        config = self.get_deck_config(deck_name)
+        violations = verify_leech_config_snapshot(config)
+        if violations:
+            raise AnkiLeechConfigMismatchError(violations)
+        return True
 
     def verify_note_type(self) -> bool:
         """Read and verify the complete note-type snapshot without repair."""

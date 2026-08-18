@@ -1153,3 +1153,31 @@ do not cause semantic verification failure.
 This decision does not add the proposed C8 pedagogical answer-leak table for
 the R/L/W/S templates. No new channel-specific answer-content requirements are
 introduced here.
+
+## D26 — T7 leech configuration is human-set and read-only verified
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Blocks:** T7, T9
+
+T7 combines human configuration through the Anki GUI with deterministic,
+read-only verification.
+
+The canonical engineering threshold is `LEECH_LAPSE_THRESHOLD`.
+`ANKI_LEECH_THRESHOLD` derives from that canonical threshold.
+
+The required Anki leech action is Tag Only, not automatic Suspend.
+
+Verification operates on one runtime deck explicitly supplied by the caller.
+Deck and option-preset identity are not frozen in v0. A dedicated vocabulary
+preset is operationally recommended, but its name, ID, and sharing status are
+not verifier PASS/FAIL invariants.
+
+T7 never creates, updates, deletes, assigns, or otherwise mutates Anki deck
+configuration.
+
+Under D10, T7 does not interpret a leech as a lifecycle transition and does not
+attribute the note-level leech signal to an R/L/W/S channel. T7 emits no event
+and changes no note, card, media, tag, or lifecycle state.
+
+Lifecycle response and remediation remain owned by future T9 under D10.

@@ -70,6 +70,15 @@ Do not automatically mutate Anki note types. In particular, do not call:
 - `updateModelStyling`
 - `createModel`
 
+Deck configuration is human-owned. Never automatically create, update, delete,
+or assign Anki deck option presets, and never invoke deck-config mutation
+actions such as:
+
+- `saveDeckConfig`
+- `setDeckConfigId`
+- `cloneDeckConfigId`
+- `removeDeckConfigId`
+
 Anki is the source of truth for vocabulary notes.
 
 ## Data safety

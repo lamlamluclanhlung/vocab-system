@@ -537,6 +537,6 @@ DORMANT_PRESERVE_REVLOG: Final[bool] = True
 ANKI_NOTE_TYPE_NAME: Final[str] = "VocabularyUnit"
 ANKI_SORT_FIELD: Final[str] = "unit_key"
 
-ANKI_LEECH_THRESHOLD: Final[int] = 4
+ANKI_LEECH_THRESHOLD: Final[int] = LEECH_LAPSE_THRESHOLD
 ANKI_LEECH_ACTION: Final[str] = "tag_only"
 ANKI_LEECH_TAG: Final[str] = "leech"
