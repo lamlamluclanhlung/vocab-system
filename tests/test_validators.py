@@ -1,7 +1,12 @@
 import pytest
 
-from vocab.validators import contains_unit, normalize_tokens
-
+from vocab.contracts import FORGE_VIOLATION_CODES
+from vocab.models import VocabUnit
+from vocab.validators import (
+    contains_unit,
+    normalize_tokens,
+    validate_forge_unit,
+)
 
 @pytest.mark.parametrize(
     ("text", "expected"),
@@ -106,3 +111,237 @@ def test_invalid_v0_frame_shape_is_rejected(unit) -> None:
             unit,
             "frame",
         )
+
+def valid_forge_unit(**overrides) -> VocabUnit:
+    values = {
+        "unit_key": "pose::threat",
+        "lemma": "pose a threat to",
+        "lemma_slug": "pose",
+        "sense_slug": "threat",
+        "unit_type": "chunk",
+        "Target_R": "1",
+        "Target_L": "",
+        "Target_W": "",
+        "Target_S": "",
+        "state_R": "NEW",
+        "state_L": "",
+        "state_W": "",
+        "state_S": "",
+        "register": "neutral",
+        "definition_en": "to create a possible danger or problem",
+        "source_ref": "dictionary:cambridge:pose-threat",
+        "source_sentence": "Climate change may pose a serious threat to food security.",
+    }
+    values.update(overrides)
+    return VocabUnit(**values)
+
+
+def test_valid_forge_unit_passes_before_context_and_media_generation() -> None:
+    unit = valid_forge_unit()
+
+    assert unit.Ctx_1 == ""
+    assert unit.audio_1 == ""
+    assert validate_forge_unit(unit) == ()
+
+
+def test_forge_identity_violations_follow_frozen_order() -> None:
+    unit = valid_forge_unit(
+        unit_key="WRONG",
+        lemma_slug="Bad Slug",
+        sense_slug="Bad Sense",
+    )
+
+    assert validate_forge_unit(unit)[:4] == (
+        "F_LEMMA_SLUG_INVALID",
+        "F_SENSE_SLUG_INVALID",
+        "F_UNIT_KEY_INVALID",
+        "F_UNIT_KEY_MISMATCH",
+    )
+
+
+def test_empty_lemma_suppresses_dependent_shape_and_containment_checks() -> None:
+    unit = valid_forge_unit(lemma="   ")
+
+    violations = validate_forge_unit(unit)
+
+    assert "F_LEMMA_EMPTY" in violations
+    assert "F_UNIT_SHAPE_INVALID" not in violations
+    assert "F_SOURCE_UNIT_MISSING" not in violations
+
+
+def test_invalid_unit_type_suppresses_shape_and_containment_checks() -> None:
+    unit = valid_forge_unit(unit_type="phrase")
+
+    violations = validate_forge_unit(unit)
+
+    assert "F_UNIT_TYPE_INVALID" in violations
+    assert "F_UNIT_SHAPE_INVALID" not in violations
+    assert "F_SOURCE_UNIT_MISSING" not in violations
+
+
+def test_invalid_unit_shape_becomes_violation_not_exception() -> None:
+    unit = valid_forge_unit(
+        lemma="one token",
+        unit_type="word",
+    )
+
+    assert "F_UNIT_SHAPE_INVALID" in validate_forge_unit(unit)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "code"),
+    [
+        ("Target_R", "F_TARGET_R_INVALID"),
+        ("Target_L", "F_TARGET_L_INVALID"),
+        ("Target_W", "F_TARGET_W_INVALID"),
+        ("Target_S", "F_TARGET_S_INVALID"),
+    ],
+)
+def test_invalid_target_flag_maps_to_channel_code(field_name, code) -> None:
+    unit = valid_forge_unit(**{field_name: "yes"})
+
+    violations = validate_forge_unit(unit)
+
+    assert code in violations
+    assert "F_NO_TARGET_ENABLED" not in violations
+
+
+def test_no_target_enabled_requires_all_target_flags_to_be_valid() -> None:
+    unit = valid_forge_unit(
+        Target_R="",
+        state_R="",
+    )
+
+    assert "F_NO_TARGET_ENABLED" in validate_forge_unit(unit)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "code"),
+    [
+        ("state_R", "F_STATE_R_INVALID"),
+        ("state_L", "F_STATE_L_INVALID"),
+        ("state_W", "F_STATE_W_INVALID"),
+        ("state_S", "F_STATE_S_INVALID"),
+    ],
+)
+def test_invalid_state_maps_to_channel_code(field_name, code) -> None:
+    unit = valid_forge_unit(**{field_name: "UNKNOWN"})
+
+    assert code in validate_forge_unit(unit)
+
+
+@pytest.mark.parametrize(
+    ("target_field", "state_field", "target_value", "state_value", "code"),
+    [
+        (
+            "Target_R",
+            "state_R",
+            "1",
+            "",
+            "F_TARGET_STATE_R_MISMATCH",
+        ),
+        (
+            "Target_L",
+            "state_L",
+            "",
+            "NEW",
+            "F_TARGET_STATE_L_MISMATCH",
+        ),
+        (
+            "Target_W",
+            "state_W",
+            "1",
+            "",
+            "F_TARGET_STATE_W_MISMATCH",
+        ),
+        (
+            "Target_S",
+            "state_S",
+            "",
+            "NEW",
+            "F_TARGET_STATE_S_MISMATCH",
+        ),
+    ],
+)
+def test_target_state_presence_is_biconditional(
+    target_field,
+    state_field,
+    target_value,
+    state_value,
+    code,
+) -> None:
+    unit = valid_forge_unit(
+        **{
+            target_field: target_value,
+            state_field: state_value,
+        }
+    )
+
+    assert code in validate_forge_unit(unit)
+
+
+def test_invalid_target_or_state_suppresses_channel_mismatch_check() -> None:
+    unit = valid_forge_unit(
+        Target_R="yes",
+        state_R="UNKNOWN",
+    )
+
+    violations = validate_forge_unit(unit)
+
+    assert "F_TARGET_R_INVALID" in violations
+    assert "F_STATE_R_INVALID" in violations
+    assert "F_TARGET_STATE_R_MISMATCH" not in violations
+
+
+def test_register_definition_and_source_ref_are_validated_independently() -> None:
+    unit = valid_forge_unit(
+        register="formal-ish",
+        definition_en="   ",
+        source_ref="web:https://example.com",
+    )
+
+    violations = validate_forge_unit(unit)
+
+    assert "F_REGISTER_INVALID" in violations
+    assert "F_DEFINITION_EMPTY" in violations
+    assert "F_SOURCE_REF_INVALID" in violations
+
+
+def test_empty_source_sentence_suppresses_unit_missing_check() -> None:
+    unit = valid_forge_unit(source_sentence="   ")
+
+    violations = validate_forge_unit(unit)
+
+    assert "F_SOURCE_SENTENCE_EMPTY" in violations
+    assert "F_SOURCE_UNIT_MISSING" not in violations
+
+
+def test_source_sentence_must_contain_unit_with_shared_matcher() -> None:
+    unit = valid_forge_unit(
+        source_sentence="Climate change creates serious risks for food security."
+    )
+
+    assert "F_SOURCE_UNIT_MISSING" in validate_forge_unit(unit)
+
+
+def test_forge_violations_are_returned_in_global_contract_order() -> None:
+    unit = valid_forge_unit(
+        unit_key="wrong",
+        lemma_slug="Bad Slug",
+        Target_R="",
+        state_R="",
+        register="bad-register",
+        definition_en="",
+        source_ref="bad",
+        source_sentence="",
+    )
+
+    actual = validate_forge_unit(unit)
+    expected = tuple(
+        code
+        for code in FORGE_VIOLATION_CODES
+        if code in actual
+    )
+
+    assert actual == expected
+    assert len(actual) == len(set(actual))
