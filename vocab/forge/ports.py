@@ -1,4 +1,4 @@
-"""Side-effect ports for T6 Forge."""
+"""Provider-neutral ports consumed by the Forge core."""
 
 from __future__ import annotations
 
@@ -6,7 +6,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
 from ..models import Event, VocabUnit
-from .request import ConfirmationDecision, ForgePreview, ForgeRequest, GenerationMetadata
+from .request import (
+    ConfirmationDecision,
+    ForgePreview,
+    ForgeRequest,
+    GenerationMetadata,
+)
 
 
 class Generator(Protocol):
@@ -22,11 +27,20 @@ class Generator(Protocol):
 class AnkiGateway(Protocol):
     def find_notes(self, query: str) -> list[int]: ...
 
-    def add_notes(self, deck_name: str, units: Sequence[VocabUnit]) -> list[int]: ...
+    def add_notes(
+        self,
+        deck_name: str,
+        units: Sequence[VocabUnit],
+    ) -> list[int]: ...
 
 
 class EventLogPort(Protocol):
-    def log(self, event: str, unit_key: str, payload: dict[str, Any]) -> Event: ...
+    def log(
+        self,
+        event: str,
+        unit_key: str,
+        payload: dict[str, Any],
+    ) -> Event: ...
 
     def read(
         self,

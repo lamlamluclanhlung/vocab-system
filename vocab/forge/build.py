@@ -1,162 +1,90 @@
-"""Pure construction and hashing helpers for T6 Forge."""
+"""Deterministic construction and immutable preview helpers for Forge."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
-import re
 from collections.abc import Mapping
 from datetime import date
-from typing import Any
 
-from ..contracts import (
-    ANKI_NOTE_TYPE_NAME,
-    SOURCE_REF_PATTERN,
-    UNIT_KEY_PATTERN,
-    UNIT_KEY_SEPARATOR,
-    UNIQUE_NOTE_FIELD,
-)
+from ..contracts import CHANNELS, STATE_NEW, UNIQUE_NOTE_FIELD, UNIT_KEY_SEPARATOR
 from ..models import VocabUnit
-from .request import ForgePreview, ForgeRequest, GenerationMetadata
-
-_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9._-]{8,128}")
-_SOURCE_REF_RE = re.compile(SOURCE_REF_PATTERN)
-_UNIT_KEY_RE = re.compile(UNIT_KEY_PATTERN)
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+from .request import ForgePreview, ForgeRequest
 
 
-def canonical_json_bytes(value: object) -> bytes:
-    """Return the canonical UTF-8 JSON representation used by T6 hashes."""
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def sha256_canonical(value: object) -> str:
-    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
-
-
-def generation_request_sha256(request: ForgeRequest) -> str:
-    return sha256_canonical(
-        {
-            "source_ref": request.source_ref,
-            "source_sentence": request.source_sentence,
-            "learner_note": request.learner_note,
-        }
-    )
-
-
-def structured_output_sha256(output: Mapping[str, Any]) -> str:
-    return sha256_canonical(dict(output))
-
-
-def validate_generation_metadata(metadata: GenerationMetadata) -> None:
-    for name in ("model_id", "model_version", "prompt_version"):
-        value = getattr(metadata, name)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{name} must be a non-empty string")
-    if not isinstance(metadata.prompt_sha256, str) or _SHA256_RE.fullmatch(
-        metadata.prompt_sha256
-    ) is None:
-        raise ValueError("prompt_sha256 must be lowercase 64-hex")
-    if not isinstance(metadata.generation_config, Mapping):
-        raise TypeError("generation_config must be a mapping")
-    for key, value in metadata.generation_config.items():
-        if not isinstance(key, str):
-            raise TypeError("generation_config keys must be strings")
-        if not isinstance(value, (str, int, float, bool, type(None))):
-            raise TypeError("generation_config values must be JSON scalars")
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError("generation_config floats must be finite")
-    canonical_json_bytes(dict(metadata.generation_config))
-
-
-def validate_preflight(request: ForgeRequest, deck_name: str) -> bool:
-    if not isinstance(request, ForgeRequest):
-        raise TypeError("request must be a ForgeRequest")
-    if not isinstance(deck_name, str) or not deck_name.strip():
-        return False
-    if not isinstance(request.source_ref, str) or _SOURCE_REF_RE.fullmatch(
-        request.source_ref
-    ) is None:
-        return False
-    if not isinstance(request.source_sentence, str) or not request.source_sentence.strip():
-        return False
-    if not isinstance(request.learner_note, str):
-        return False
-    return True
-
-
-def build_candidate(
+def build_vocab_unit(
+    structured_output: Mapping[str, object],
     request: ForgeRequest,
-    output: Mapping[str, Any],
     *,
-    today: date,
+    created_on: date,
 ) -> VocabUnit:
-    """Construct one Forge-stage VocabUnit without repairing generated data."""
-    target = {channel: bool(output[f"target_{channel}"]) for channel in "RLWS"}
+    """Build a VocabUnit without normalizing, repairing, or inventing data."""
+    if type(created_on) is not date:
+        raise TypeError("created_on must be a date")
+
+    lemma_slug = structured_output["lemma_slug"]
+    sense_slug = structured_output["sense_slug"]
+    if not isinstance(lemma_slug, str) or not isinstance(sense_slug, str):
+        raise TypeError("strict output identity fields must be strings")
+
+    targets = {
+        channel: "1" if structured_output[f"target_{channel}"] is True else ""
+        for channel in CHANNELS
+    }
+    states = {
+        channel: STATE_NEW if targets[channel] == "1" else ""
+        for channel in CHANNELS
+    }
+
     return VocabUnit(
-        unit_key=(
-            str(output["lemma_slug"])
-            + UNIT_KEY_SEPARATOR
-            + str(output["sense_slug"])
-        ),
-        lemma=str(output["lemma"]),
-        lemma_slug=str(output["lemma_slug"]),
-        sense_slug=str(output["sense_slug"]),
-        unit_type=str(output["unit_type"]),
-        Target_R="1" if target["R"] else "",
-        Target_L="1" if target["L"] else "",
-        Target_W="1" if target["W"] else "",
-        Target_S="1" if target["S"] else "",
-        register=str(output["register"]),
-        definition_en=str(output["definition_en"]),
+        unit_key=lemma_slug + UNIT_KEY_SEPARATOR + sense_slug,
+        lemma=structured_output["lemma"],
+        lemma_slug=lemma_slug,
+        sense_slug=sense_slug,
+        unit_type=structured_output["unit_type"],
+        Target_R=targets["R"],
+        Target_L=targets["L"],
+        Target_W=targets["W"],
+        Target_S=targets["S"],
+        register=structured_output["register"],
+        definition_en=structured_output["definition_en"],
         source_ref=request.source_ref,
         source_sentence=request.source_sentence,
-        state_R="NEW" if target["R"] else "",
-        state_L="NEW" if target["L"] else "",
-        state_W="NEW" if target["W"] else "",
-        state_S="NEW" if target["S"] else "",
-        created=today.isoformat(),
+        Ctx_1="",
+        Ctx_2="",
+        Ctx_3="",
+        Ctx_4="",
+        Ctx_5="",
+        audio_1="",
+        audio_2="",
+        audio_3="",
+        VisualCue="",
+        state_R=states["R"],
+        state_L=states["L"],
+        state_W=states["W"],
+        state_S=states["S"],
+        freq_band="",
+        created=created_on.isoformat(),
+        graduated="",
     )
 
 
-def identity_trusted(unit: VocabUnit) -> bool:
-    if _UNIT_KEY_RE.fullmatch(unit.unit_key) is None:
-        return False
-    return unit.unit_key == (
-        unit.lemma_slug + UNIT_KEY_SEPARATOR + unit.sense_slug
-    )
-
-
-def validate_attempt_id(value: object) -> str:
-    if not isinstance(value, str) or _ATTEMPT_ID_RE.fullmatch(value) is None:
-        raise ValueError("forge_attempt_id must match [A-Za-z0-9._-]{8,128}")
-    return value
-
-
-def unit_key_query(unit_key: str) -> str:
-    return (
-        f"note:{ANKI_NOTE_TYPE_NAME} "
-        f"{UNIQUE_NOTE_FIELD}:re:^{re.escape(unit_key)}$"
-    )
+def build_unit_key_query(unit_key: str) -> str:
+    """Build Anki's exact-match field query for one trusted unit key."""
+    return f"{UNIQUE_NOTE_FIELD}:{unit_key}"
 
 
 def build_preview(
     unit: VocabUnit,
     target_justification: Mapping[str, str],
 ) -> ForgePreview:
+    """Copy a candidate into a frozen scalar-and-tuple-only preview."""
     targets = tuple(
         channel
-        for channel in "RLWS"
+        for channel in CHANNELS
         if getattr(unit, f"Target_{channel}") == "1"
     )
-    states = tuple((channel, getattr(unit, f"state_{channel}")) for channel in targets)
+    states = tuple(
+        (channel, getattr(unit, f"state_{channel}")) for channel in targets
+    )
     justifications = tuple(
         (channel, target_justification[channel])
         for channel in ("W", "S")

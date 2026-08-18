@@ -1,37 +1,41 @@
-"""Strict structured-output contract for T6 Forge."""
+"""Strict provider-neutral structured-output schema for Forge."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+
+from ..contracts import REGISTER_VALUES, UNIT_TYPE_VALUES
+
 
 FORGE_SCHEMA_VERSION = "1"
 
-FORGE_JSON_SCHEMA: dict[str, Any] = {
+_STRING_FIELDS = (
+    "lemma",
+    "lemma_slug",
+    "sense_slug",
+    "unit_type",
+    "register",
+    "definition_en",
+)
+_TARGET_FIELDS = (
+    "target_R",
+    "target_L",
+    "target_W",
+    "target_S",
+)
+_REQUIRED_FIELDS = (*_STRING_FIELDS, *_TARGET_FIELDS, "target_justification")
+
+FORGE_JSON_SCHEMA: dict[str, object] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": False,
-    "required": [
-        "lemma",
-        "lemma_slug",
-        "sense_slug",
-        "unit_type",
-        "register",
-        "definition_en",
-        "target_R",
-        "target_L",
-        "target_W",
-        "target_S",
-        "target_justification",
-    ],
+    "required": list(_REQUIRED_FIELDS),
     "properties": {
         "lemma": {"type": "string"},
         "lemma_slug": {"type": "string"},
         "sense_slug": {"type": "string"},
-        "unit_type": {"type": "string", "enum": ["word", "chunk", "frame"]},
-        "register": {
-            "type": "string",
-            "enum": ["academic", "neutral", "conversational", "technical"],
-        },
+        "unit_type": {"type": "string", "enum": list(UNIT_TYPE_VALUES)},
+        "register": {"type": "string", "enum": list(REGISTER_VALUES)},
         "definition_en": {"type": "string"},
         "target_R": {"type": "boolean"},
         "target_L": {"type": "boolean"},
@@ -48,55 +52,54 @@ FORGE_JSON_SCHEMA: dict[str, Any] = {
     },
 }
 
-_REQUIRED = tuple(FORGE_JSON_SCHEMA["required"])
-_ALLOWED = frozenset(_REQUIRED)
-_UNIT_TYPES = frozenset(("word", "chunk", "frame"))
-_REGISTERS = frozenset(("academic", "neutral", "conversational", "technical"))
-_TARGETS = ("target_R", "target_L", "target_W", "target_S")
-
 
 class ForgeSchemaError(ValueError):
-    """Raised when provider output violates the strict T6 output schema."""
+    """Raised when generated structured output violates the strict schema."""
 
 
-def parse_forge_output(value: object) -> dict[str, Any]:
-    """Validate and copy one provider-neutral Forge structured output."""
+def parse_strict_output(value: object) -> dict[str, object]:
+    """Validate and copy one exact Forge structured-output object."""
     if not isinstance(value, Mapping):
-        raise ForgeSchemaError("Forge output must be a JSON object")
+        raise ForgeSchemaError("structured output must be an object")
 
-    keys = set(value)
-    missing = [name for name in _REQUIRED if name not in value]
-    extra = sorted(keys.difference(_ALLOWED))
-    if missing:
-        raise ForgeSchemaError(f"Forge output missing fields: {tuple(missing)}")
-    if extra:
-        raise ForgeSchemaError(f"Forge output contains extra fields: {tuple(extra)}")
+    actual_keys = set(value.keys())
+    required_keys = set(_REQUIRED_FIELDS)
+    if actual_keys != required_keys:
+        raise ForgeSchemaError("structured output fields do not match the schema")
 
-    for field in ("lemma", "lemma_slug", "sense_slug", "definition_en"):
-        if not isinstance(value[field], str):
-            raise ForgeSchemaError(f"{field} must be a string")
+    parsed: dict[str, object] = {}
+    for field_name in _STRING_FIELDS:
+        field_value = value[field_name]
+        if not isinstance(field_value, str):
+            raise ForgeSchemaError(f"{field_name} must be a string")
+        parsed[field_name] = field_value
 
-    if value["unit_type"] not in _UNIT_TYPES:
-        raise ForgeSchemaError("unit_type is outside the strict schema enum")
-    if value["register"] not in _REGISTERS:
-        raise ForgeSchemaError("register is outside the strict schema enum")
+    if parsed["unit_type"] not in UNIT_TYPE_VALUES:
+        raise ForgeSchemaError("unit_type is outside the schema enum")
+    if parsed["register"] not in REGISTER_VALUES:
+        raise ForgeSchemaError("register is outside the schema enum")
 
-    for field in _TARGETS:
-        if type(value[field]) is not bool:
-            raise ForgeSchemaError(f"{field} must be a boolean")
+    for field_name in _TARGET_FIELDS:
+        field_value = value[field_name]
+        if type(field_value) is not bool:
+            raise ForgeSchemaError(f"{field_name} must be a boolean")
+        parsed[field_name] = field_value
 
-    justification = value["target_justification"]
-    if not isinstance(justification, Mapping):
+    raw_justification = value["target_justification"]
+    if not isinstance(raw_justification, Mapping):
         raise ForgeSchemaError("target_justification must be an object")
-    unknown_justification = sorted(set(justification).difference(("W", "S")))
-    if unknown_justification:
-        raise ForgeSchemaError(
-            "target_justification contains unsupported keys: "
-            f"{tuple(unknown_justification)}"
-        )
-    if any(not isinstance(v, str) for v in justification.values()):
-        raise ForgeSchemaError("target_justification values must be strings")
+    if not set(raw_justification.keys()).issubset({"W", "S"}):
+        raise ForgeSchemaError("target_justification has an extra field")
 
-    result = {field: value[field] for field in _REQUIRED}
-    result["target_justification"] = dict(justification)
-    return result
+    justification: dict[str, str] = {}
+    for channel in ("W", "S"):
+        if channel not in raw_justification:
+            continue
+        reason = raw_justification[channel]
+        if not isinstance(reason, str):
+            raise ForgeSchemaError(
+                f"target_justification.{channel} must be a string"
+            )
+        justification[channel] = reason
+    parsed["target_justification"] = justification
+    return parsed

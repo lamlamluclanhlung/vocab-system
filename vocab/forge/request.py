@@ -1,4 +1,4 @@
-"""T6 Forge public data types and local outcome vocabularies."""
+"""Public request and result types for the T6 Forge pipeline."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TypeAlias
+
 
 JSONScalar: TypeAlias = str | int | float | bool | None
 
@@ -17,11 +18,13 @@ FORGE_REJECTION_OUTCOMES = (
     "DUPLICATE",
     "HUMAN_DECLINED",
 )
+
 FORGE_OPERATION_OUTCOMES = (
     "COMMIT_INTENT",
     "ANKI_COMMIT_UNCERTAIN",
     "INTENT_ABANDONED",
 )
+
 FORGE_ABORT_REASONS = (
     "REQUEST_INVALID",
     "GENERATION_FAILED",
@@ -31,6 +34,7 @@ FORGE_ABORT_REASONS = (
     "ANKI_READ_FAILED",
     "ATTEMPT_ID_INVALID",
 )
+
 FORGE_RESULT_ONLY_REASONS = (
     "PENDING_INTENT",
     "PENDING_INTENT_AMBIGUOUS",
@@ -44,15 +48,6 @@ class ForgeStatus(str, Enum):
     ABORTED = "ABORTED"
     EVIDENCE_GAP = "EVIDENCE_GAP"
     COMMIT_UNCERTAIN = "COMMIT_UNCERTAIN"
-
-
-class RepairStatus(str, Enum):
-    REPAIRED = "REPAIRED"
-    NO_NOTE = "NO_NOTE"
-    NOTE_EXISTS = "NOTE_EXISTS"
-    AMBIGUOUS = "AMBIGUOUS"
-    ALREADY_RESOLVED = "ALREADY_RESOLVED"
-    ABANDONED = "ABANDONED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,10 +97,19 @@ class ForgeResult:
     ambiguous_note_ids: tuple[int, ...] = ()
 
 
+class RepairStatus(str, Enum):
+    REPAIRED = "REPAIRED"
+    NO_NOTE = "NO_NOTE"
+    AMBIGUOUS = "AMBIGUOUS"
+    ALREADY_RESOLVED = "ALREADY_RESOLVED"
+    ABANDONED = "ABANDONED"
+
+
 @dataclass(frozen=True, slots=True)
 class RepairResult:
     status: RepairStatus
-    forge_attempt_id: str
+    forge_attempt_id: str = ""
     unit_key: str = ""
     note_id: int | None = None
+    outcome: str = ""
     ambiguous_note_ids: tuple[int, ...] = ()

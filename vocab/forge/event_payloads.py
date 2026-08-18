@@ -1,61 +1,161 @@
-"""FORGE producer payloads and attempt-state analysis."""
+"""Canonical hashing and FORGE event-payload construction."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-from collections.abc import Mapping, Sequence
+import copy
+import hashlib
+import json
+import math
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
-from ..models import Event
-from .request import GenerationMetadata, PRODUCER_VERSION
+from .request import (
+    JSONScalar,
+    PRODUCER_VERSION,
+    ForgeRequest,
+    GenerationMetadata,
+)
 from .schema import FORGE_SCHEMA_VERSION
 
 
-def provenance_payload(
-    *,
-    attempt_id: str,
+_LOWER_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9._-]{8,128}")
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    """Return the canonical standards-compliant UTF-8 JSON representation."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def is_valid_attempt_id(value: object) -> bool:
+    return isinstance(value, str) and _ATTEMPT_ID_RE.fullmatch(value) is not None
+
+
+def is_lower_sha256(value: object) -> bool:
+    return isinstance(value, str) and _LOWER_SHA256_RE.fullmatch(value) is not None
+
+
+def validate_generation_metadata(metadata: object) -> GenerationMetadata:
+    """Validate metadata and detach its mutable generation-config mapping."""
+    if not isinstance(metadata, GenerationMetadata):
+        raise ValueError("generation_metadata must be GenerationMetadata")
+
+    for field_name in ("model_id", "model_version", "prompt_version"):
+        value = getattr(metadata, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must be a non-empty string")
+    if not is_lower_sha256(metadata.prompt_sha256):
+        raise ValueError("prompt_sha256 must be 64 lowercase hexadecimal characters")
+    if not isinstance(metadata.generation_config, Mapping):
+        raise ValueError("generation_config must be a mapping")
+
+    config: dict[str, JSONScalar] = {}
+    for key, value in metadata.generation_config.items():
+        if not isinstance(key, str):
+            raise ValueError("generation_config keys must be strings")
+        if value is None or isinstance(value, (str, bool)):
+            config[key] = value
+        elif type(value) is int:
+            config[key] = value
+        elif type(value) is float and math.isfinite(value):
+            config[key] = value
+        else:
+            raise ValueError("generation_config values must be finite JSON scalars")
+
+    canonical_json_bytes(config)
+    return GenerationMetadata(
+        model_id=metadata.model_id,
+        model_version=metadata.model_version,
+        prompt_version=metadata.prompt_version,
+        prompt_sha256=metadata.prompt_sha256,
+        generation_config=config,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeProvenance:
+    metadata: GenerationMetadata
+    generation_request_sha256: str
+    structured_output_sha256: str
+    structured_output: dict[str, object]
+
+
+def build_provenance(
+    request: ForgeRequest,
     metadata: GenerationMetadata,
-    generation_request_sha256: str,
-    structured_output_sha256: str,
-    structured_output: Mapping[str, Any],
-) -> dict[str, Any]:
+    structured_output: Mapping[str, object],
+) -> ForgeProvenance:
+    request_value = {
+        "source_ref": request.source_ref,
+        "source_sentence": request.source_sentence,
+        "learner_note": request.learner_note,
+    }
+    detached_output = copy.deepcopy(dict(structured_output))
+    return ForgeProvenance(
+        metadata=metadata,
+        generation_request_sha256=canonical_sha256(request_value),
+        structured_output_sha256=canonical_sha256(detached_output),
+        structured_output=detached_output,
+    )
+
+
+def evidence_payload(
+    *,
+    request: ForgeRequest,
+    forge_attempt_id: str,
+    provenance: ForgeProvenance,
+) -> dict[str, object]:
+    structured_output = copy.deepcopy(provenance.structured_output)
     return {
-        "forge_attempt_id": attempt_id,
-        "model_id": metadata.model_id,
-        "model_version": metadata.model_version,
-        "prompt_version": metadata.prompt_version,
-        "prompt_sha256": metadata.prompt_sha256,
+        "source_ref": request.source_ref,
+        "accepted": False,
+        "forge_attempt_id": forge_attempt_id,
+        "model_id": provenance.metadata.model_id,
+        "model_version": provenance.metadata.model_version,
+        "prompt_version": provenance.metadata.prompt_version,
+        "prompt_sha256": provenance.metadata.prompt_sha256,
         "forge_schema_version": FORGE_SCHEMA_VERSION,
         "producer_version": PRODUCER_VERSION,
-        "generation_config": dict(metadata.generation_config),
-        "generation_request_sha256": generation_request_sha256,
-        "structured_output_sha256": structured_output_sha256,
-        "structured_output": dict(structured_output),
+        "generation_config": dict(provenance.metadata.generation_config),
+        "generation_request_sha256": provenance.generation_request_sha256,
+        "structured_output_sha256": provenance.structured_output_sha256,
+        "structured_output": structured_output,
+        "target_justification": dict(
+            structured_output["target_justification"]
+        ),
     }
 
 
 def rejection_payload(
     *,
-    source_ref: str,
+    request: ForgeRequest,
+    forge_attempt_id: str,
+    provenance: ForgeProvenance,
     outcome: str,
-    phase: str,
-    attempt_id: str,
-    provenance: Mapping[str, Any],
-    violations: Sequence[str] = (),
-    decided_by: str = "",
-    duplicate_note_ids: Sequence[int] = (),
-) -> dict[str, Any]:
-    payload = {
-        "source_ref": source_ref,
-        "accepted": False,
-        "outcome": outcome,
-        "phase": phase,
-        "violations": list(violations),
-        **dict(provenance),
-    }
-    payload["forge_attempt_id"] = attempt_id
-    if decided_by:
+    violations: tuple[str, ...] = (),
+    decided_by: str | None = None,
+    duplicate_note_ids: tuple[int, ...] = (),
+) -> dict[str, object]:
+    payload = evidence_payload(
+        request=request,
+        forge_attempt_id=forge_attempt_id,
+        provenance=provenance,
+    )
+    payload["outcome"] = outcome
+    if violations:
+        payload["violations"] = list(violations)
+    if decided_by is not None:
         payload["decided_by"] = decided_by
     if duplicate_note_ids:
         payload["duplicate_note_ids"] = list(duplicate_note_ids)
@@ -64,116 +164,45 @@ def rejection_payload(
 
 def commit_intent_payload(
     *,
-    source_ref: str,
-    attempt_id: str,
+    request: ForgeRequest,
+    forge_attempt_id: str,
+    provenance: ForgeProvenance,
     confirmed_by: str,
-    provenance: Mapping[str, Any],
-) -> dict[str, Any]:
-    payload = {
-        "source_ref": source_ref,
-        "accepted": False,
-        "outcome": "COMMIT_INTENT",
-        "confirmed_by": confirmed_by,
-        **dict(provenance),
-    }
-    payload["forge_attempt_id"] = attempt_id
+) -> dict[str, object]:
+    payload = evidence_payload(
+        request=request,
+        forge_attempt_id=forge_attempt_id,
+        provenance=provenance,
+    )
+    payload.update(
+        {
+            "outcome": "COMMIT_INTENT",
+            "confirmed_by": confirmed_by,
+        }
+    )
     return payload
-
-
-def uncertain_payload(
-    *,
-    source_ref: str,
-    attempt_id: str,
-    error_kind: str,
-) -> dict[str, Any]:
-    return {
-        "source_ref": source_ref,
-        "accepted": False,
-        "outcome": "ANKI_COMMIT_UNCERTAIN",
-        "forge_attempt_id": attempt_id,
-        "error_kind": error_kind,
-    }
 
 
 def acceptance_payload(
     *,
     source_ref: str,
-    attempt_id: str,
+    forge_attempt_id: str,
     note_id: int,
     structured_output_sha256: str,
     repaired: bool = False,
-) -> dict[str, Any]:
-    payload = {
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "source_ref": source_ref,
         "accepted": True,
-        "forge_attempt_id": attempt_id,
+        "forge_attempt_id": forge_attempt_id,
         "note_id": note_id,
         "structured_output_sha256": structured_output_sha256,
     }
     if repaired:
-        payload["repaired"] = True
-        payload["repair_reason"] = "recovered-from-commit-intent"
-    return payload
-
-
-def abandoned_payload(
-    *,
-    source_ref: str,
-    attempt_id: str,
-    reason: str,
-) -> dict[str, Any]:
-    return {
-        "source_ref": source_ref,
-        "accepted": False,
-        "outcome": "INTENT_ABANDONED",
-        "forge_attempt_id": attempt_id,
-        "reason": reason,
-    }
-
-
-@dataclass(frozen=True, slots=True)
-class AttemptState:
-    attempt_id: str
-    unit_key: str
-    intent: Event | None
-    acceptance: Event | None
-    abandoned: Event | None
-    events: tuple[Event, ...]
-
-    @property
-    def pending(self) -> bool:
-        return self.intent is not None and self.acceptance is None and self.abandoned is None
-
-
-def analyze_attempts(events: Sequence[Event]) -> dict[str, AttemptState]:
-    groups: dict[str, list[Event]] = defaultdict(list)
-    for event in events:
-        if event.event != "FORGE":
-            continue
-        attempt_id = event.payload.get("forge_attempt_id")
-        if isinstance(attempt_id, str) and attempt_id:
-            groups[attempt_id].append(event)
-
-    result: dict[str, AttemptState] = {}
-    for attempt_id, group in groups.items():
-        intents = [e for e in group if e.payload.get("outcome") == "COMMIT_INTENT"]
-        accepted = [e for e in group if e.payload.get("accepted") is True]
-        abandoned = [e for e in group if e.payload.get("outcome") == "INTENT_ABANDONED"]
-        if len(intents) > 1 or len(accepted) > 1 or len(abandoned) > 1:
-            raise ValueError(f"inconsistent FORGE attempt history for {attempt_id!r}")
-        unit_keys = {e.unit_key for e in group}
-        if len(unit_keys) != 1:
-            raise ValueError(f"attempt {attempt_id!r} spans multiple unit_key values")
-        result[attempt_id] = AttemptState(
-            attempt_id=attempt_id,
-            unit_key=next(iter(unit_keys)),
-            intent=intents[0] if intents else None,
-            acceptance=accepted[0] if accepted else None,
-            abandoned=abandoned[0] if abandoned else None,
-            events=tuple(group),
+        payload.update(
+            {
+                "repaired": True,
+                "repair_reason": "recovered-from-commit-intent",
+            }
         )
-    return result
-
-
-def pending_for_unit(states: Mapping[str, AttemptState], unit_key: str) -> tuple[AttemptState, ...]:
-    return tuple(state for state in states.values() if state.unit_key == unit_key and state.pending)
+    return payload

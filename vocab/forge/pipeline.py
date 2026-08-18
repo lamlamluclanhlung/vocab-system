@@ -1,33 +1,31 @@
-"""T6 Forge orchestration."""
+"""Single-writer T6 Forge pipeline."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import copy
+import re
+from collections.abc import Callable
 from datetime import date
-from typing import Any
 
+from ..contracts import SOURCE_REF_PATTERN, UNIT_KEY_PATTERN, UNIT_KEY_SEPARATOR
+from ..models import Event, VocabUnit
 from ..validators import validate_forge_unit
-from .build import (
-    build_candidate,
-    build_preview,
-    generation_request_sha256,
-    identity_trusted,
-    structured_output_sha256,
-    unit_key_query,
-    validate_attempt_id,
-    validate_generation_metadata,
-    validate_preflight,
-)
+from .build import build_preview, build_unit_key_query, build_vocab_unit
 from .event_payloads import (
+    ForgeProvenance,
     acceptance_payload,
-    analyze_attempts,
+    build_provenance,
     commit_intent_payload,
-    pending_for_unit,
-    provenance_payload,
+    is_valid_attempt_id,
     rejection_payload,
-    uncertain_payload,
+    validate_generation_metadata,
 )
 from .ports import AnkiGateway, ConfirmationPort, EventLogPort, Generator
+from .recovery import (
+    PendingStatus,
+    inspect_pending_intent,
+    read_forge_events,
+)
 from .request import (
     ConfirmationDecision,
     ForgeRequest,
@@ -35,99 +33,145 @@ from .request import (
     ForgeStatus,
     GenerationMetadata,
 )
-from .schema import FORGE_JSON_SCHEMA, ForgeSchemaError, parse_forge_output
+from .schema import FORGE_JSON_SCHEMA, parse_strict_output
 
 
-def _aborted(outcome: str, *, violations: tuple[str, ...] = ()) -> ForgeResult:
-    return ForgeResult(status=ForgeStatus.ABORTED, outcome=outcome, violations=violations)
+_SOURCE_REF_RE = re.compile(SOURCE_REF_PATTERN)
+_UNIT_KEY_RE = re.compile(UNIT_KEY_PATTERN)
 
 
-def _read_attempts(event_log: EventLogPort):
-    return analyze_attempts(event_log.read(event_type="FORGE"))
+class _AttemptAllocator:
+    def __init__(self, factory: Callable[[], str]) -> None:
+        self._factory = factory
+        self._called = False
+        self._value = ""
+
+    def get(self) -> str | None:
+        if self._called:
+            return self._value or None
+        self._called = True
+        try:
+            candidate = self._factory()
+        except Exception:
+            return None
+        if not is_valid_attempt_id(candidate):
+            return None
+        self._value = candidate
+        return candidate
 
 
-def _new_attempt_id(factory: Callable[[], str], existing: Mapping[str, object]) -> str:
-    attempt_id = validate_attempt_id(factory())
-    if attempt_id in existing:
-        raise ValueError(f"forge_attempt_id already exists: {attempt_id!r}")
-    return attempt_id
-
-
-def _producer_justification_ok(output: Mapping[str, Any]) -> bool:
-    justification = output["target_justification"]
-    assert isinstance(justification, Mapping)
-    expected = {
-        channel
-        for channel in ("W", "S")
-        if output[f"target_{channel}"] is True
-    }
-    actual = set(justification)
-    if actual != expected:
-        return False
-    return all(
-        isinstance(justification[channel], str) and justification[channel].strip()
-        for channel in expected
+def _request_is_valid(request: object, deck_name: object) -> bool:
+    return (
+        isinstance(request, ForgeRequest)
+        and isinstance(deck_name, str)
+        and bool(deck_name.strip())
+        and isinstance(request.source_ref, str)
+        and _SOURCE_REF_RE.fullmatch(request.source_ref) is not None
+        and isinstance(request.source_sentence, str)
+        and bool(request.source_sentence.strip())
+        and isinstance(request.learner_note, str)
     )
+
+
+def _abort(
+    outcome: str,
+    *,
+    unit_key: str = "",
+    forge_attempt_id: str = "",
+    violations: tuple[str, ...] = (),
+) -> ForgeResult:
+    return ForgeResult(
+        ForgeStatus.ABORTED,
+        unit_key=unit_key,
+        forge_attempt_id=forge_attempt_id,
+        outcome=outcome,
+        violations=violations,
+    )
+
+
+def _log_event(
+    event_log: EventLogPort,
+    unit_key: str,
+    payload: dict[str, object],
+) -> bool:
+    try:
+        stored = event_log.log("FORGE", unit_key, payload)
+    except Exception:
+        return False
+    return isinstance(stored, Event)
 
 
 def _emit_rejection(
     *,
-    unit_key: str,
-    source_ref: str,
-    outcome: str,
-    phase: str,
-    violations: tuple[str, ...],
-    structured_output: Mapping[str, Any],
-    request_hash: str,
-    output_hash: str,
-    metadata: GenerationMetadata,
+    unit: VocabUnit,
+    request: ForgeRequest,
+    provenance: ForgeProvenance,
     event_log: EventLogPort,
-    attempt_id_factory: Callable[[], str],
-    decided_by: str = "",
+    attempts: _AttemptAllocator,
+    outcome: str,
+    violations: tuple[str, ...] = (),
+    decided_by: str | None = None,
     duplicate_note_ids: tuple[int, ...] = (),
 ) -> ForgeResult:
-    try:
-        states = _read_attempts(event_log)
-    except Exception:
-        return _aborted("EVENTLOG_UNAVAILABLE")
-    try:
-        attempt_id = _new_attempt_id(attempt_id_factory, states)
-    except (TypeError, ValueError):
-        return _aborted("ATTEMPT_ID_INVALID")
-
-    provenance = provenance_payload(
-        attempt_id=attempt_id,
-        metadata=metadata,
-        generation_request_sha256=request_hash,
-        structured_output_sha256=output_hash,
-        structured_output=structured_output,
-    )
-    try:
-        event_log.log(
-            "FORGE",
-            unit_key,
-            rejection_payload(
-                source_ref=source_ref,
-                outcome=outcome,
-                phase=phase,
-                attempt_id=attempt_id,
-                provenance=provenance,
-                violations=violations,
-                decided_by=decided_by,
-                duplicate_note_ids=duplicate_note_ids,
-            ),
+    attempt_id = attempts.get()
+    if attempt_id is None:
+        return _abort(
+            "ATTEMPT_ID_INVALID",
+            unit_key=unit.unit_key,
+            violations=violations,
         )
-    except Exception:
-        return _aborted("EVENTLOG_UNAVAILABLE")
-
-    return ForgeResult(
-        status=ForgeStatus.REJECTED,
-        unit_key=unit_key,
+    payload = rejection_payload(
+        request=request,
         forge_attempt_id=attempt_id,
+        provenance=provenance,
         outcome=outcome,
         violations=violations,
-        ambiguous_note_ids=duplicate_note_ids if len(duplicate_note_ids) > 1 else (),
+        decided_by=decided_by,
+        duplicate_note_ids=duplicate_note_ids,
     )
+    if not _log_event(event_log, unit.unit_key, payload):
+        return _abort(
+            "EVENTLOG_UNAVAILABLE",
+            unit_key=unit.unit_key,
+            forge_attempt_id=attempt_id,
+            violations=violations,
+        )
+    return ForgeResult(
+        ForgeStatus.REJECTED,
+        unit_key=unit.unit_key,
+        forge_attempt_id=attempt_id,
+        note_id=(duplicate_note_ids[0] if len(duplicate_note_ids) == 1 else None),
+        outcome=outcome,
+        violations=violations,
+        ambiguous_note_ids=(
+            duplicate_note_ids if len(duplicate_note_ids) > 1 else ()
+        ),
+    )
+
+
+def _justification_is_valid(structured_output: dict[str, object]) -> bool:
+    justification = structured_output["target_justification"]
+    if not isinstance(justification, dict):
+        return False
+    for channel in ("W", "S"):
+        enabled = structured_output[f"target_{channel}"] is True
+        if enabled:
+            if channel not in justification or not justification[channel].strip():
+                return False
+        elif channel in justification:
+            return False
+    return True
+
+
+def _find_note_ids(anki: AnkiGateway, unit_key: str) -> tuple[int, ...]:
+    result = anki.find_notes(build_unit_key_query(unit_key))
+    if not isinstance(result, list) or any(type(note_id) is not int for note_id in result):
+        raise ValueError("Anki returned malformed note IDs")
+    return tuple(result)
+
+
+def _uncertain_error_kind(error: BaseException | None) -> str:
+    return "MALFORMED_RESPONSE" if error is None else type(error).__name__
 
 
 def forge(
@@ -142,218 +186,217 @@ def forge(
     today: Callable[[], date],
     attempt_id_factory: Callable[[], str],
 ) -> ForgeResult:
-    """Run one fail-closed T6 Forge attempt."""
-    validate_generation_metadata(generation_metadata)
-    if not validate_preflight(request, deck_name):
-        return _aborted("REQUEST_INVALID")
-
-    request_hash = generation_request_sha256(request)
+    """Generate, validate, confirm, and durably commit one vocabulary Unit."""
+    if not _request_is_valid(request, deck_name):
+        return _abort("REQUEST_INVALID")
     try:
-        raw_output = generator.generate(
+        metadata = validate_generation_metadata(generation_metadata)
+    except Exception:
+        return _abort("REQUEST_INVALID")
+
+    generator_metadata = GenerationMetadata(
+        model_id=metadata.model_id,
+        model_version=metadata.model_version,
+        prompt_version=metadata.prompt_version,
+        prompt_sha256=metadata.prompt_sha256,
+        generation_config=dict(metadata.generation_config),
+    )
+    try:
+        generated = generator.generate(
             request,
-            json_schema=FORGE_JSON_SCHEMA,
-            metadata=generation_metadata,
+            json_schema=copy.deepcopy(FORGE_JSON_SCHEMA),
+            metadata=generator_metadata,
         )
     except Exception:
-        return _aborted("GENERATION_FAILED")
+        return _abort("GENERATION_FAILED")
 
     try:
-        output = parse_forge_output(raw_output)
-    except (ForgeSchemaError, TypeError, ValueError):
-        return _aborted("SCHEMA_INVALID")
+        structured_output = parse_strict_output(generated)
+    except Exception:
+        return _abort("SCHEMA_INVALID")
 
-    current_day = today()
-    if not isinstance(current_day, date):
-        raise TypeError("today() must return datetime.date")
-    unit = build_candidate(request, output, today=current_day)
+    try:
+        created_on = today()
+        unit = build_vocab_unit(
+            structured_output,
+            request,
+            created_on=created_on,
+        )
+    except Exception:
+        return _abort("REQUEST_INVALID")
+
     violations = validate_forge_unit(unit)
+    identity_trusted = (
+        _UNIT_KEY_RE.fullmatch(unit.unit_key) is not None
+        and unit.unit_key
+        == unit.lemma_slug + UNIT_KEY_SEPARATOR + unit.sense_slug
+    )
+    if not identity_trusted:
+        return _abort("IDENTITY_INVALID", violations=violations)
 
-    if not identity_trusted(unit):
-        return _aborted("IDENTITY_INVALID", violations=violations)
-
-    output_hash = structured_output_sha256(output)
+    provenance = build_provenance(request, metadata, structured_output)
+    attempts = _AttemptAllocator(attempt_id_factory)
     if violations:
         return _emit_rejection(
-            unit_key=unit.unit_key,
-            source_ref=unit.source_ref,
+            unit=unit,
+            request=request,
+            provenance=provenance,
+            event_log=event_log,
+            attempts=attempts,
             outcome="VALIDATOR_REJECTED",
-            phase="validate",
             violations=violations,
-            structured_output=output,
-            request_hash=request_hash,
-            output_hash=output_hash,
-            metadata=generation_metadata,
-            event_log=event_log,
-            attempt_id_factory=attempt_id_factory,
         )
-
-    if not _producer_justification_ok(output):
+    if not _justification_is_valid(structured_output):
         return _emit_rejection(
-            unit_key=unit.unit_key,
-            source_ref=unit.source_ref,
-            outcome="JUSTIFICATION_MISSING",
-            phase="justification",
-            violations=(),
-            structured_output=output,
-            request_hash=request_hash,
-            output_hash=output_hash,
-            metadata=generation_metadata,
+            unit=unit,
+            request=request,
+            provenance=provenance,
             event_log=event_log,
-            attempt_id_factory=attempt_id_factory,
+            attempts=attempts,
+            outcome="JUSTIFICATION_MISSING",
         )
 
     try:
-        states = _read_attempts(event_log)
+        forge_events = read_forge_events(event_log)
+        pending = inspect_pending_intent(forge_events, unit.unit_key)
     except Exception:
-        return _aborted("EVENTLOG_UNAVAILABLE")
-
-    pending = pending_for_unit(states, unit.unit_key)
-    if pending:
-        if len(pending) > 1:
-            return ForgeResult(
-                status=ForgeStatus.COMMIT_UNCERTAIN,
-                unit_key=unit.unit_key,
-                outcome="PENDING_INTENT_AMBIGUOUS",
-            )
-        state = pending[0]
+        return _abort("EVENTLOG_UNAVAILABLE", unit_key=unit.unit_key)
+    if pending.status is PendingStatus.AMBIGUOUS:
+        return ForgeResult(
+            ForgeStatus.COMMIT_UNCERTAIN,
+            unit_key=unit.unit_key,
+            outcome="PENDING_INTENT_AMBIGUOUS",
+        )
+    if pending.status is PendingStatus.ONE:
         try:
-            note_ids = tuple(anki.find_notes(unit_key_query(unit.unit_key)))
+            note_ids = _find_note_ids(anki, unit.unit_key)
         except Exception:
-            return _aborted("ANKI_READ_FAILED")
+            return _abort(
+                "ANKI_READ_FAILED",
+                unit_key=unit.unit_key,
+                forge_attempt_id=pending.forge_attempt_id,
+            )
+        if not note_ids:
+            return ForgeResult(
+                ForgeStatus.COMMIT_UNCERTAIN,
+                unit_key=unit.unit_key,
+                forge_attempt_id=pending.forge_attempt_id,
+                outcome="PENDING_INTENT",
+            )
         if len(note_ids) == 1:
             return ForgeResult(
-                status=ForgeStatus.EVIDENCE_GAP,
+                ForgeStatus.EVIDENCE_GAP,
                 unit_key=unit.unit_key,
-                forge_attempt_id=state.attempt_id,
+                forge_attempt_id=pending.forge_attempt_id,
                 note_id=note_ids[0],
                 outcome="PENDING_INTENT",
             )
         return ForgeResult(
-            status=ForgeStatus.COMMIT_UNCERTAIN,
+            ForgeStatus.COMMIT_UNCERTAIN,
             unit_key=unit.unit_key,
-            forge_attempt_id=state.attempt_id,
-            outcome=("PENDING_INTENT" if not note_ids else "PENDING_INTENT_AMBIGUOUS"),
-            ambiguous_note_ids=note_ids if len(note_ids) > 1 else (),
+            forge_attempt_id=pending.forge_attempt_id,
+            outcome="PENDING_INTENT_AMBIGUOUS",
+            ambiguous_note_ids=note_ids,
         )
 
     try:
-        note_ids = tuple(anki.find_notes(unit_key_query(unit.unit_key)))
+        duplicate_note_ids = _find_note_ids(anki, unit.unit_key)
     except Exception:
-        return _aborted("ANKI_READ_FAILED")
-    if note_ids:
+        return _abort("ANKI_READ_FAILED", unit_key=unit.unit_key)
+    if duplicate_note_ids:
         return _emit_rejection(
-            unit_key=unit.unit_key,
-            source_ref=unit.source_ref,
-            outcome="DUPLICATE",
-            phase="dedup",
-            violations=(),
-            structured_output=output,
-            request_hash=request_hash,
-            output_hash=output_hash,
-            metadata=generation_metadata,
+            unit=unit,
+            request=request,
+            provenance=provenance,
             event_log=event_log,
-            attempt_id_factory=attempt_id_factory,
-            duplicate_note_ids=note_ids,
+            attempts=attempts,
+            outcome="DUPLICATE",
+            duplicate_note_ids=duplicate_note_ids,
         )
 
-    preview = build_preview(unit, output["target_justification"])
-    decision = confirmation.decide(preview)
-    if not isinstance(decision, ConfirmationDecision):
-        raise TypeError("ConfirmationPort.decide() must return ConfirmationDecision")
-    if not isinstance(decision.actor_id, str) or not decision.actor_id.strip():
-        raise ValueError("confirmation actor_id must be non-empty")
+    justification = structured_output["target_justification"]
+    preview = build_preview(unit, justification)
+    try:
+        decision = confirmation.decide(preview)
+    except Exception:
+        return _abort("REQUEST_INVALID", unit_key=unit.unit_key)
+    if (
+        not isinstance(decision, ConfirmationDecision)
+        or type(decision.confirmed) is not bool
+        or not isinstance(decision.actor_id, str)
+        or not decision.actor_id.strip()
+    ):
+        return _abort("REQUEST_INVALID", unit_key=unit.unit_key)
     if not decision.confirmed:
         return _emit_rejection(
-            unit_key=unit.unit_key,
-            source_ref=unit.source_ref,
-            outcome="HUMAN_DECLINED",
-            phase="confirm",
-            violations=(),
-            structured_output=output,
-            request_hash=request_hash,
-            output_hash=output_hash,
-            metadata=generation_metadata,
+            unit=unit,
+            request=request,
+            provenance=provenance,
             event_log=event_log,
-            attempt_id_factory=attempt_id_factory,
+            attempts=attempts,
+            outcome="HUMAN_DECLINED",
             decided_by=decision.actor_id,
         )
 
-    try:
-        attempt_id = _new_attempt_id(attempt_id_factory, states)
-    except (TypeError, ValueError):
-        return _aborted("ATTEMPT_ID_INVALID")
-    provenance = provenance_payload(
-        attempt_id=attempt_id,
-        metadata=generation_metadata,
-        generation_request_sha256=request_hash,
-        structured_output_sha256=output_hash,
-        structured_output=output,
+    attempt_id = attempts.get()
+    if attempt_id is None:
+        return _abort("ATTEMPT_ID_INVALID", unit_key=unit.unit_key)
+    intent = commit_intent_payload(
+        request=request,
+        forge_attempt_id=attempt_id,
+        provenance=provenance,
+        confirmed_by=decision.actor_id,
     )
-    try:
-        event_log.log(
-            "FORGE",
-            unit.unit_key,
-            commit_intent_payload(
-                source_ref=unit.source_ref,
-                attempt_id=attempt_id,
-                confirmed_by=decision.actor_id,
-                provenance=provenance,
-            ),
+    if not _log_event(event_log, unit.unit_key, intent):
+        return _abort(
+            "EVENTLOG_UNAVAILABLE",
+            unit_key=unit.unit_key,
+            forge_attempt_id=attempt_id,
         )
-    except Exception:
-        return _aborted("EVENTLOG_UNAVAILABLE")
 
+    error: BaseException | None = None
     try:
-        created_ids = anki.add_notes(deck_name, [unit])
-        if (
-            not isinstance(created_ids, list)
-            or len(created_ids) != 1
-            or type(created_ids[0]) is not int
-        ):
-            raise ValueError("add_notes did not prove exactly one note creation")
+        add_result = anki.add_notes(deck_name, [unit])
     except Exception as exc:
-        try:
-            event_log.log(
-                "FORGE",
-                unit.unit_key,
-                uncertain_payload(
-                    source_ref=unit.source_ref,
-                    attempt_id=attempt_id,
-                    error_kind=type(exc).__name__,
-                ),
-            )
-        except Exception:
-            pass
+        error = exc
+        add_result = None
+    if (
+        not isinstance(add_result, list)
+        or len(add_result) != 1
+        or type(add_result[0]) is not int
+    ):
+        uncertain_payload = {
+            "source_ref": request.source_ref,
+            "accepted": False,
+            "outcome": "ANKI_COMMIT_UNCERTAIN",
+            "forge_attempt_id": attempt_id,
+            "error_kind": _uncertain_error_kind(error),
+        }
+        _log_event(event_log, unit.unit_key, uncertain_payload)
         return ForgeResult(
-            status=ForgeStatus.COMMIT_UNCERTAIN,
+            ForgeStatus.COMMIT_UNCERTAIN,
             unit_key=unit.unit_key,
             forge_attempt_id=attempt_id,
             outcome="ANKI_COMMIT_UNCERTAIN",
         )
 
-    note_id = created_ids[0]
-    try:
-        event_log.log(
-            "FORGE",
-            unit.unit_key,
-            acceptance_payload(
-                source_ref=unit.source_ref,
-                attempt_id=attempt_id,
-                note_id=note_id,
-                structured_output_sha256=output_hash,
-            ),
-        )
-    except Exception:
+    note_id = add_result[0]
+    accepted_payload = acceptance_payload(
+        source_ref=request.source_ref,
+        forge_attempt_id=attempt_id,
+        note_id=note_id,
+        structured_output_sha256=provenance.structured_output_sha256,
+    )
+    if not _log_event(event_log, unit.unit_key, accepted_payload):
         return ForgeResult(
-            status=ForgeStatus.EVIDENCE_GAP,
+            ForgeStatus.EVIDENCE_GAP,
             unit_key=unit.unit_key,
             forge_attempt_id=attempt_id,
             note_id=note_id,
             outcome="ACCEPTANCE_UNWRITABLE",
         )
-
     return ForgeResult(
-        status=ForgeStatus.CREATED,
+        ForgeStatus.CREATED,
         unit_key=unit.unit_key,
         forge_attempt_id=attempt_id,
         note_id=note_id,
