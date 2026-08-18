@@ -11,9 +11,9 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .anki_template import AnkiTemplateViolation, verify_model_snapshot
 from .contracts import (
     ANKI_NOTE_TYPE_NAME,
-    CARD_TEMPLATE_NAMES,
     IMMUTABLE_NOTE_FIELDS,
     NOTE_FIELDS,
 )
@@ -89,6 +89,20 @@ class AnkiNoteCreationError(AnkiConnectError):
 
 class AnkiNoteTypeMismatchError(AnkiConnectError):
     """Raised when the installed VocabularyUnit note type violates contracts."""
+
+
+class AnkiCardTemplateError(AnkiNoteTypeMismatchError):
+    """Raised with all deterministic note-type semantic violations."""
+
+    def __init__(
+        self,
+        violations: Sequence[AnkiTemplateViolation],
+    ) -> None:
+        self.violations = tuple(violations)
+        super().__init__(
+            "Anki note type semantic verification failed: "
+            + "; ".join(str(violation) for violation in self.violations)
+        )
 
 
 class AnkiConnectClient:
@@ -312,50 +326,28 @@ class AnkiConnectClient:
         return result
 
     def verify_note_type(self) -> bool:
-        """Verify the frozen field order and template-name set without repair."""
-        fields = self._invoke(
-            "modelFieldNames",
-            {"modelName": ANKI_NOTE_TYPE_NAME},
+        """Read and verify the complete note-type snapshot without repair."""
+        models = self._invoke(
+            "findModelsByName",
+            {"modelNames": [ANKI_NOTE_TYPE_NAME]},
         )
-        if not isinstance(fields, list) or any(
-            not isinstance(field_name, str) for field_name in fields
+        if not isinstance(models, list) or any(
+            not isinstance(model, dict) for model in models
         ):
             raise AnkiResponseError(
-                "modelFieldNames",
-                "result must be a list of field names",
-                response=fields,
+                "findModelsByName",
+                "result must be a list of model objects",
+                response=models,
             )
-        if tuple(fields) != NOTE_FIELDS:
-            missing = tuple(field for field in NOTE_FIELDS if field not in fields)
-            extra = tuple(field for field in fields if field not in NOTE_FIELDS)
+        if len(models) != 1:
             raise AnkiNoteTypeMismatchError(
-                f"Anki note type {ANKI_NOTE_TYPE_NAME!r} field order does not "
-                f"match NOTE_FIELDS; missing={missing}, extra={extra}, "
-                f"expected={NOTE_FIELDS}, actual={tuple(fields)}"
+                f"findModelsByName must return exactly one "
+                f"{ANKI_NOTE_TYPE_NAME!r} model, received {len(models)}"
             )
 
-        templates = self._invoke(
-            "modelTemplates",
-            {"modelName": ANKI_NOTE_TYPE_NAME},
-        )
-        if not isinstance(templates, dict) or any(
-            not isinstance(template_name, str) for template_name in templates
-        ):
-            raise AnkiResponseError(
-                "modelTemplates",
-                "result must be an object keyed by template name",
-                response=templates,
-            )
-
-        actual_names = set(templates)
-        expected_names = set(CARD_TEMPLATE_NAMES)
-        if actual_names != expected_names:
-            raise AnkiNoteTypeMismatchError(
-                f"Anki note type {ANKI_NOTE_TYPE_NAME!r} template names do not "
-                f"match CARD_TEMPLATE_NAMES; missing="
-                f"{tuple(sorted(expected_names - actual_names))}, extra="
-                f"{tuple(sorted(actual_names - expected_names))}"
-            )
+        violations = verify_model_snapshot(models[0])
+        if violations:
+            raise AnkiCardTemplateError(violations)
         return True
 
     @staticmethod

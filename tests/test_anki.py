@@ -13,6 +13,7 @@ import pytest
 import vocab.anki as anki_module
 from vocab.anki import (
     AnkiAPIError,
+    AnkiCardTemplateError,
     AnkiConnectClient,
     AnkiConnectionError,
     AnkiNoteCreationError,
@@ -21,9 +22,11 @@ from vocab.anki import (
 )
 from vocab.contracts import (
     ANKI_NOTE_TYPE_NAME,
+    ANKI_SORT_FIELD,
     CARD_TEMPLATE_NAMES,
     IMMUTABLE_NOTE_FIELDS,
     NOTE_FIELDS,
+    TARGET_FIELD_BY_CHANNEL,
 )
 from vocab.models import VocabUnit
 
@@ -329,28 +332,62 @@ def test_add_notes_fails_closed_for_partial_or_failed_creation(
     assert captured.value.result == result
 
 
-def install_valid_note_type(monkeypatch, templates=None):
-    if templates is None:
-        templates = {name: {} for name in CARD_TEMPLATE_NAMES}
+def valid_note_type_snapshot() -> dict[str, Any]:
+    field_ordinals = {name: index for index, name in enumerate(NOTE_FIELDS)}
+    templates = []
+    requirements = []
+    for ordinal, name in enumerate(CARD_TEMPLATE_NAMES):
+        target = TARGET_FIELD_BY_CHANNEL[name]
+        content = "Ctx_1" if name == "R" else "lemma"
+        templates.append(
+            {
+                "name": name,
+                "ord": ordinal,
+                "qfmt": (
+                    f"{{{{#{target}}}}}{{{{{content}}}}}"
+                    f"{{{{/{target}}}}}"
+                ),
+                "afmt": "{{FrontSide}}{{definition_en}}",
+            }
+        )
+        requirements.append(
+            [ordinal, "any", [field_ordinals[target]]]
+        )
+    return {
+        "id": 1704387367119,
+        "name": ANKI_NOTE_TYPE_NAME,
+        "sortf": field_ordinals[ANKI_SORT_FIELD],
+        "flds": [
+            {"name": name, "ord": ordinal}
+            for ordinal, name in enumerate(NOTE_FIELDS)
+        ],
+        "tmpls": templates,
+        "req": requirements,
+        "css": ".card { color: black; }",
+    }
+
+
+def install_valid_note_type(monkeypatch, model=None):
+    if model is None:
+        model = valid_note_type_snapshot()
     return install_responses(
         monkeypatch,
-        [response_body(list(NOTE_FIELDS)), response_body(templates)],
+        [response_body([model])],
     )
 
 
 def test_verify_note_type_accepts_frozen_contract(monkeypatch) -> None:
+    # Deliberate contract hardening: empty template dictionaries used to pass
+    # this test, which was the semantic-verification gap addressed by D25.
     calls = install_valid_note_type(monkeypatch)
 
     assert AnkiConnectClient().verify_note_type() is True
     assert [request_envelope(call)["action"] for call in calls] == [
-        "modelFieldNames",
-        "modelTemplates",
+        "findModelsByName",
     ]
-    assert all(
-        request_envelope(call)["params"]
-        == {"modelName": ANKI_NOTE_TYPE_NAME}
-        for call in calls
-    )
+    assert request_envelope(calls[0])["params"] == {
+        "modelNames": [ANKI_NOTE_TYPE_NAME]
+    }
 
 
 @pytest.mark.parametrize(
@@ -363,37 +400,88 @@ def test_verify_note_type_accepts_frozen_contract(monkeypatch) -> None:
     ids=["missing", "extra", "reordered"],
 )
 def test_verify_note_type_rejects_field_mismatch(monkeypatch, fields) -> None:
-    install_responses(monkeypatch, [response_body(fields)])
+    model = valid_note_type_snapshot()
+    model["flds"] = [
+        {"name": name, "ord": ordinal}
+        for ordinal, name in enumerate(fields)
+    ]
+    install_valid_note_type(monkeypatch, model)
 
     with pytest.raises(AnkiNoteTypeMismatchError, match="field order"):
         AnkiConnectClient().verify_note_type()
 
 
 @pytest.mark.parametrize(
-    "templates",
+    "change",
     [
-        {name: {} for name in CARD_TEMPLATE_NAMES[:-1]},
-        {**{name: {} for name in CARD_TEMPLATE_NAMES}, "Extra": {}},
+        "missing",
+        "extra",
+        "renamed",
     ],
-    ids=["missing", "extra"],
+    ids=["missing", "extra", "renamed"],
 )
 def test_verify_note_type_rejects_template_name_mismatch(
     monkeypatch,
-    templates,
+    change,
 ) -> None:
-    install_responses(
-        monkeypatch,
-        [response_body(list(NOTE_FIELDS)), response_body(templates)],
-    )
+    model = valid_note_type_snapshot()
+    templates = model["tmpls"]
+    if change == "missing":
+        templates.pop()
+    elif change == "extra":
+        templates.append(
+            {
+                "name": "Extra",
+                "ord": 99,
+                "qfmt": "extra",
+                "afmt": "extra",
+            }
+        )
+    else:
+        templates[0]["name"] = "Renamed"
+    install_valid_note_type(monkeypatch, model)
 
     with pytest.raises(AnkiNoteTypeMismatchError, match="template names"):
         AnkiConnectClient().verify_note_type()
 
 
-def test_verify_note_type_ignores_template_ordinal_and_response_order(
+def test_verify_note_type_ignores_template_response_order(
     monkeypatch,
 ) -> None:
-    templates = {name: {} for name in ("S", "W", "R", "L")}
-    install_valid_note_type(monkeypatch, templates)
+    model = valid_note_type_snapshot()
+    model["tmpls"] = list(reversed(model["tmpls"]))
+    install_valid_note_type(monkeypatch, model)
 
     assert AnkiConnectClient().verify_note_type() is True
+
+
+def test_verify_note_type_exposes_all_semantic_violations(monkeypatch) -> None:
+    model = valid_note_type_snapshot()
+    model["tmpls"][0]["qfmt"] = ""
+    model["tmpls"][0]["afmt"] = ""
+    install_valid_note_type(monkeypatch, model)
+
+    with pytest.raises(AnkiCardTemplateError) as captured:
+        AnkiConnectClient().verify_note_type()
+
+    violation_codes = tuple(
+        violation.code for violation in captured.value.violations
+    )
+    assert "TEMPLATE_FRONT_EMPTY" in violation_codes
+    assert "TEMPLATE_BACK_EMPTY" in violation_codes
+
+
+def test_verify_note_type_does_not_fallback_when_rich_api_is_unsupported(
+    monkeypatch,
+) -> None:
+    calls = install_responses(
+        monkeypatch,
+        [response_body(None, "unsupported action")],
+    )
+
+    with pytest.raises(AnkiAPIError, match="unsupported action"):
+        AnkiConnectClient().verify_note_type()
+
+    assert [request_envelope(call)["action"] for call in calls] == [
+        "findModelsByName"
+    ]

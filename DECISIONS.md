@@ -1125,3 +1125,31 @@ T6 does not require an iterator refactor.
 **Reason:** T6 will begin writing semantically important FORGE decisions.
 The append-only log must enforce stable structural boundaries without becoming
 a second implementation of every producer's business rules.
+
+## D25 — T3 verifies card-template semantics without mutation
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Blocks:** T3, T4
+
+T3 verification must validate the semantics of normal Anki card templates.
+It does not require byte-for-byte template equality.
+
+For each normal card template `X` in `R`, `L`, `W`, and `S`, `Target_X` must
+gate generation of card `X`.
+
+Normal review templates must not reference `Ctx_2` through `Ctx_5`. Those
+fields remain reserved for novel-context assessment under D15.
+
+Executable JavaScript is forbidden in normal review templates because it can
+invalidate deterministic card-generation and context-selection guarantees.
+
+The verifier is read-only and fails closed. It must not create, update, repair,
+or otherwise mutate the installed Anki note type.
+
+CSS is not a semantic PASS/FAIL contract in v0. Cosmetic CSS changes therefore
+do not cause semantic verification failure.
+
+This decision does not add the proposed C8 pedagogical answer-leak table for
+the R/L/W/S templates. No new channel-specific answer-content requirements are
+introduced here.

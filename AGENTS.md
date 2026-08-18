@@ -14,6 +14,7 @@ If these sources conflict, STOP and report the conflict. Do not resolve it by mo
 The following files are human-owned and must be treated as read-only unless the human explicitly says otherwise:
 
 - `vocab/contracts.py`
+- `vocab/card_contract.py`
 - `vocab/models.py`
 - `vocab/validators.py`
 - `tests/test_contract_alignment.py`
@@ -62,6 +63,12 @@ Do not introduce:
 - silent retries
 - silent fallback values
 - automatic slug generation for approved vocabulary units
+
+Do not automatically mutate Anki note types. In particular, do not call:
+
+- `updateModelTemplates`
+- `updateModelStyling`
+- `createModel`
 
 Anki is the source of truth for vocabulary notes.
 
