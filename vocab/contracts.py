@@ -79,6 +79,15 @@ NOTE_FIELDS: Final[tuple[str, ...]] = (
 
 UNIQUE_NOTE_FIELD: Final[str] = "unit_key"
 
+# Stable note identity is assigned once at creation time.
+# Changing any of these fields would change the identity of the Unit rather
+# than update its mutable learning state.
+IMMUTABLE_NOTE_FIELDS: Final[tuple[str, ...]] = (
+    "unit_key",
+    "lemma_slug",
+    "sense_slug",
+)
+
 CHANNELS: Final[tuple[str, ...]] = ("R", "L", "W", "S")
 
 TARGET_FIELDS: Final[tuple[str, ...]] = (
@@ -121,9 +130,17 @@ CHANNEL_BY_TEMPLATE_NAME: Final[dict[str, str]] = {
 DEFAULT_TARGET_FIELD: Final[str] = "Target_R"
 TARGET_FLAG_VALUE: Final[str] = "1"
 
-TARGET_FIELDS_REQUIRING_JUSTIFICATION: Final[tuple[str, ...]] = (
-    "Target_W",
-    "Target_S",
+# Productive-channel targeting requires explicit provenance from FORGE.
+# The justification is NOT stored in the Anki note. It belongs in the
+# FORGE event payload so the note keeps current state while the event log
+# preserves why W/S was enabled.
+TARGET_CHANNELS_REQUIRING_JUSTIFICATION: Final[tuple[str, ...]] = (
+    "W",
+    "S",
+)
+
+FORGE_TARGET_JUSTIFICATION_PAYLOAD_FIELD: Final[str] = (
+    "target_justification"
 )
 
 CONTEXT_FIELDS: Final[tuple[str, ...]] = (
@@ -164,9 +181,72 @@ UNIT_TYPE_VALUES: Final[tuple[str, ...]] = (
     "frame",
 )
 
+# Shared deterministic Unit-matching contract for T5 validation and
+# T10 corpus scanning.
+
+TEXT_NORMALIZATION_FORM: Final[str] = "NFKC"
+
+# Normalize these common Unicode apostrophe forms to ASCII apostrophe
+# before tokenization.
+APOSTROPHE_EQUIVALENTS: Final[tuple[str, ...]] = (
+    "\u2018",  # LEFT SINGLE QUOTATION MARK
+    "\u2019",  # RIGHT SINGLE QUOTATION MARK
+    "\u02bc",  # MODIFIER LETTER APOSTROPHE
+    "\uff07",  # FULLWIDTH APOSTROPHE
+)
+
+CANONICAL_APOSTROPHE: Final[str] = "'"
+
+# One lexical token:
+# - Unicode letters/digits are allowed;
+# - underscore is not lexical content;
+# - apostrophe may occur only inside the token.
+#
+# Examples:
+# don't -> one token
+# state-of-the-art -> four tokens
+LEXICAL_TOKEN_PATTERN: Final[str] = (
+    r"[^\W_]+(?:'[^\W_]+)*"
+)
+
+CHUNK_MAX_INSERTED_TOKENS: Final[int] = 2
+
+FRAME_PLACEHOLDER: Final[str] = "___"
+FRAME_PLACEHOLDER_COUNT: Final[int] = 1
+FRAME_MIN_FIXED_TOKENS: Final[int] = 2
+FRAME_SLOT_MIN_TOKENS: Final[int] = 1
+FRAME_SLOT_MAX_TOKENS: Final[int] = 6
+
 SOURCE_REF_KINDS: Final[tuple[str, ...]] = (
     "dictionary",
     "corpus",
+)
+
+# Internal evidence reference:
+# <kind>:<namespace>:<resource-id>
+#
+# Examples:
+# dictionary:cambridge:subtle
+# corpus:ragtrust-papers:2405-12345
+#
+# This contract validates reference syntax only. Validators must not resolve
+# the reference or require the underlying resource to exist.
+_SOURCE_REF_KIND_PATTERN: Final[str] = "|".join(
+    re.escape(kind) for kind in SOURCE_REF_KINDS
+)
+
+_SOURCE_REF_NAMESPACE_PATTERN: Final[str] = (
+    r"[a-z0-9]+(?:-[a-z0-9]+)*"
+)
+
+_SOURCE_REF_RESOURCE_PATTERN: Final[str] = (
+    r"[a-z0-9][a-z0-9._-]*"
+)
+
+SOURCE_REF_PATTERN: Final[str] = (
+    rf"^(?:{_SOURCE_REF_KIND_PATTERN}):"
+    rf"{_SOURCE_REF_NAMESPACE_PATTERN}:"
+    rf"{_SOURCE_REF_RESOURCE_PATTERN}$"
 )
 
 DEFINITION_FIELD: Final[str] = "definition_en"

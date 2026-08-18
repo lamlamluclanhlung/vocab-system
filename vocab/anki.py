@@ -11,7 +11,13 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .contracts import ANKI_NOTE_TYPE_NAME, CARD_TEMPLATE_NAMES, NOTE_FIELDS
+from .contracts import (
+    ANKI_NOTE_TYPE_NAME,
+    CARD_TEMPLATE_NAMES,
+    IMMUTABLE_NOTE_FIELDS,
+    NOTE_FIELDS,
+)
+
 from .models import VocabUnit
 
 
@@ -230,6 +236,14 @@ class AnkiConnectClient:
             raise ValueError(
                 f"unknown VocabularyUnit fields: {tuple(sorted(unknown_fields))}"
             )
+        
+        immutable_fields = set(fields).intersection(IMMUTABLE_NOTE_FIELDS)
+        if immutable_fields:
+            raise ValueError(
+                "immutable VocabularyUnit fields cannot be updated: "
+                f"{tuple(sorted(immutable_fields))}"
+            )
+        
         if any(not isinstance(value, str) for value in fields.values()):
             raise TypeError("field values must be strings")
 

@@ -19,7 +19,12 @@ from vocab.anki import (
     AnkiNoteTypeMismatchError,
     AnkiResponseError,
 )
-from vocab.contracts import ANKI_NOTE_TYPE_NAME, CARD_TEMPLATE_NAMES, NOTE_FIELDS
+from vocab.contracts import (
+    ANKI_NOTE_TYPE_NAME,
+    CARD_TEMPLATE_NAMES,
+    IMMUTABLE_NOTE_FIELDS,
+    NOTE_FIELDS,
+)
 from vocab.models import VocabUnit
 
 
@@ -232,6 +237,21 @@ def test_update_note_fields_maps_explicit_subset(monkeypatch) -> None:
         },
     }
 
+
+@pytest.mark.parametrize("field_name", IMMUTABLE_NOTE_FIELDS)
+def test_update_note_fields_rejects_immutable_identity_before_http(
+    monkeypatch,
+    field_name,
+) -> None:
+    calls = install_responses(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="immutable"):
+        AnkiConnectClient().update_note_fields(
+            17,
+            {field_name: "changed-identity"},
+        )
+
+    assert calls == []
 
 def test_suspend_uses_card_ids(monkeypatch) -> None:
     calls = install_responses(monkeypatch, [response_body(True)])
