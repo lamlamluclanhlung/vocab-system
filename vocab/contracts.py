@@ -274,7 +274,7 @@ CONTEXT_VIOLATION_CODES: Final[tuple[str, ...]] = (
     "C_CTX_3_SOURCE_COPY",
     "C_CTX_4_SOURCE_COPY",
     "C_CTX_5_SOURCE_COPY",
-)
+)   
 
 FORGE_VIOLATION_CODES: Final[tuple[str, ...]] = (
     "F_LEMMA_SLUG_INVALID",
@@ -349,6 +349,12 @@ EVENT_TYPES: Final[tuple[str, ...]] = (
     "STATE",
     "SPEAK",
     "ENCOUNTER",
+)
+
+# Known event types that remain readable/recognized but must not be emitted
+# through EventLog.log() in v0.
+RESERVED_EVENT_TYPES: Final[tuple[str, ...]] = (
+    "REVIEW",
 )
 
 EVENT_PAYLOAD_REQUIRED_FIELDS: Final[dict[str, tuple[str, ...]]] = {

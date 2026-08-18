@@ -1002,3 +1002,126 @@ contexts without forcing T6 to create context artifacts prematurely. Presence,
 Unit containment, sufficient lexical material, contextual diversity, and
 source-copy protection are separate checks and therefore remain independently
 observable.
+
+## D24 — EventLog enforces structural event contracts before T6
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Blocks:** T6
+
+`EventLog` is the append-only persistence boundary for historical evidence.
+
+Before T6 begins producing FORGE events, the log boundary must reject events
+that violate the frozen structural event contract.
+
+### Required payload fields
+
+For every emitted event type, `EventLog` must require every field listed in:
+
+```python
+EVENT_PAYLOAD_REQUIRED_FIELDS
+```
+
+The log owns only unconditional structural requirements.
+
+It does not own producer-specific conditional semantics.
+
+For example, FORGE always requires:
+
+```text
+source_ref
+accepted
+```
+
+but `target_justification` remains conditional producer provenance under D16
+and is therefore validated by the T6 FORGE producer rather than made an
+unconditional EventLog requirement.
+
+Likewise, rejection-specific violation codes belong to the FORGE producer's
+semantic contract.
+
+### REVIEW is reserved
+
+`REVIEW` remains part of the event vocabulary for compatibility and future
+design, but v0 does not emit synthetic REVIEW events.
+
+Therefore:
+
+```python
+RESERVED_EVENT_TYPES = ("REVIEW",)
+```
+
+`EventLog.log()` must fail closed if asked to append a reserved event type.
+
+Existing historical decoding remains separate from this emission rule.
+
+### JSON must be standards-compliant
+
+Serialized event records must use:
+
+```python
+json.dumps(..., allow_nan=False)
+```
+
+Payload values such as:
+
+```text
+NaN
+Infinity
+-Infinity
+```
+
+must not be silently persisted as non-standard JSON tokens.
+
+A serialization failure must occur before any invalid record is appended.
+
+### Layer ownership
+
+The generic EventLog boundary owns:
+
+- known event type;
+- non-empty `unit_key`;
+- payload is a mapping;
+- unconditional required payload fields are present;
+- existing model-metadata requirements;
+- existing STATE channel validation;
+- reserved-event rejection;
+- standards-compliant JSON serialization.
+
+The producer owns semantic rules specific to the meaning of an event.
+
+Examples:
+
+```text
+FORGE:
+accepted == false -> which violation codes must be present?
+
+FORGE:
+Target_W enabled -> is target_justification["W"] present and non-empty?
+
+STATE:
+is this transition actually allowed by lifecycle policy?
+```
+
+Those rules must not be silently pulled into generic EventLog validation.
+
+### No automatic tail repair
+
+This hardening does not add automatic truncated-tail recovery.
+
+The existing fail-closed append behavior remains unchanged.
+
+A malformed tail must not be silently converted into valid history by merely
+adding a newline.
+
+Any future recovery operation must be explicit and auditable.
+
+### Read API remains unchanged
+
+`EventLog.read()` continues returning its existing list representation.
+
+T6 does not require an iterator refactor.
+
+**Reason:** T6 will begin writing semantically important FORGE decisions.
+The append-only log must enforce stable structural boundaries without becoming
+a second implementation of every producer's business rules.
