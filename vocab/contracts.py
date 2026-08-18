@@ -252,6 +252,30 @@ SOURCE_REF_PATTERN: Final[str] = (
     rf"{_SOURCE_REF_RESOURCE_PATTERN}$"
 )
 
+CONTEXT_VIOLATION_CODES: Final[tuple[str, ...]] = (
+    "C_CTX_1_EMPTY",
+    "C_CTX_2_EMPTY",
+    "C_CTX_3_EMPTY",
+    "C_CTX_4_EMPTY",
+    "C_CTX_5_EMPTY",
+    "C_CTX_1_UNIT_MISSING",
+    "C_CTX_2_UNIT_MISSING",
+    "C_CTX_3_UNIT_MISSING",
+    "C_CTX_4_UNIT_MISSING",
+    "C_CTX_5_UNIT_MISSING",
+    "C_CTX_1_TOO_SHORT",
+    "C_CTX_2_TOO_SHORT",
+    "C_CTX_3_TOO_SHORT",
+    "C_CTX_4_TOO_SHORT",
+    "C_CTX_5_TOO_SHORT",
+    "C_CONTEXTS_NOT_DISTINCT",
+    "C_CTX_1_SOURCE_COPY",
+    "C_CTX_2_SOURCE_COPY",
+    "C_CTX_3_SOURCE_COPY",
+    "C_CTX_4_SOURCE_COPY",
+    "C_CTX_5_SOURCE_COPY",
+)
+
 FORGE_VIOLATION_CODES: Final[tuple[str, ...]] = (
     "F_LEMMA_SLUG_INVALID",
     "F_SENSE_SLUG_INVALID",
@@ -294,6 +318,7 @@ CTX_MUST_BE_PAIRWISE_DISTINCT: Final[bool] = True
 CTX_MAX_SOURCE_TOKEN_OVERLAP: Final[float] = 0.60
 CTX_OVERLAP_EXCLUDES_UNIT_TOKENS: Final[bool] = True
 CTX_MIN_TOKENS: Final[int] = 8
+CTX_MIN_RESIDUAL_TOKENS: Final[int] = 6
 
 # "Different topic" remains a FORGE prompt requirement; it is intentionally
 # not claimed as a deterministic validator invariant.

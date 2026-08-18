@@ -629,3 +629,376 @@ field.
 lexical Unit from entering Anki while remaining aligned with the staged
 T6 -> T8 -> T9 pipeline. A fixed code inventory also gives T6 a deterministic
 rejection protocol that can be tested and persisted.
+
+## D22 — Source copying uses directional multiset overlap
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Blocks:** T5, T8
+
+Context validation measures how much of the generated context is copied from the
+source sentence.
+
+It does not use Jaccard similarity.
+
+The metric is directional:
+
+```text
+source_copy_ratio =
+    residual context tokens also available in residual source
+    ----------------------------------------------------------
+                total residual context tokens
+```
+
+The question being measured is:
+
+```text
+"What fraction of this context could have been copied from the source?"
+```
+
+### Token representation
+
+Both the generated context and `source_sentence` use the shared D19
+normalization and lexical tokenization.
+
+No stemming, lemmatization, fuzzy matching, stop-word removal, or semantic
+similarity is used.
+
+Duplicate tokens matter.
+
+The overlap therefore uses token multisets rather than token sets.
+
+For each token `t`:
+
+```text
+shared_count(t) =
+    min(context_count(t), source_count(t))
+```
+
+and:
+
+```text
+shared_total =
+    sum(shared_count(t) for every residual token t)
+```
+
+### Excluding the Unit itself
+
+The target Unit must not inflate the copying score merely because both the
+source and generated context are required to contain it.
+
+Before computing overlap, exactly one Unit's fixed lexical-token multiset is
+removed independently from each side.
+
+For a `word`, the fixed Unit tokens are the normalized word token.
+
+For a `chunk`, they are all normalized chunk target tokens.
+
+For a `frame`, they are the normalized fixed tokens before and after the
+`___` slot. Slot content is not part of the fixed Unit and remains residual
+context.
+
+Token subtraction is count-based and removes no more copies of a token than
+the Unit itself requires.
+
+### Ratio
+
+After Unit-token subtraction:
+
+```text
+source_copy_ratio =
+    shared_total / number_of_residual_context_tokens
+```
+
+Example:
+
+```text
+source:
+Climate change may pose a serious threat to food security.
+
+context:
+Pollution can pose a major threat to public health.
+```
+
+After removing the fixed chunk tokens:
+
+```text
+pose / a / threat / to
+```
+
+the remaining context tokens are compared directionally against the remaining
+source tokens.
+
+### Threshold
+
+The existing frozen threshold remains:
+
+```python
+CTX_MAX_SOURCE_TOKEN_OVERLAP = 0.60
+```
+
+A context violates the source-copy rule only when:
+
+```text
+source_copy_ratio > 0.60
+```
+
+Exactly `0.60` is allowed.
+
+If no residual context tokens remain after Unit-token subtraction, the overlap
+check is not evaluated. Insufficient context is handled by the context-length
+contract instead.
+
+The overlap check runs only after the relevant context has passed the
+prerequisites required for meaningful Unit containment.
+
+**Reason:** Jaccard is symmetric and can hide copying when a short generated
+context is largely contained inside a much longer source sentence. A
+directional multiset ratio directly measures the behavior we actually want to
+prevent: generated context that derives too much of its lexical content from
+the evidence sentence.
+
+## D23 — Context-bank validation has fixed staged rules
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Blocks:** T5, T8
+
+`validate_context_bank()` validates the five generated context fields only after
+the lexical Unit has already passed Forge-stage validation.
+
+The public boundary remains:
+
+```python
+validate_context_bank(unit: VocabUnit) -> tuple[str, ...]
+```
+
+An empty tuple means PASS.
+
+### Fixed violation order
+
+Violations are returned in this fixed order:
+
+```python
+(
+    "C_CTX_1_EMPTY",
+    "C_CTX_2_EMPTY",
+    "C_CTX_3_EMPTY",
+    "C_CTX_4_EMPTY",
+    "C_CTX_5_EMPTY",
+
+    "C_CTX_1_UNIT_MISSING",
+    "C_CTX_2_UNIT_MISSING",
+    "C_CTX_3_UNIT_MISSING",
+    "C_CTX_4_UNIT_MISSING",
+    "C_CTX_5_UNIT_MISSING",
+
+    "C_CTX_1_TOO_SHORT",
+    "C_CTX_2_TOO_SHORT",
+    "C_CTX_3_TOO_SHORT",
+    "C_CTX_4_TOO_SHORT",
+    "C_CTX_5_TOO_SHORT",
+
+    "C_CONTEXTS_NOT_DISTINCT",
+
+    "C_CTX_1_SOURCE_COPY",
+    "C_CTX_2_SOURCE_COPY",
+    "C_CTX_3_SOURCE_COPY",
+    "C_CTX_4_SOURCE_COPY",
+    "C_CTX_5_SOURCE_COPY",
+)
+```
+
+Each code appears at most once.
+
+### Presence
+
+All five fields are required at the T8 context-bank boundary:
+
+```text
+Ctx_1
+Ctx_2
+Ctx_3
+Ctx_4
+Ctx_5
+```
+
+A context containing only whitespace is empty.
+
+An empty context emits only its corresponding:
+
+```text
+C_CTX_X_EMPTY
+```
+
+Checks requiring lexical content are suppressed for that context.
+
+### Unit containment
+
+Every non-empty context must contain the Unit according to the shared D19
+`contains_unit()` matcher.
+
+A missing Unit emits:
+
+```text
+C_CTX_X_UNIT_MISSING
+```
+
+The context validator must not introduce alternate word/chunk/frame matching
+semantics.
+
+If the Unit itself is structurally invalid, that is a caller/precondition error:
+the Unit should have been rejected by `validate_forge_unit()` before reaching
+this stage.
+
+### Context length
+
+Generated context must contain enough lexical material beyond the fixed Unit
+itself.
+
+Two minimums apply simultaneously.
+
+First, total normalized lexical-token count must satisfy the existing contract:
+
+```python
+CTX_MIN_TOKENS = 8
+```
+
+Second, after subtracting exactly one fixed Unit-token multiset using the same
+count-based subtraction rule as D22, at least:
+
+```text
+6 residual lexical tokens
+```
+
+must remain.
+
+Therefore the effective minimum is equivalent to:
+
+```text
+max(
+    CTX_MIN_TOKENS,
+    number_of_fixed_unit_tokens + 6
+)
+```
+
+for a context containing one required occurrence of the Unit.
+
+For a frame, only the fixed tokens around `___` count as fixed Unit tokens.
+Slot content remains residual context.
+
+A failure emits:
+
+```text
+C_CTX_X_TOO_SHORT
+```
+
+Length is checked only for a non-empty context whose Unit containment check
+passes.
+
+### Distinctness
+
+The five contexts must provide different retrieval situations.
+
+Distinctness uses the shared normalized lexical-token representation.
+
+Two contexts are considered duplicates when their complete normalized token
+tuples are equal.
+
+Differences in:
+
+- capitalization;
+- Unicode normalization;
+- punctuation only;
+
+do not make two contexts distinct.
+
+If any pair of non-empty contexts is duplicate after normalization, emit exactly:
+
+```text
+C_CONTEXTS_NOT_DISTINCT
+```
+
+once.
+
+Distinctness is independent of context length. A short context may therefore
+produce both:
+
+```text
+C_CTX_X_TOO_SHORT
+```
+
+and:
+
+```text
+C_CONTEXTS_NOT_DISTINCT
+```
+
+when both facts are true.
+
+Empty contexts do not participate in duplicate comparison.
+
+### Source-copy protection
+
+Each context that:
+
+- is non-empty; and
+- contains the Unit;
+
+is checked against `source_sentence` using the D22 directional multiset
+`source_copy_ratio`.
+
+The Unit's fixed lexical-token multiset is removed independently from context
+and source before overlap is measured.
+
+The frozen threshold is:
+
+```python
+CTX_MAX_SOURCE_TOKEN_OVERLAP = 0.60
+```
+
+A context fails only when:
+
+```text
+source_copy_ratio > 0.60
+```
+
+Exactly `0.60` passes.
+
+A failure emits:
+
+```text
+C_CTX_X_SOURCE_COPY
+```
+
+If no residual context tokens remain, the copy check is suppressed. The
+context-length rule owns that failure.
+
+### Stage precondition
+
+`validate_context_bank()` assumes that the lexical/core Unit has already passed:
+
+```python
+validate_forge_unit(unit) == ()
+```
+
+T8 must not use context validation as a substitute for Forge validation.
+
+The context validator therefore does not re-report Forge `F_*` violations.
+
+### Explicitly outside this validator
+
+`validate_context_bank()` does not validate:
+
+- target justification;
+- audio filenames or Anki media representation;
+- lifecycle state transitions;
+- graduation timing;
+- TTS voice selection;
+- semantic quality beyond the deterministic rules frozen above.
+
+**Reason:** T8 needs a deterministic acceptance boundary for AI-generated
+contexts without forcing T6 to create context artifacts prematurely. Presence,
+Unit containment, sufficient lexical material, contextual diversity, and
+source-copy protection are separate checks and therefore remain independently
+observable.
