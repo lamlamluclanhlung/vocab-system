@@ -494,6 +494,82 @@ def valid_note_type_snapshot() -> dict[str, Any]:
     }
 
 
+def test_retrieve_media_file_decodes_strict_base64(monkeypatch) -> None:
+    raw = b"\x00audio\xff"
+    calls = install_responses(
+        monkeypatch,
+        [response_body(base64.b64encode(raw).decode("ascii"))],
+    )
+
+    assert AnkiConnectClient().retrieve_media_file("clip.mp3") == raw
+    assert request_envelope(calls[0]) == {
+        "action": "retrieveMediaFile",
+        "version": 6,
+        "params": {"filename": "clip.mp3"},
+    }
+
+
+def test_retrieve_media_file_false_means_missing(monkeypatch) -> None:
+    install_responses(monkeypatch, [response_body(False)])
+
+    assert AnkiConnectClient().retrieve_media_file("missing.mp3") is None
+
+
+def test_retrieve_media_file_empty_base64_is_empty_bytes(monkeypatch) -> None:
+    install_responses(monkeypatch, [response_body("")])
+
+    assert AnkiConnectClient().retrieve_media_file("empty.mp3") == b""
+
+
+@pytest.mark.parametrize("result", [True, None, [], {}, 7])
+def test_retrieve_media_file_rejects_non_string_results(
+    monkeypatch,
+    result,
+) -> None:
+    install_responses(monkeypatch, [response_body(result)])
+
+    with pytest.raises(AnkiResponseError, match="base64 string"):
+        AnkiConnectClient().retrieve_media_file("clip.mp3")
+
+
+def test_retrieve_media_file_rejects_invalid_base64(monkeypatch) -> None:
+    install_responses(monkeypatch, [response_body("not base64!")])
+
+    with pytest.raises(AnkiResponseError, match="strict base64"):
+        AnkiConnectClient().retrieve_media_file("clip.mp3")
+
+
+def test_retrieve_media_file_connection_failure_has_one_attempt(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    def fail_urlopen(_request, *, timeout):
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(anki_module.urllib.request, "urlopen", fail_urlopen)
+
+    with pytest.raises(AnkiConnectionError):
+        AnkiConnectClient().retrieve_media_file("clip.mp3")
+
+    assert attempts == 1
+
+
+@pytest.mark.parametrize("filename", ["", None])
+def test_retrieve_media_file_rejects_invalid_filename_before_http(
+    monkeypatch,
+    filename,
+) -> None:
+    calls = install_responses(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        AnkiConnectClient().retrieve_media_file(filename)
+
+    assert calls == []
+
+
 def install_valid_note_type(monkeypatch, model=None):
     if model is None:
         model = valid_note_type_snapshot()

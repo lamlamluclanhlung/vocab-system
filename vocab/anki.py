@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import http.client
 import json
 import math
@@ -345,6 +346,32 @@ class AnkiConnectClient:
                 response=result,
             )
         return result
+
+    def retrieve_media_file(self, filename: str) -> bytes | None:
+        """Retrieve exact media bytes, or None when Anki reports no file."""
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("filename must be a non-empty string")
+
+        result = self._invoke(
+            "retrieveMediaFile",
+            {"filename": filename},
+        )
+        if result is False:
+            return None
+        if not isinstance(result, str):
+            raise AnkiResponseError(
+                "retrieveMediaFile",
+                "result must be false or a base64 string",
+                response=result,
+            )
+        try:
+            return base64.b64decode(result, validate=True)
+        except (binascii.Error, ValueError):
+            raise AnkiResponseError(
+                "retrieveMediaFile",
+                "result must be strict base64",
+                response=result,
+            ) from None
 
     def get_deck_config(self, deck_name: str) -> dict[str, Any]:
         """Return one caller-selected deck's Anki option configuration."""
