@@ -1181,3 +1181,107 @@ attribute the note-level leech signal to an R/L/W/S channel. T7 emits no event
 and changes no note, card, media, tag, or lifecycle state.
 
 Lifecycle response and remediation remain owned by future T9 under D10.
+
+## D27 — T8 context bank is one confirmed atomic logical artifact
+
+**Date:** 2026-08-19
+**Status:** Accepted
+**Blocks:** T8
+
+`Ctx_1` through `Ctx_5` are generated together by exactly one LLM request and
+returned as one strict structured object containing exactly those five string
+fields. `validate_context_bank()` validates the whole candidate; any violation
+rejects the whole bank. T8 performs no automatic retry, field-by-field
+regeneration, repair, or partial persistence.
+
+Initial persistence requires a human preview and explicit confirmation. T8
+then rereads the note and compares the generation-relevant source snapshot
+before writing. If it changed, the write is rejected as stale. The accepted
+bank is written by one explicit subset update containing all five context
+fields, followed by exact readback verification.
+
+An existing valid bank is never silently overwritten. A partial bank or a
+fully populated invalid bank fails closed. T8 v0 has no normal context
+regeneration feature; this does not preclude a separately designed change
+workflow in a future version. T8 emits no EventLog event.
+
+## D28 — Normal R/L review uses stable persisted artifacts
+
+**Date:** 2026-08-19
+**Status:** Accepted
+**Blocks:** T3, T8
+
+The exact Anki card-generation requirements are:
+
+```text
+R -> Target_R AND Ctx_1
+L -> Target_L AND audio_1
+W -> Target_W
+S -> Target_S
+```
+
+No additional hidden field may become a generation requirement. Normal R
+review uses stable `Ctx_1`; normal L review uses stable `audio_1`. Normal
+review must not reference `Ctx_2` through `Ctx_5` or `audio_2`/`audio_3`.
+
+All three baseline audio slots speak the exact accepted `Ctx_1` text and vary
+only by configured speaker:
+
+```text
+audio_1 = Ctx_1 spoken by voice_1
+audio_2 = Ctx_1 spoken by voice_2
+audio_3 = Ctx_1 spoken by voice_3
+```
+
+Thus `Ctx_2` through `Ctx_5` own context variation, while `audio_2` and
+`audio_3` own alternate-speaker variation. T8 synthesizes only when
+`Target_L == "1"`. Otherwise it performs no synthesis and neither clears nor
+mutates existing audio.
+
+## D29 — T8 audio artifacts have immutable request identity
+
+**Date:** 2026-08-19
+**Status:** Accepted
+**Blocks:** T8
+
+T8-created audio files are immutable request-identified artifacts. Cloud TTS
+byte reproducibility is not assumed; the reproducible object is the logical
+synthesis request.
+
+Canonical synthesis request v1 contains exactly:
+
+```text
+{
+  "v": 1,
+  "provider": "azure-speech-rest",
+  "region": "<exact runtime region>",
+  "unit_key": "<exact persisted unit_key>",
+  "slot": <1|2|3>,
+  "source_context_field": "Ctx_1",
+  "text": "<exact persisted Ctx_1>",
+  "voice_id": "<slot voice ID>",
+  "locale": "<runtime common locale>",
+  "output_format": "audio-24khz-48kbitrate-mono-mp3"
+}
+```
+
+`slot` is serialized as the integer `1`, `2`, or `3`. Canonical bytes are:
+
+```python
+json.dumps(
+    request,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
+```
+
+Identity is `sha256(canonical_bytes).hexdigest()[:16]`. Filenames are exactly
+`vocab-a1-<16 lowercase hex>.mp3`, `vocab-a2-<16 lowercase hex>.mp3`, and
+`vocab-a3-<16 lowercase hex>.mp3` for slots 1, 2, and 3 respectively.
+
+Identity never uses Python `hash()`, timestamps, UUIDs, raw `unit_key` in the
+filename, credentials, or generated audio bytes. Existing complete valid T8
+audio remains accepted if runtime region or voice configuration later changes;
+new configuration applies only to not-yet-hydrated audio. T8 v0 performs no
+automatic audio regeneration or media deletion.

@@ -11,6 +11,7 @@ from typing import Any
 from .card_contract import (
     ANKI_VIRTUAL_FIELDS,
     FORBIDDEN_NORMAL_REVIEW_FIELDS,
+    GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME,
     PERSISTED_CARD_FIELDS,
     REQUIRED_FRONT_FIELDS_BY_TEMPLATE_NAME,
     TARGET_FIELD_BY_TEMPLATE_NAME,
@@ -21,7 +22,9 @@ from .contracts import (
     ANKI_SORT_FIELD,
     CARD_TEMPLATE_NAMES,
     NOTE_FIELDS,
+    NOVEL_CONTEXT_FIELDS,
 )
+from .media_contract import NOVEL_AUDIO_FIELDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,9 +650,17 @@ def _verify_side_references(
 
     for field_name in FORBIDDEN_NORMAL_REVIEW_FIELDS:
         if field_name in seen:
+            if field_name in NOVEL_CONTEXT_FIELDS:
+                code = "TEMPLATE_NOVEL_CONTEXT_FORBIDDEN"
+            elif field_name in NOVEL_AUDIO_FIELDS:
+                code = "TEMPLATE_NOVEL_AUDIO_FORBIDDEN"
+            else:  # pragma: no cover - human-owned contract exhaustiveness
+                raise AssertionError(
+                    f"unclassified forbidden review field: {field_name!r}"
+                )
             violations.append(
                 AnkiTemplateViolation(
-                    "TEMPLATE_NOVEL_CONTEXT_FORBIDDEN",
+                    code,
                     location,
                     f"normal review must not reference {field_name!r}",
                 )
@@ -936,5 +947,41 @@ def _verify_requirements(
                     f"model.req[{requirement_index}]",
                     f"{target_field!r} is not necessary for card "
                     f"{template_name!r}",
+                )
+            )
+
+        expected_fields = GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME[
+            template_name
+        ]
+        expected_ordinals = tuple(
+            field_ordinals[field_name]
+            for field_name in expected_fields
+            if field_name in field_ordinals
+        )
+        if len(expected_ordinals) != len(expected_fields):
+            continue
+
+        exact_fields = (
+            len(ordinals) == len(expected_ordinals)
+            and set(ordinals) == set(expected_ordinals)
+        )
+        exact_mode = (
+            mode == "all"
+            if len(expected_ordinals) > 1
+            else mode in {"all", "any"}
+        )
+        if not (exact_fields and exact_mode):
+            actual_fields = tuple(
+                field_names[ordinal]
+                for ordinal in ordinals
+                if 0 <= ordinal < len(field_names)
+            )
+            violations.append(
+                AnkiTemplateViolation(
+                    "MODEL_REQ_GENERATION_FIELDS_MISMATCH",
+                    f"model.req[{requirement_index}]",
+                    f"card {template_name!r} must require exactly "
+                    f"{expected_fields!r} with semantically equivalent mode; "
+                    f"got mode={mode!r}, fields={actual_fields!r}",
                 )
             )

@@ -21,6 +21,7 @@ from vocab.anki import (
     AnkiNoteTypeMismatchError,
     AnkiResponseError,
 )
+from vocab.card_contract import GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME
 from vocab.contracts import (
     ANKI_NOTE_TYPE_NAME,
     ANKI_SORT_FIELD,
@@ -456,7 +457,10 @@ def valid_note_type_snapshot() -> dict[str, Any]:
     requirements = []
     for ordinal, name in enumerate(CARD_TEMPLATE_NAMES):
         target = TARGET_FIELD_BY_CHANNEL[name]
-        content = "Ctx_1" if name == "R" else "lemma"
+        content = {
+            "R": "Ctx_1",
+            "L": "audio_1",
+        }.get(name, "lemma")
         templates.append(
             {
                 "name": name,
@@ -468,8 +472,13 @@ def valid_note_type_snapshot() -> dict[str, Any]:
                 "afmt": "{{FrontSide}}{{definition_en}}",
             }
         )
+        generation_fields = GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME[name]
         requirements.append(
-            [ordinal, "any", [field_ordinals[target]]]
+            [
+                ordinal,
+                "all" if len(generation_fields) > 1 else "any",
+                [field_ordinals[field] for field in generation_fields],
+            ]
         )
     return {
         "id": 1704387367119,

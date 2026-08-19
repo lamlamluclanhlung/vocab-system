@@ -16,6 +16,10 @@ from .contracts import (
     NOVEL_CONTEXT_FIELDS,
     TARGET_FIELD_BY_CHANNEL,
 )
+from .media_contract import (
+    NORMAL_REVIEW_AUDIO_FIELD,
+    NOVEL_AUDIO_FIELDS,
+)
 
 
 TARGET_FIELD_BY_TEMPLATE_NAME: Final[dict[str, str]] = {
@@ -31,18 +35,26 @@ TARGET_TEMPLATE_FIELDS: Final[tuple[str, ...]] = tuple(
 )
 
 FORBIDDEN_NORMAL_REVIEW_FIELDS: Final[tuple[str, ...]] = (
-    NOVEL_CONTEXT_FIELDS
+    *NOVEL_CONTEXT_FIELDS,
+    *NOVEL_AUDIO_FIELDS,
 )
 
 REQUIRED_FRONT_FIELDS_BY_TEMPLATE_NAME: Final[
     dict[str, tuple[str, ...]]
 ] = {
-    template_name: (
-        (ANKI_REVIEW_CONTEXT_FIELD,)
-        if CHANNEL_BY_TEMPLATE_NAME[template_name] == "R"
-        else ()
-    )
-    for template_name in CARD_TEMPLATE_NAMES
+    "R": (ANKI_REVIEW_CONTEXT_FIELD,),
+    "L": (NORMAL_REVIEW_AUDIO_FIELD,),
+    "W": (),
+    "S": (),
+}
+
+GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME: Final[
+    dict[str, tuple[str, ...]]
+] = {
+    "R": ("Target_R", ANKI_REVIEW_CONTEXT_FIELD),
+    "L": ("Target_L", NORMAL_REVIEW_AUDIO_FIELD),
+    "W": ("Target_W",),
+    "S": ("Target_S",),
 }
 
 PERSISTED_CARD_FIELDS: Final[tuple[str, ...]] = NOTE_FIELDS

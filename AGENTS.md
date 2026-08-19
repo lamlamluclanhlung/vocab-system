@@ -15,6 +15,7 @@ The following files are human-owned and must be treated as read-only unless the 
 
 - `vocab/contracts.py`
 - `vocab/card_contract.py`
+- `vocab/media_contract.py`
 - `vocab/models.py`
 - `vocab/validators.py`
 - `tests/test_contract_alignment.py`
@@ -93,6 +94,18 @@ When lifecycle logic requires dormancy:
 - clear only explicitly specified media fields
 
 Never invent missing identifiers, state, model metadata, source references, or vocabulary fields.
+
+## T8 hydration safety
+
+T8 LLM and TTS integrations are batch/offline hydration only. Normal Anki
+review consumes persisted context/audio artifacts and never calls OpenAI or
+Azure TTS.
+
+For T8: never write a partial context bank or partial audio field set; never
+use `VocabUnit.to_note_fields()` for partial hydration; never mutate
+`VisualCue`; never emit EventLog events in v0; never delete media
+automatically; never regenerate accepted context/audio automatically; and use
+no provider retries or fallbacks.
 
 ## Task scope
 

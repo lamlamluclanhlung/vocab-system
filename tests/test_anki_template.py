@@ -7,7 +7,10 @@ from copy import deepcopy
 import pytest
 
 from vocab.anki_template import verify_model_snapshot
-from vocab.card_contract import TARGET_FIELD_BY_TEMPLATE_NAME
+from vocab.card_contract import (
+    GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME,
+    TARGET_FIELD_BY_TEMPLATE_NAME,
+)
 from vocab.contracts import (
     ANKI_NOTE_TYPE_NAME,
     ANKI_SORT_FIELD,
@@ -15,6 +18,7 @@ from vocab.contracts import (
     NOTE_FIELDS,
     NOVEL_CONTEXT_FIELDS,
 )
+from vocab.media_contract import NOVEL_AUDIO_FIELDS
 
 
 def valid_model() -> dict[str, object]:
@@ -23,7 +27,10 @@ def valid_model() -> dict[str, object]:
     requirements = []
     for ordinal, template_name in enumerate(CARD_TEMPLATE_NAMES):
         target = TARGET_FIELD_BY_TEMPLATE_NAME[template_name]
-        content = "Ctx_1" if template_name == "R" else "lemma"
+        content = {
+            "R": "Ctx_1",
+            "L": "audio_1",
+        }.get(template_name, "lemma")
         templates.append(
             {
                 "name": template_name,
@@ -37,8 +44,15 @@ def valid_model() -> dict[str, object]:
                 ),
             }
         )
+        generation_fields = GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME[
+            template_name
+        ]
         requirements.append(
-            [ordinal, "any", [field_ordinals[target]]]
+            [
+                ordinal,
+                "all" if len(generation_fields) > 1 else "any",
+                [field_ordinals[field] for field in generation_fields],
+            ]
         )
 
     return {
@@ -203,6 +217,43 @@ def test_r_front_requires_ctx_1() -> None:
     )
 
     assert "TEMPLATE_REQUIRED_FRONT_FIELD_MISSING" in codes(model)
+
+
+def test_l_front_requires_audio_1() -> None:
+    model = valid_model()
+    template(model, "L")["qfmt"] = (
+        "{{#Target_L}}{{lemma}}{{/Target_L}}"
+    )
+
+    assert "TEMPLATE_REQUIRED_FRONT_FIELD_MISSING" in codes(model)
+
+
+@pytest.mark.parametrize("field_name", NOVEL_AUDIO_FIELDS)
+@pytest.mark.parametrize("side", ["qfmt", "afmt"], ids=["front", "back"])
+def test_novel_audio_is_forbidden_on_either_side(
+    field_name: str,
+    side: str,
+) -> None:
+    model = valid_model()
+    if side == "qfmt":
+        template(model, "L")[side] = (
+            "{{#Target_L}}{{audio_1}}"
+            f"{{{{{field_name}}}}}"
+            "{{/Target_L}}"
+        )
+    else:
+        template(model, "L")[side] += f"{{{{{field_name}}}}}"
+
+    result = codes(model)
+    assert "TEMPLATE_NOVEL_AUDIO_FORBIDDEN" in result
+    assert "TEMPLATE_NOVEL_CONTEXT_FORBIDDEN" not in result
+
+
+def test_audio_1_is_not_globally_forbidden() -> None:
+    model = valid_model()
+
+    assert "audio_1" in template(model, "L")["qfmt"]
+    assert verify_model_snapshot(model) == ()
 
 
 def test_unknown_field_fails() -> None:
@@ -402,6 +453,116 @@ def test_req_allows_additional_legitimate_requirements() -> None:
     ]
 
     assert verify_model_snapshot(model) == ()
+
+
+def test_r_req_exact_target_and_ctx_1_passes() -> None:
+    model = valid_model()
+    model["req"][0] = [
+        0,
+        "all",
+        [NOTE_FIELDS.index("Target_R"), NOTE_FIELDS.index("Ctx_1")],
+    ]
+
+    assert verify_model_snapshot(model) == ()
+
+
+@pytest.mark.parametrize(
+    ("mode", "fields"),
+    [
+        ("all", ("Target_R",)),
+        ("all", ("Target_R", "Ctx_1", "VisualCue")),
+        ("any", ("Target_R", "Ctx_1")),
+    ],
+    ids=["missing-ctx-1", "extra-field", "any-is-not-conjunction"],
+)
+def test_r_req_must_match_exact_generation_fields(
+    mode: str,
+    fields: tuple[str, ...],
+) -> None:
+    model = valid_model()
+    model["req"][0] = [
+        0,
+        mode,
+        [NOTE_FIELDS.index(field) for field in fields],
+    ]
+
+    assert "MODEL_REQ_GENERATION_FIELDS_MISMATCH" in codes(model)
+
+
+def test_l_req_exact_target_and_audio_1_passes() -> None:
+    model = valid_model()
+    model["req"][1] = [
+        1,
+        "all",
+        [NOTE_FIELDS.index("Target_L"), NOTE_FIELDS.index("audio_1")],
+    ]
+
+    assert verify_model_snapshot(model) == ()
+
+
+@pytest.mark.parametrize(
+    ("mode", "fields"),
+    [
+        ("all", ("Target_L",)),
+        ("all", ("Target_L", "audio_1", "VisualCue")),
+        ("any", ("Target_L", "audio_1")),
+    ],
+    ids=["missing-audio-1", "extra-visual-cue", "any-is-not-conjunction"],
+)
+def test_l_req_must_match_exact_generation_fields(
+    mode: str,
+    fields: tuple[str, ...],
+) -> None:
+    model = valid_model()
+    model["req"][1] = [
+        1,
+        mode,
+        [NOTE_FIELDS.index(field) for field in fields],
+    ]
+
+    assert "MODEL_REQ_GENERATION_FIELDS_MISMATCH" in codes(model)
+
+
+@pytest.mark.parametrize(
+    ("template_name", "ordinal", "target"),
+    [
+        ("W", 2, "Target_W"),
+        ("S", 3, "Target_S"),
+    ],
+)
+def test_single_field_generation_requirement_accepts_all_or_any(
+    template_name: str,
+    ordinal: int,
+    target: str,
+) -> None:
+    for mode in ("all", "any"):
+        model = valid_model()
+        model["req"][ordinal] = [
+            ordinal,
+            mode,
+            [NOTE_FIELDS.index(target)],
+        ]
+
+        assert verify_model_snapshot(model) == (), template_name
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "target"),
+    [(2, "Target_W"), (3, "Target_S")],
+    ids=["W", "S"],
+)
+def test_w_and_s_reject_extra_generation_requirements(
+    ordinal: int,
+    target: str,
+) -> None:
+    model = valid_model()
+    model["req"][ordinal] = [
+        ordinal,
+        "all",
+        [NOTE_FIELDS.index(target), NOTE_FIELDS.index("VisualCue")],
+    ]
+
+    assert "MODEL_REQ_GENERATION_FIELDS_MISMATCH" in codes(model)
 
 
 def test_duplicate_req_record_for_template_fails_closed() -> None:
