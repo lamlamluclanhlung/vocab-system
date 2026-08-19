@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from xml.sax.saxutils import escape, quoteattr
 
-from .media_contract import AUDIO_OUTPUT_FORMAT
+from .media_contract import AUDIO_OUTPUT_FORMAT, AUDIO_PROVIDER_ID
 
 
 DEFAULT_AZURE_TTS_TIMEOUT = 60.0
@@ -54,8 +54,23 @@ class AzureSpeechSynthesizer:
             raise TypeError("timeout must be a finite positive number")
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a finite positive number")
-        self.region = region
+        self._region = region
         self.timeout = float(timeout)
+
+    @property
+    def provider_id(self) -> str:
+        """Return the exact provider identity used for synthesis."""
+        return AUDIO_PROVIDER_ID
+
+    @property
+    def region(self) -> str:
+        """Return the exact configured Azure region without normalization."""
+        return self._region
+
+    @property
+    def output_format(self) -> str:
+        """Return the exact Azure output format used for synthesis."""
+        return AUDIO_OUTPUT_FORMAT
 
     def synthesize(
         self,

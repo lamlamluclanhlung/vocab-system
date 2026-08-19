@@ -21,7 +21,12 @@ from .contracts import (
     NOTE_FIELDS,
     TARGET_FLAG_VALUE,
 )
-from .media_contract import AUDIO_SLOT_FIELDS, AUDIO_SLOT_NUMBERS
+from .media_contract import (
+    AUDIO_OUTPUT_FORMAT,
+    AUDIO_PROVIDER_ID,
+    AUDIO_SLOT_FIELDS,
+    AUDIO_SLOT_NUMBERS,
+)
 from .models import VocabUnit
 from .tts import (
     SpeechSynthesizer,
@@ -137,6 +142,10 @@ class AudioContextNotReadyError(HydrationError):
 
 class AudioSynthesisError(HydrationError):
     """Raised when a synthesizer returns anything other than non-empty bytes."""
+
+
+class AudioSynthesisIdentityError(HydrationError):
+    """Raised when synthesis identity cannot be bound to D29 exactly."""
 
 
 class AudioPersistenceError(HydrationError):
@@ -314,17 +323,24 @@ def _hydrate_audio(
     if not isinstance(tts_config, TtsConfig):
         raise TypeError("tts_config must be a TtsConfig")
 
+    provider_id, region, output_format = _require_synthesis_identity(
+        synthesizer,
+        tts_config,
+    )
+
     snapshot = _snapshot(unit, _AUDIO_SNAPSHOT_FIELDS)
     filenames: list[str] = []
     for slot in AUDIO_SLOT_NUMBERS:
         voice_id = tts_config.voice_ids[slot - 1]
         filename = deterministic_audio_filename(
-            region=tts_config.region,
+            provider=provider_id,
+            region=region,
             unit_key=unit.unit_key,
             slot=slot,
             text=unit.Ctx_1,
             voice_id=voice_id,
             locale=tts_config.locale,
+            output_format=output_format,
         )
         filenames.append(filename)
         existing = anki.retrieve_media_file(filename)
@@ -373,6 +389,43 @@ def _hydrate_audio(
             "audio fields did not match the atomic subset write"
         )
     return AudioOutcome.CREATED
+
+
+def _require_synthesis_identity(
+    synthesizer: SpeechSynthesizer,
+    tts_config: TtsConfig,
+) -> tuple[str, str, str]:
+    try:
+        provider_id = synthesizer.provider_id
+        region = synthesizer.region
+        output_format = synthesizer.output_format
+    except Exception:
+        raise AudioSynthesisIdentityError(
+            "synthesizer identity metadata is missing or unreadable"
+        ) from None
+
+    identity = {
+        "provider_id": provider_id,
+        "region": region,
+        "output_format": output_format,
+    }
+    if any(type(value) is not str for value in identity.values()):
+        raise AudioSynthesisIdentityError(
+            "synthesizer identity metadata must contain exact strings"
+        )
+    if provider_id != AUDIO_PROVIDER_ID:
+        raise AudioSynthesisIdentityError(
+            "synthesizer provider_id does not match the D29 provider"
+        )
+    if region != tts_config.region:
+        raise AudioSynthesisIdentityError(
+            "synthesizer region does not exactly match TtsConfig.region"
+        )
+    if output_format != AUDIO_OUTPUT_FORMAT:
+        raise AudioSynthesisIdentityError(
+            "synthesizer output_format does not match the D29 format"
+        )
+    return provider_id, region, output_format
 
 
 def _load_unit(note_id: int, anki: AnkiConnectClient) -> VocabUnit:

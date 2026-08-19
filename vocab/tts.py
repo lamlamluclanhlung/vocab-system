@@ -32,6 +32,15 @@ class TtsContractError(ValueError):
 class SpeechSynthesizer(Protocol):
     """Provider-neutral speech synthesis boundary."""
 
+    @property
+    def provider_id(self) -> str: ...
+
+    @property
+    def region(self) -> str: ...
+
+    @property
+    def output_format(self) -> str: ...
+
     def synthesize(
         self,
         *,

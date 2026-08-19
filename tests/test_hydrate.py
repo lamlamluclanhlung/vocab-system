@@ -15,12 +15,14 @@ from vocab.hydrate import (
     AudioMediaMissingOrInvalidError,
     AudioOutcome,
     AudioPersistenceError,
+    AudioSynthesisIdentityError,
     ContextOutcome,
     ContextPersistenceError,
     HydrationCoreInvalidError,
     HydrationNoteError,
     hydrate_unit,
 )
+from vocab.media_contract import AUDIO_OUTPUT_FORMAT, AUDIO_PROVIDER_ID
 from vocab.models import VocabUnit
 from vocab.tts import TtsConfig, deterministic_audio_filename, sound_markup
 
@@ -161,10 +163,20 @@ class FakeConfirmation:
 
 
 class FakeSynthesizer:
-    def __init__(self, events: list[tuple[str, str]] | None = None) -> None:
+    def __init__(
+        self,
+        events: list[tuple[str, str]] | None = None,
+        *,
+        provider_id: object = AUDIO_PROVIDER_ID,
+        region: object = "southeastasia",
+        output_format: object = AUDIO_OUTPUT_FORMAT,
+    ) -> None:
         self.calls: list[dict[str, str]] = []
         self.fail_on_call: int | None = None
         self.events = events
+        self.provider_id = provider_id
+        self.region = region
+        self.output_format = output_format
 
     def synthesize(self, *, text: str, voice_id: str, locale: str) -> bytes:
         self.calls.append(
@@ -526,6 +538,120 @@ def test_fully_hydrated_enabled_note_needs_no_provider_dependencies() -> None:
 
     assert result.context_outcome is ContextOutcome.ALREADY_READY
     assert result.audio_outcome is AudioOutcome.ALREADY_READY
+
+
+def test_matching_synthesis_identity_allows_unhydrated_audio() -> None:
+    unit = make_unit(target_l=True)
+    anki = FakeAnki(unit)
+    synth = FakeSynthesizer(
+        provider_id=AUDIO_PROVIDER_ID,
+        region="southeastasia",
+        output_format=AUDIO_OUTPUT_FORMAT,
+    )
+
+    result = hydrate_unit(
+        NOTE_ID,
+        anki=anki,
+        synthesizer=synth,
+        tts_config=tts_config(),
+    )
+
+    assert result.audio_outcome is AudioOutcome.CREATED
+    assert len(anki.retrieve_calls) == 6
+    assert len(synth.calls) == 3
+    assert len(anki.store_calls) == 3
+    assert len(anki.updates) == 1
+
+
+@pytest.mark.parametrize(
+    ("identity_changes", "message"),
+    [
+        ({"region": "eastus"}, "region"),
+        ({"region": "southeastasia "}, "region"),
+        ({"provider_id": "another-provider"}, "provider_id"),
+        ({"output_format": "another-output-format"}, "output_format"),
+    ],
+    ids=[
+        "region-mismatch",
+        "region-is-not-normalized",
+        "provider-mismatch",
+        "output-format-mismatch",
+    ],
+)
+def test_synthesis_identity_mismatch_fails_before_every_audio_side_effect(
+    identity_changes: dict[str, object],
+    message: str,
+) -> None:
+    anki = FakeAnki(make_unit(target_l=True))
+    synth = FakeSynthesizer(**identity_changes)
+
+    with pytest.raises(AudioSynthesisIdentityError, match=message):
+        hydrate_unit(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=synth,
+            tts_config=tts_config(),
+        )
+
+    assert anki.retrieve_calls == []
+    assert synth.calls == []
+    assert anki.store_calls == []
+    assert anki.updates == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "malformed_value"),
+    [
+        ("provider_id", None),
+        ("region", 7),
+        ("output_format", True),
+    ],
+)
+def test_malformed_synthesis_identity_fails_before_every_audio_side_effect(
+    field_name: str,
+    malformed_value: object,
+) -> None:
+    anki = FakeAnki(make_unit(target_l=True))
+    synth = FakeSynthesizer()
+    setattr(synth, field_name, malformed_value)
+
+    with pytest.raises(AudioSynthesisIdentityError, match="exact strings"):
+        hydrate_unit(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=synth,
+            tts_config=tts_config(),
+        )
+
+    assert anki.retrieve_calls == []
+    assert synth.calls == []
+    assert anki.store_calls == []
+    assert anki.updates == []
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["provider_id", "region", "output_format"],
+)
+def test_missing_synthesis_identity_fails_before_every_audio_side_effect(
+    field_name: str,
+) -> None:
+    anki = FakeAnki(make_unit(target_l=True))
+    synth = FakeSynthesizer()
+    delattr(synth, field_name)
+
+    with pytest.raises(AudioSynthesisIdentityError, match="missing"):
+        hydrate_unit(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=synth,
+            tts_config=tts_config(),
+        )
+
+    assert anki.retrieve_calls == []
+    assert synth.calls == []
+    assert anki.store_calls == []
+    assert anki.updates == []
 
 
 def test_partial_audio_fails_before_synthesis_or_write() -> None:

@@ -15,6 +15,7 @@ from vocab.azure_tts import (
     AzureTtsTransportError,
 )
 from vocab.media_contract import AUDIO_OUTPUT_FORMAT
+from vocab.media_contract import AUDIO_PROVIDER_ID
 
 
 class FakeHTTPResponse:
@@ -29,6 +30,16 @@ class FakeHTTPResponse:
 
     def read(self) -> object:
         return self.body
+
+
+def test_synthesizer_exposes_read_only_d29_identity() -> None:
+    synthesizer = AzureSpeechSynthesizer("eastus")
+
+    assert synthesizer.provider_id == AUDIO_PROVIDER_ID
+    assert synthesizer.region == "eastus"
+    assert synthesizer.output_format == AUDIO_OUTPUT_FORMAT
+    with pytest.raises(AttributeError):
+        synthesizer.region = "southeastasia"
 
 
 def install_response(
