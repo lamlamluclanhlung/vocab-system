@@ -306,9 +306,11 @@ def _encode_mp3(runtime: _Runtime, pcm: bytes) -> bytes:
         flushed = encoder.flush()
     except Exception as exc:
         raise KokoroEncodingError("local MP3 encoding failed") from exc
-    if not isinstance(encoded, bytes) or not isinstance(flushed, bytes):
-        raise KokoroEncodingError("MP3 encoder must return bytes")
-    result = encoded + flushed
+    if not isinstance(encoded, (bytes, bytearray)) or not isinstance(
+        flushed, (bytes, bytearray)
+    ):
+        raise KokoroEncodingError("MP3 encoder must return bytes or bytearray")
+    result = bytes(encoded) + bytes(flushed)
     if not result:
         raise KokoroEncodingError("MP3 encoder returned empty output")
     return result

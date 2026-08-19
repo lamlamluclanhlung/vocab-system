@@ -40,8 +40,8 @@ class FakeEncoder:
         self,
         calls: dict[str, object],
         *,
-        encoded: bytes,
-        flushed: bytes,
+        encoded: object,
+        flushed: object,
     ) -> None:
         self.calls = calls
         self.encoded = encoded
@@ -59,11 +59,11 @@ class FakeEncoder:
     def set_quality(self, value: int) -> None:
         self.calls["quality"] = value
 
-    def encode(self, pcm: bytes) -> bytes:
+    def encode(self, pcm: bytes) -> object:
         self.calls["pcm"] = pcm
         return self.encoded
 
-    def flush(self) -> bytes:
+    def flush(self) -> object:
         return self.flushed
 
 
@@ -72,8 +72,8 @@ def install_runtime(
     tmp_path: Path,
     *,
     chunk_samples: list[list[float]] | None = None,
-    encoded: bytes = b"mp3",
-    flushed: bytes = b"tail",
+    encoded: object = b"mp3",
+    flushed: object = b"tail",
 ) -> dict[str, object]:
     calls: dict[str, object] = {"downloads": [], "pipeline_calls": []}
     config_path = tmp_path / "config.json"
@@ -277,6 +277,42 @@ def test_empty_encoder_output_fails(
     install_runtime(monkeypatch, tmp_path, encoded=b"", flushed=b"")
 
     with pytest.raises(KokoroEncodingError, match="empty"):
+        KokoroLocalSynthesizer().synthesize(text="Exact persisted text.")
+
+
+def test_bytearray_encoder_output_is_returned_as_immutable_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_runtime(
+        monkeypatch,
+        tmp_path,
+        encoded=bytearray(b"mp3"),
+        flushed=bytearray(b"tail"),
+    )
+
+    result = KokoroLocalSynthesizer().synthesize(text="Exact persisted text.")
+
+    assert type(result) is bytes
+    assert result == b"mp3tail"
+
+
+@pytest.mark.parametrize(
+    ("encoded", "flushed"),
+    [
+        (memoryview(b"mp3"), b"tail"),
+        (b"mp3", memoryview(b"tail")),
+    ],
+)
+def test_unsupported_encoder_output_type_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    encoded: object,
+    flushed: object,
+) -> None:
+    install_runtime(monkeypatch, tmp_path, encoded=encoded, flushed=flushed)
+
+    with pytest.raises(KokoroEncodingError, match="bytes or bytearray"):
         KokoroLocalSynthesizer().synthesize(text="Exact persisted text.")
 
 
