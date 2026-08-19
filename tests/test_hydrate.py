@@ -1,30 +1,32 @@
-"""Fake-only tests for one-unit T8 context and audio hydration."""
+"""Fake-only tests for one-unit T8.1 audio_1 hydration."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
-from vocab.context import ContextPreview
-from vocab.contracts import ANKI_NOTE_TYPE_NAME, CONTEXT_FIELDS, NOTE_FIELDS
+from vocab.contracts import ANKI_NOTE_TYPE_NAME, NOTE_FIELDS
 from vocab.hydrate import (
+    AudioContextNotReadyError,
     AudioExistingInvalidError,
-    AudioExistingPartialError,
     AudioMediaMissingOrInvalidError,
     AudioOutcome,
     AudioPersistenceError,
     AudioSynthesisIdentityError,
-    ContextOutcome,
-    ContextPersistenceError,
     HydrationCoreInvalidError,
     HydrationNoteError,
-    hydrate_unit,
+    hydrate_audio,
 )
-from vocab.media_contract import AUDIO_OUTPUT_FORMAT, AUDIO_PROVIDER_ID
 from vocab.models import VocabUnit
-from vocab.tts import TtsConfig, deterministic_audio_filename, sound_markup
+from vocab.tts import (
+    FROZEN_TTS_CONFIG,
+    TtsConfig,
+    deterministic_audio_filename,
+    sound_markup,
+)
 
 
 NOTE_ID = 7001
@@ -55,11 +57,7 @@ def valid_contexts() -> dict[str, str]:
     }
 
 
-def make_unit(
-    *,
-    contexts_ready: bool = True,
-    target_l: bool = False,
-) -> VocabUnit:
+def make_unit(*, target_l: bool = True, contexts_ready: bool = True) -> VocabUnit:
     unit = VocabUnit(
         unit_key="subtle::small-difference",
         lemma="subtle",
@@ -93,12 +91,11 @@ class FakeAnki:
         self.notes_hooks: dict[int, Callable[[FakeAnki], None]] = {}
         self.updates: list[tuple[int, dict[str, str]]] = []
         self.apply_updates = True
-        self.media: dict[str, bytes] = {}
+        self.media: dict[str, object] = {}
         self.retrieve_calls: list[str] = []
         self.store_calls: list[tuple[str, bytes]] = []
         self.store_name_override: str | None = None
         self.corrupt_store_readback = False
-        self.events: list[tuple[str, str]] = []
 
     def notes_info(self, note_ids: list[int]) -> object:
         self.notes_calls += 1
@@ -115,7 +112,6 @@ class FakeAnki:
                     field_name: {"value": self.values[field_name], "order": index}
                     for index, field_name in enumerate(NOTE_FIELDS)
                 },
-                "tags": ["normal-metadata-is-ignored"],
             }
         ]
 
@@ -126,716 +122,371 @@ class FakeAnki:
     ) -> None:
         copied = dict(fields)
         self.updates.append((note_id, copied))
-        self.events.append(("update", ",".join(copied)))
         if self.apply_updates:
             self.values.update(copied)
 
-    def retrieve_media_file(self, filename: str) -> bytes | None:
+    def retrieve_media_file(self, filename: str) -> object:
         self.retrieve_calls.append(filename)
-        self.events.append(("retrieve", filename))
         return self.media.get(filename)
 
     def store_media_file(self, filename: str, data: bytes) -> str:
         self.store_calls.append((filename, data))
-        self.events.append(("store", filename))
         self.media[filename] = b"corrupt" if self.corrupt_store_readback else data
         return self.store_name_override or filename
-
-
-class FakeGenerator:
-    def __init__(self, output: Mapping[str, object]) -> None:
-        self.output = output
-        self.calls: list[tuple[object, Mapping[str, object]]] = []
-
-    def generate(self, request, *, json_schema):
-        self.calls.append((request, deepcopy(json_schema)))
-        return dict(self.output)
-
-
-class FakeConfirmation:
-    def __init__(self, accepted: bool) -> None:
-        self.accepted = accepted
-        self.previews: list[ContextPreview] = []
-
-    def __call__(self, preview: ContextPreview) -> bool:
-        self.previews.append(preview)
-        return self.accepted
 
 
 class FakeSynthesizer:
     def __init__(
         self,
-        events: list[tuple[str, str]] | None = None,
-        *,
-        provider_id: object = AUDIO_PROVIDER_ID,
-        region: object = "southeastasia",
-        output_format: object = AUDIO_OUTPUT_FORMAT,
+        identity: object = FROZEN_TTS_CONFIG,
+        audio: object = b"local-mp3",
     ) -> None:
-        self.calls: list[dict[str, str]] = []
-        self.fail_on_call: int | None = None
-        self.events = events
-        self.provider_id = provider_id
-        self.region = region
-        self.output_format = output_format
+        self._identity = identity
+        self.audio = audio
+        self.identity_reads = 0
+        self.calls: list[str] = []
 
-    def synthesize(self, *, text: str, voice_id: str, locale: str) -> bytes:
-        self.calls.append(
-            {"text": text, "voice_id": voice_id, "locale": locale}
-        )
-        if self.events is not None:
-            self.events.append(("synthesize", voice_id))
-        if self.fail_on_call == len(self.calls):
-            raise RuntimeError("synthetic provider failure")
-        return f"audio:{voice_id}".encode("utf-8")
+    @property
+    def synthesis_identity(self) -> object:
+        self.identity_reads += 1
+        return self._identity
+
+    def synthesize(self, *, text: str) -> object:
+        self.calls.append(text)
+        return self.audio
 
 
-def tts_config() -> TtsConfig:
-    return TtsConfig(
-        "southeastasia",
-        "en-US",
-        ("voice-one", "voice-two", "voice-three"),
+def expected_filename(unit: VocabUnit) -> str:
+    return deterministic_audio_filename(
+        config=FROZEN_TTS_CONFIG,
+        unit_key=unit.unit_key,
+        text=unit.Ctx_1,
     )
-
-
-def expected_filenames(unit: VocabUnit, config: TtsConfig) -> list[str]:
-    return [
-        deterministic_audio_filename(
-            region=config.region,
-            unit_key=unit.unit_key,
-            slot=slot,
-            text=unit.Ctx_1,
-            voice_id=config.voice_ids[slot - 1],
-            locale=config.locale,
-        )
-        for slot in (1, 2, 3)
-    ]
 
 
 def test_loaded_note_requires_actual_integer_id_before_anki_call() -> None:
     anki = FakeAnki(make_unit())
 
     with pytest.raises(HydrationNoteError, match="actual integer"):
-        hydrate_unit(True, anki=anki)
+        hydrate_audio(True, anki=anki)
 
     assert anki.notes_calls == 0
 
 
 @pytest.mark.parametrize("result", [[], [{"noteId": NOTE_ID}], [{}, {}]])
-def test_loaded_note_requires_exactly_one_well_shaped_note(result) -> None:
+def test_loaded_note_requires_exactly_one_well_shaped_note(result: object) -> None:
     anki = FakeAnki(make_unit())
     anki.notes_result_override = result
 
     with pytest.raises(HydrationNoteError):
-        hydrate_unit(NOTE_ID, anki=anki)
+        hydrate_audio(NOTE_ID, anki=anki)
 
 
-def test_loaded_note_rejects_wrong_model() -> None:
-    anki = FakeAnki(make_unit())
-    note = anki.notes_info([NOTE_ID])[0]
-    note["modelName"] = "WrongModel"
-    anki.notes_result_override = [note]
-    anki.notes_calls = 0
-
-    with pytest.raises(HydrationNoteError, match="model"):
-        hydrate_unit(NOTE_ID, anki=anki)
-
-
-@pytest.mark.parametrize("returned_id", [NOTE_ID + 1, True, "7001"])
-def test_loaded_note_rejects_wrong_returned_note_id(returned_id: object) -> None:
-    anki = FakeAnki(make_unit())
-    note = anki.notes_info([NOTE_ID])[0]
-    note["noteId"] = returned_id
-    anki.notes_result_override = [note]
-    anki.notes_calls = 0
-
-    with pytest.raises(HydrationNoteError, match="different note ID"):
-        hydrate_unit(NOTE_ID, anki=anki)
-
-
-def test_loaded_note_rejects_missing_field() -> None:
-    anki = FakeAnki(make_unit())
-    note = anki.notes_info([NOTE_ID])[0]
-    del note["fields"]["Ctx_5"]
-    anki.notes_result_override = [note]
-    anki.notes_calls = 0
-
-    with pytest.raises(HydrationNoteError, match="NOTE_FIELDS"):
-        hydrate_unit(NOTE_ID, anki=anki)
-
-
-def test_loaded_note_rejects_malformed_field_value() -> None:
-    anki = FakeAnki(make_unit())
-    note = anki.notes_info([NOTE_ID])[0]
-    note["fields"]["Ctx_5"]["value"] = 5
-    anki.notes_result_override = [note]
-    anki.notes_calls = 0
-
-    with pytest.raises(HydrationNoteError, match="value must be a string"):
-        hydrate_unit(NOTE_ID, anki=anki)
-
-
-def test_forge_precondition_failure_makes_no_generation_or_write() -> None:
-    unit = make_unit(contexts_ready=False)
+def test_forge_precondition_fails_before_audio_work() -> None:
+    unit = make_unit()
     unit.definition_en = ""
     anki = FakeAnki(unit)
-    generator = FakeGenerator(valid_contexts())
+    synth = FakeSynthesizer()
 
     with pytest.raises(HydrationCoreInvalidError) as captured:
-        hydrate_unit(
+        hydrate_audio(
             NOTE_ID,
             anki=anki,
-            generator=generator,
-            confirmation=FakeConfirmation(True),
+            synthesizer=synth,
+            tts_config=FROZEN_TTS_CONFIG,
         )
 
     assert captured.value.violations == ("F_DEFINITION_EMPTY",)
-    assert generator.calls == []
-    assert anki.updates == []
-    assert anki.store_calls == []
-
-
-def test_empty_context_bank_generates_confirms_and_writes_once() -> None:
-    unit = make_unit(contexts_ready=False)
-    anki = FakeAnki(unit)
-    generator = FakeGenerator(valid_contexts())
-    confirmation = FakeConfirmation(True)
-
-    result = hydrate_unit(
-        NOTE_ID,
-        anki=anki,
-        generator=generator,
-        confirmation=confirmation,
-    )
-
-    assert result.context_outcome is ContextOutcome.CREATED
-    assert result.audio_outcome is AudioOutcome.SKIPPED_NO_L
-    assert len(generator.calls) == 1
-    request, schema = generator.calls[0]
-    assert tuple(request.__dataclass_fields__) == (
-        "lemma",
-        "unit_type",
-        "definition_en",
-        "register",
-        "source_sentence",
-    )
-    assert schema["additionalProperties"] is False
-    assert len(confirmation.previews) == 1
-    assert confirmation.previews[0].validation_passed is True
-    assert anki.updates == [(NOTE_ID, valid_contexts())]
-
-
-def test_generated_validator_rejection_preserves_exact_codes_without_retry() -> None:
-    unit = make_unit(contexts_ready=False)
-    candidate = valid_contexts()
-    candidate["Ctx_1"] = (
-        "This ordinary example intentionally omits the required target word "
-        "entirely."
-    )
-    anki = FakeAnki(unit)
-    generator = FakeGenerator(candidate)
-    confirmation = FakeConfirmation(True)
-
-    result = hydrate_unit(
-        NOTE_ID,
-        anki=anki,
-        generator=generator,
-        confirmation=confirmation,
-    )
-
-    assert result.context_outcome is ContextOutcome.GENERATED_INVALID
-    assert result.audio_outcome is AudioOutcome.NOT_ATTEMPTED
-    assert result.violations == ("C_CTX_1_UNIT_MISSING",)
-    assert len(generator.calls) == 1
-    assert confirmation.previews == []
-    assert anki.updates == []
-
-
-def test_human_decline_writes_nothing_and_does_no_audio_work() -> None:
-    unit = make_unit(contexts_ready=False, target_l=True)
-    anki = FakeAnki(unit)
-    generator = FakeGenerator(valid_contexts())
-    synth = FakeSynthesizer()
-
-    result = hydrate_unit(
-        NOTE_ID,
-        anki=anki,
-        generator=generator,
-        confirmation=FakeConfirmation(False),
-        synthesizer=synth,
-        tts_config=tts_config(),
-    )
-
-    assert result.context_outcome is ContextOutcome.DECLINED
-    assert result.audio_outcome is AudioOutcome.NOT_ATTEMPTED
-    assert anki.updates == []
-    assert synth.calls == []
-
-
-def test_existing_valid_context_bank_is_not_generated_or_overwritten() -> None:
-    anki = FakeAnki(make_unit())
-    generator = FakeGenerator(valid_contexts())
-
-    result = hydrate_unit(NOTE_ID, anki=anki, generator=generator)
-
-    assert result.context_outcome is ContextOutcome.ALREADY_READY
-    assert result.audio_outcome is AudioOutcome.SKIPPED_NO_L
-    assert generator.calls == []
-    assert anki.updates == []
-
-
-def test_existing_partial_context_bank_fails_closed() -> None:
-    unit = make_unit(contexts_ready=False)
-    unit.Ctx_1 = valid_contexts()["Ctx_1"]
-    anki = FakeAnki(unit)
-    generator = FakeGenerator(valid_contexts())
-
-    result = hydrate_unit(NOTE_ID, anki=anki, generator=generator)
-
-    assert result.context_outcome is ContextOutcome.EXISTING_PARTIAL
-    assert generator.calls == []
-    assert anki.updates == []
-
-
-def test_existing_full_invalid_context_preserves_validator_codes() -> None:
-    unit = make_unit()
-    unit.Ctx_4 = "Whitespace-free but missing the required lexical item here."
-    anki = FakeAnki(unit)
-
-    result = hydrate_unit(NOTE_ID, anki=anki)
-
-    assert result.context_outcome is ContextOutcome.EXISTING_INVALID
-    assert result.violations == ("C_CTX_4_UNIT_MISSING",)
-    assert anki.updates == []
-
-
-def test_whitespace_contexts_are_not_normalized_to_empty_eligibility() -> None:
-    unit = make_unit(contexts_ready=False)
-    for field_name in CONTEXT_FIELDS:
-        setattr(unit, field_name, "   ")
-    anki = FakeAnki(unit)
-    generator = FakeGenerator(valid_contexts())
-
-    result = hydrate_unit(NOTE_ID, anki=anki, generator=generator)
-
-    assert result.context_outcome is ContextOutcome.EXISTING_INVALID
-    assert result.violations == tuple(
-        f"C_CTX_{index}_EMPTY" for index in range(1, 6)
-    )
-    assert generator.calls == []
-
-
-def test_context_stale_snapshot_after_confirmation_writes_nothing() -> None:
-    unit = make_unit(contexts_ready=False)
-    anki = FakeAnki(unit)
-    anki.notes_hooks[2] = lambda fake: fake.values.update(
-        {"definition_en": "human edited definition"}
-    )
-
-    result = hydrate_unit(
-        NOTE_ID,
-        anki=anki,
-        generator=FakeGenerator(valid_contexts()),
-        confirmation=FakeConfirmation(True),
-    )
-
-    assert result.context_outcome is ContextOutcome.STALE
-    assert result.audio_outcome is AudioOutcome.NOT_ATTEMPTED
-    assert anki.updates == []
-
-
-def test_context_readback_mismatch_is_persistence_failure() -> None:
-    anki = FakeAnki(make_unit(contexts_ready=False))
-    anki.apply_updates = False
-
-    with pytest.raises(ContextPersistenceError):
-        hydrate_unit(
-            NOTE_ID,
-            anki=anki,
-            generator=FakeGenerator(valid_contexts()),
-            confirmation=FakeConfirmation(True),
-        )
-
-
-def test_hydration_never_uses_full_replacement_serialization(monkeypatch) -> None:
-    anki = FakeAnki(make_unit(contexts_ready=False))
-
-    def forbidden_to_note_fields(_self):
-        raise AssertionError("T8 must not call to_note_fields")
-
-    monkeypatch.setattr(VocabUnit, "to_note_fields", forbidden_to_note_fields)
-
-    result = hydrate_unit(
-        NOTE_ID,
-        anki=anki,
-        generator=FakeGenerator(valid_contexts()),
-        confirmation=FakeConfirmation(True),
-    )
-
-    assert result.context_outcome is ContextOutcome.CREATED
-
-
-def test_target_l_disabled_does_not_touch_existing_audio() -> None:
-    unit = make_unit()
-    unit.audio_1 = "legacy one"
-    unit.audio_2 = "legacy two"
-    anki = FakeAnki(unit)
-    synth = FakeSynthesizer()
-
-    result = hydrate_unit(
-        NOTE_ID,
-        anki=anki,
-        synthesizer=synth,
-        tts_config=tts_config(),
-    )
-
-    assert result.audio_outcome is AudioOutcome.SKIPPED_NO_L
     assert synth.calls == []
     assert anki.retrieve_calls == []
     assert anki.store_calls == []
     assert anki.updates == []
-    assert anki.values["audio_1"] == "legacy one"
 
 
-def test_complete_valid_audio_and_media_is_already_ready_despite_config_drift() -> None:
-    unit = make_unit(target_l=True)
-    filenames = [
-        f"vocab-a{slot}-{str(slot) * 16}.mp3"
-        for slot in (1, 2, 3)
-    ]
-    for slot, filename in enumerate(filenames, start=1):
-        setattr(unit, f"audio_{slot}", sound_markup(filename))
+def test_context_bank_must_be_complete_and_valid() -> None:
+    unit = make_unit(contexts_ready=False)
     anki = FakeAnki(unit)
-    anki.media = {filename: f"old-{filename}".encode() for filename in filenames}
-    synth = FakeSynthesizer()
-    drifted = TtsConfig("changedregion", "en-GB", ("new-1", "new-2", "new-3"))
 
-    result = hydrate_unit(
+    with pytest.raises(AudioContextNotReadyError):
+        hydrate_audio(NOTE_ID, anki=anki)
+
+    unit = make_unit()
+    unit.Ctx_4 = "This sentence lacks the required vocabulary item entirely."
+    with pytest.raises(AudioContextNotReadyError):
+        hydrate_audio(NOTE_ID, anki=FakeAnki(unit))
+
+
+def test_target_l_disabled_performs_zero_audio_operations() -> None:
+    unit = make_unit(target_l=False)
+    unit.audio_1 = "arbitrary malformed legacy value"
+    unit.audio_2 = "opaque two"
+    unit.audio_3 = "opaque three"
+    anki = FakeAnki(unit)
+    synth = FakeSynthesizer()
+
+    outcome = hydrate_audio(
         NOTE_ID,
         anki=anki,
         synthesizer=synth,
+        tts_config=FROZEN_TTS_CONFIG,
+    )
+
+    assert outcome is AudioOutcome.SKIPPED_NO_L
+    assert synth.identity_reads == 0
+    assert synth.calls == []
+    assert anki.retrieve_calls == []
+    assert anki.store_calls == []
+    assert anki.updates == []
+
+
+def test_existing_valid_audio_is_already_ready_despite_runtime_drift() -> None:
+    unit = make_unit()
+    filename = "vocab-a1-1111111111111111.mp3"
+    unit.audio_1 = sound_markup(filename)
+    anki = FakeAnki(unit)
+    anki.media[filename] = b"accepted-legacy-provider-bytes"
+
+    class ExplodingIdentity:
+        @property
+        def synthesis_identity(self) -> object:
+            raise AssertionError("accepted audio must not inspect runtime identity")
+
+    drifted = replace(FROZEN_TTS_CONFIG, provider="changed-local-runtime")
+    outcome = hydrate_audio(
+        NOTE_ID,
+        anki=anki,
+        synthesizer=ExplodingIdentity(),
         tts_config=drifted,
     )
 
-    assert result.audio_outcome is AudioOutcome.ALREADY_READY
-    assert anki.retrieve_calls == filenames
-    assert synth.calls == []
+    assert outcome is AudioOutcome.ALREADY_READY
+    assert anki.retrieve_calls == [filename]
     assert anki.store_calls == []
     assert anki.updates == []
 
 
-def test_fully_hydrated_enabled_note_needs_no_provider_dependencies() -> None:
-    unit = make_unit(target_l=True)
-    filenames = [
-        f"vocab-a{slot}-{str(slot) * 16}.mp3"
-        for slot in (1, 2, 3)
-    ]
-    for slot, filename in enumerate(filenames, start=1):
-        setattr(unit, f"audio_{slot}", sound_markup(filename))
+def test_existing_audio_needs_no_current_runtime_dependencies() -> None:
+    unit = make_unit()
+    filename = "vocab-a1-2222222222222222.mp3"
+    unit.audio_1 = sound_markup(filename)
     anki = FakeAnki(unit)
-    anki.media = {filename: b"accepted" for filename in filenames}
+    anki.media[filename] = b"accepted"
 
-    result = hydrate_unit(NOTE_ID, anki=anki)
-
-    assert result.context_outcome is ContextOutcome.ALREADY_READY
-    assert result.audio_outcome is AudioOutcome.ALREADY_READY
-
-
-def test_matching_synthesis_identity_allows_unhydrated_audio() -> None:
-    unit = make_unit(target_l=True)
-    anki = FakeAnki(unit)
-    synth = FakeSynthesizer(
-        provider_id=AUDIO_PROVIDER_ID,
-        region="southeastasia",
-        output_format=AUDIO_OUTPUT_FORMAT,
-    )
-
-    result = hydrate_unit(
-        NOTE_ID,
-        anki=anki,
-        synthesizer=synth,
-        tts_config=tts_config(),
-    )
-
-    assert result.audio_outcome is AudioOutcome.CREATED
-    assert len(anki.retrieve_calls) == 6
-    assert len(synth.calls) == 3
-    assert len(anki.store_calls) == 3
-    assert len(anki.updates) == 1
+    assert hydrate_audio(NOTE_ID, anki=anki) is AudioOutcome.ALREADY_READY
 
 
 @pytest.mark.parametrize(
-    ("identity_changes", "message"),
+    "markup",
     [
-        ({"region": "eastus"}, "region"),
-        ({"region": "southeastasia "}, "region"),
-        ({"provider_id": "another-provider"}, "provider_id"),
-        ({"output_format": "another-output-format"}, "output_format"),
-    ],
-    ids=[
-        "region-mismatch",
-        "region-is-not-normalized",
-        "provider-mismatch",
-        "output-format-mismatch",
+        "arbitrary.mp3",
+        "[sound:vocab-a2-0000000000000000.mp3]",
+        "[sound:vocab-a1-ABCDEF0000000000.mp3]",
     ],
 )
-def test_synthesis_identity_mismatch_fails_before_every_audio_side_effect(
-    identity_changes: dict[str, object],
-    message: str,
-) -> None:
-    anki = FakeAnki(make_unit(target_l=True))
-    synth = FakeSynthesizer(**identity_changes)
-
-    with pytest.raises(AudioSynthesisIdentityError, match=message):
-        hydrate_unit(
-            NOTE_ID,
-            anki=anki,
-            synthesizer=synth,
-            tts_config=tts_config(),
-        )
-
-    assert anki.retrieve_calls == []
-    assert synth.calls == []
-    assert anki.store_calls == []
-    assert anki.updates == []
-
-
-@pytest.mark.parametrize(
-    ("field_name", "malformed_value"),
-    [
-        ("provider_id", None),
-        ("region", 7),
-        ("output_format", True),
-    ],
-)
-def test_malformed_synthesis_identity_fails_before_every_audio_side_effect(
-    field_name: str,
-    malformed_value: object,
-) -> None:
-    anki = FakeAnki(make_unit(target_l=True))
-    synth = FakeSynthesizer()
-    setattr(synth, field_name, malformed_value)
-
-    with pytest.raises(AudioSynthesisIdentityError, match="exact strings"):
-        hydrate_unit(
-            NOTE_ID,
-            anki=anki,
-            synthesizer=synth,
-            tts_config=tts_config(),
-        )
-
-    assert anki.retrieve_calls == []
-    assert synth.calls == []
-    assert anki.store_calls == []
-    assert anki.updates == []
-
-
-@pytest.mark.parametrize(
-    "field_name",
-    ["provider_id", "region", "output_format"],
-)
-def test_missing_synthesis_identity_fails_before_every_audio_side_effect(
-    field_name: str,
-) -> None:
-    anki = FakeAnki(make_unit(target_l=True))
-    synth = FakeSynthesizer()
-    delattr(synth, field_name)
-
-    with pytest.raises(AudioSynthesisIdentityError, match="missing"):
-        hydrate_unit(
-            NOTE_ID,
-            anki=anki,
-            synthesizer=synth,
-            tts_config=tts_config(),
-        )
-
-    assert anki.retrieve_calls == []
-    assert synth.calls == []
-    assert anki.store_calls == []
-    assert anki.updates == []
-
-
-def test_partial_audio_fails_before_synthesis_or_write() -> None:
-    unit = make_unit(target_l=True)
-    unit.audio_1 = "[sound:vocab-a1-0000000000000000.mp3]"
-    anki = FakeAnki(unit)
-    synth = FakeSynthesizer()
-
-    with pytest.raises(AudioExistingPartialError):
-        hydrate_unit(NOTE_ID, anki=anki, synthesizer=synth, tts_config=tts_config())
-
-    assert synth.calls == []
-    assert anki.updates == []
-
-
-def test_complete_malformed_audio_fails_closed() -> None:
-    unit = make_unit(target_l=True)
-    unit.audio_1 = "arbitrary.mp3"
-    unit.audio_2 = "arbitrary.mp3"
-    unit.audio_3 = "arbitrary.mp3"
+def test_existing_malformed_audio1_fails_closed(markup: str) -> None:
+    unit = make_unit()
+    unit.audio_1 = markup
     anki = FakeAnki(unit)
 
     with pytest.raises(AudioExistingInvalidError):
-        hydrate_unit(NOTE_ID, anki=anki)
-
-
-@pytest.mark.parametrize("media_value", [None, b"", "not-bytes"])
-def test_complete_audio_with_missing_or_empty_media_fails_without_repair(
-    media_value: object,
-) -> None:
-    unit = make_unit(target_l=True)
-    filenames = [
-        f"vocab-a{slot}-{str(slot) * 16}.mp3"
-        for slot in (1, 2, 3)
-    ]
-    for slot, filename in enumerate(filenames, start=1):
-        setattr(unit, f"audio_{slot}", sound_markup(filename))
-    anki = FakeAnki(unit)
-    anki.media = {filename: b"valid" for filename in filenames}
-    if media_value is None:
-        del anki.media[filenames[1]]
-    else:
-        anki.media[filenames[1]] = media_value  # type: ignore[assignment]
-
-    with pytest.raises(AudioMediaMissingOrInvalidError):
-        hydrate_unit(NOTE_ID, anki=anki)
+        hydrate_audio(NOTE_ID, anki=anki)
 
     assert anki.store_calls == []
     assert anki.updates == []
 
 
-def test_empty_audio_reuses_orphans_synthesizes_missing_and_commits_atomically() -> None:
-    unit = make_unit(target_l=True)
+@pytest.mark.parametrize("media", [None, b"", "not-bytes"])
+def test_existing_audio1_missing_or_empty_media_fails_without_repair(
+    media: object,
+) -> None:
+    unit = make_unit()
+    filename = "vocab-a1-3333333333333333.mp3"
+    unit.audio_1 = sound_markup(filename)
     anki = FakeAnki(unit)
-    config = tts_config()
-    filenames = expected_filenames(unit, config)
-    anki.media[filenames[0]] = b"existing-orphan"
-    synth = FakeSynthesizer(anki.events)
+    if media is not None:
+        anki.media[filename] = media
 
-    result = hydrate_unit(
+    with pytest.raises(AudioMediaMissingOrInvalidError):
+        hydrate_audio(NOTE_ID, anki=anki)
+
+    assert anki.store_calls == []
+    assert anki.updates == []
+
+
+def test_matching_frozen_identity_synthesizes_exact_ctx1_and_updates_only_audio1() -> None:
+    unit = make_unit()
+    anki = FakeAnki(unit)
+    synth = FakeSynthesizer()
+    filename = expected_filename(unit)
+
+    outcome = hydrate_audio(
         NOTE_ID,
         anki=anki,
         synthesizer=synth,
-        tts_config=config,
+        tts_config=FROZEN_TTS_CONFIG,
     )
 
-    assert result.audio_outcome is AudioOutcome.CREATED
-    assert [call["text"] for call in synth.calls] == [unit.Ctx_1, unit.Ctx_1]
-    assert [call["voice_id"] for call in synth.calls] == ["voice-two", "voice-three"]
-    assert [call["locale"] for call in synth.calls] == ["en-US", "en-US"]
-    assert anki.store_calls == [
-        (filenames[1], b"audio:voice-two"),
-        (filenames[2], b"audio:voice-three"),
-    ]
-    assert anki.updates == [
-        (
-            NOTE_ID,
-            {
-                "audio_1": sound_markup(filenames[0]),
-                "audio_2": sound_markup(filenames[1]),
-                "audio_3": sound_markup(filenames[2]),
-            },
-        )
-    ]
+    assert outcome is AudioOutcome.CREATED
+    assert synth.calls == [unit.Ctx_1]
+    assert anki.retrieve_calls == [filename, filename]
+    assert anki.store_calls == [(filename, b"local-mp3")]
+    assert anki.updates == [(NOTE_ID, {"audio_1": sound_markup(filename)})]
     assert anki.values["VisualCue"] == "keep-this-cue"
-    assert anki.events.index(("retrieve", filenames[1])) < anki.events.index(
-        ("synthesize", "voice-two")
-    )
-    assert all(event[0] != "update" for event in anki.events[:-1])
 
 
-def test_all_three_slots_synthesize_exact_same_ctx_1_with_ordered_voices() -> None:
-    unit = make_unit(target_l=True)
+def test_existing_exact_deterministic_media_is_reused_without_synthesis() -> None:
+    unit = make_unit()
+    filename = expected_filename(unit)
     anki = FakeAnki(unit)
-    config = tts_config()
+    anki.media[filename] = b"orphan-from-earlier-safe-run"
     synth = FakeSynthesizer()
 
-    result = hydrate_unit(
+    outcome = hydrate_audio(
         NOTE_ID,
         anki=anki,
         synthesizer=synth,
-        tts_config=config,
+        tts_config=FROZEN_TTS_CONFIG,
     )
 
-    assert result.audio_outcome is AudioOutcome.CREATED
-    assert [call["text"] for call in synth.calls] == [unit.Ctx_1] * 3
-    assert [call["voice_id"] for call in synth.calls] == list(config.voice_ids)
-    assert [call["locale"] for call in synth.calls] == [config.locale] * 3
-    assert [filename for filename, _data in anki.store_calls] == (
-        expected_filenames(unit, config)
-    )
+    assert outcome is AudioOutcome.CREATED
+    assert anki.retrieve_calls == [filename]
+    assert synth.calls == []
+    assert anki.store_calls == []
+    assert anki.updates == [(NOTE_ID, {"audio_1": sound_markup(filename)})]
 
 
-def test_empty_deterministic_orphan_fails_without_synthesis_or_write() -> None:
-    unit = make_unit(target_l=True)
+@pytest.mark.parametrize("invalid_media", [b"", "not-bytes"])
+def test_invalid_deterministic_media_fails_before_synthesis_or_write(
+    invalid_media: object,
+) -> None:
+    unit = make_unit()
+    filename = expected_filename(unit)
     anki = FakeAnki(unit)
-    config = tts_config()
-    filename = expected_filenames(unit, config)[0]
-    anki.media[filename] = b""
+    anki.media[filename] = invalid_media
     synth = FakeSynthesizer()
 
-    with pytest.raises(AudioMediaMissingOrInvalidError, match="non-empty bytes"):
-        hydrate_unit(
+    with pytest.raises(AudioMediaMissingOrInvalidError):
+        hydrate_audio(
             NOTE_ID,
             anki=anki,
             synthesizer=synth,
-            tts_config=config,
+            tts_config=FROZEN_TTS_CONFIG,
         )
 
     assert synth.calls == []
+    assert anki.store_calls == []
     assert anki.updates == []
 
 
-def test_store_returned_filename_mismatch_fails_without_audio_field_write() -> None:
-    unit = make_unit(target_l=True)
-    anki = FakeAnki(unit)
-    anki.store_name_override = "renamed.mp3"
+@pytest.mark.parametrize(
+    "identity",
+    [
+        replace(FROZEN_TTS_CONFIG, provider="wrong-provider"),
+        replace(FROZEN_TTS_CONFIG, output_format="wrong-format"),
+        replace(FROZEN_TTS_CONFIG, voice_id="wrong-voice"),
+        None,
+        "malformed",
+    ],
+)
+def test_synthesizer_identity_mismatch_fails_before_every_audio_side_effect(
+    identity: object,
+) -> None:
+    anki = FakeAnki(make_unit())
+    synth = FakeSynthesizer(identity)
 
-    with pytest.raises(AudioPersistenceError, match="filename"):
-        hydrate_unit(
-            NOTE_ID,
-            anki=anki,
-            synthesizer=FakeSynthesizer(),
-            tts_config=tts_config(),
-        )
-
-    assert anki.updates == []
-
-
-def test_stored_media_byte_mismatch_fails_without_audio_field_write() -> None:
-    unit = make_unit(target_l=True)
-    anki = FakeAnki(unit)
-    anki.corrupt_store_readback = True
-
-    with pytest.raises(AudioPersistenceError, match="bytes"):
-        hydrate_unit(
-            NOTE_ID,
-            anki=anki,
-            synthesizer=FakeSynthesizer(),
-            tts_config=tts_config(),
-        )
-
-    assert anki.updates == []
-
-
-def test_slot_two_synthesis_failure_leaves_orphan_without_field_write() -> None:
-    unit = make_unit(target_l=True)
-    anki = FakeAnki(unit)
-    config = tts_config()
-    filenames = expected_filenames(unit, config)
-    synth = FakeSynthesizer()
-    synth.fail_on_call = 2
-
-    with pytest.raises(RuntimeError, match="provider failure"):
-        hydrate_unit(
+    with pytest.raises(AudioSynthesisIdentityError):
+        hydrate_audio(
             NOTE_ID,
             anki=anki,
             synthesizer=synth,
-            tts_config=config,
+            tts_config=FROZEN_TTS_CONFIG,
         )
 
-    assert anki.media[filenames[0]] == b"audio:voice-one"
-    assert filenames[1] not in anki.media
+    assert anki.retrieve_calls == []
+    assert synth.calls == []
+    assert anki.store_calls == []
     assert anki.updates == []
+
+
+def test_missing_synthesis_identity_fails_before_every_audio_side_effect() -> None:
+    anki = FakeAnki(make_unit())
+
+    with pytest.raises(AudioSynthesisIdentityError, match="missing"):
+        hydrate_audio(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=object(),
+            tts_config=FROZEN_TTS_CONFIG,
+        )
+
+    assert anki.retrieve_calls == []
+    assert anki.store_calls == []
+    assert anki.updates == []
+
+
+def test_drifted_tts_config_fails_before_every_audio_side_effect() -> None:
+    anki = FakeAnki(make_unit())
+    synth = FakeSynthesizer()
+    drifted = replace(FROZEN_TTS_CONFIG, encoder_version="different")
+
+    with pytest.raises(AudioSynthesisIdentityError, match="TtsConfig"):
+        hydrate_audio(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=synth,
+            tts_config=drifted,
+        )
+
+    assert anki.retrieve_calls == []
+    assert synth.calls == []
+    assert anki.store_calls == []
+    assert anki.updates == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "opaque_value"),
+    [
+        ("audio_2", "[not even valid markup"),
+        ("audio_3", "opaque legacy value exactly preserved"),
+    ],
+)
+def test_reserved_audio_values_do_not_block_audio1_and_are_preserved(
+    field_name: str,
+    opaque_value: str,
+) -> None:
+    unit = make_unit()
+    setattr(unit, field_name, opaque_value)
+    anki = FakeAnki(unit)
+
+    assert hydrate_audio(
+        NOTE_ID,
+        anki=anki,
+        synthesizer=FakeSynthesizer(),
+        tts_config=FROZEN_TTS_CONFIG,
+    ) is AudioOutcome.CREATED
+
+    assert anki.values[field_name] == opaque_value
+    assert all(set(fields) == {"audio_1"} for _note_id, fields in anki.updates)
+
+
+def test_reserved_audio_changes_are_not_part_of_stale_identity() -> None:
+    unit = make_unit()
+    unit.audio_2 = "before"
+    anki = FakeAnki(unit)
+    anki.notes_hooks[2] = lambda fake: fake.values.update(
+        {"audio_2": "human changed opaque value"}
+    )
+
+    outcome = hydrate_audio(
+        NOTE_ID,
+        anki=anki,
+        synthesizer=FakeSynthesizer(),
+        tts_config=FROZEN_TTS_CONFIG,
+    )
+
+    assert outcome is AudioOutcome.CREATED
+    assert anki.values["audio_2"] == "human changed opaque value"
+    assert set(anki.updates[0][1]) == {"audio_1"}
 
 
 @pytest.mark.parametrize(
@@ -843,45 +494,98 @@ def test_slot_two_synthesis_failure_leaves_orphan_without_field_write() -> None:
     [
         ("Target_L", ""),
         ("Ctx_1", "A human changed this subtle context before commit."),
-        ("audio_2", "[sound:vocab-a2-ffffffffffffffff.mp3]"),
+        ("Ctx_2", "A human changed another subtle validated context."),
+        ("definition_en", "a human changed the intended sense"),
+        ("audio_1", "[sound:vocab-a1-ffffffffffffffff.mp3]"),
     ],
 )
-def test_audio_stale_guard_prevents_field_commit(
+def test_relevant_stale_guard_prevents_audio1_field_write(
     field_name: str,
     replacement: str,
 ) -> None:
-    unit = make_unit(target_l=True)
-    anki = FakeAnki(unit)
-    anki.notes_hooks[3] = lambda fake: fake.values.update(
+    anki = FakeAnki(make_unit())
+    anki.notes_hooks[2] = lambda fake: fake.values.update(
         {field_name: replacement}
     )
 
-    result = hydrate_unit(
+    outcome = hydrate_audio(
         NOTE_ID,
         anki=anki,
         synthesizer=FakeSynthesizer(),
-        tts_config=tts_config(),
+        tts_config=FROZEN_TTS_CONFIG,
     )
 
-    assert result.audio_outcome is AudioOutcome.STALE
-    assert anki.updates == []
+    assert outcome is AudioOutcome.STALE
     assert anki.store_calls
-    assert anki.values["VisualCue"] == "keep-this-cue"
+    assert anki.updates == []
 
 
-def test_audio_field_readback_mismatch_is_persistence_failure() -> None:
-    unit = make_unit(target_l=True)
-    anki = FakeAnki(unit)
-    anki.apply_updates = False
-
-    with pytest.raises(AudioPersistenceError, match="fields"):
-        hydrate_unit(
+def test_store_filename_or_media_readback_mismatch_fails_before_field_write() -> None:
+    anki = FakeAnki(make_unit())
+    anki.store_name_override = "renamed.mp3"
+    with pytest.raises(AudioPersistenceError, match="filename"):
+        hydrate_audio(
             NOTE_ID,
             anki=anki,
             synthesizer=FakeSynthesizer(),
-            tts_config=tts_config(),
+            tts_config=FROZEN_TTS_CONFIG,
+        )
+    assert anki.updates == []
+
+    anki = FakeAnki(make_unit())
+    anki.corrupt_store_readback = True
+    with pytest.raises(AudioPersistenceError, match="bytes"):
+        hydrate_audio(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=FakeSynthesizer(),
+            tts_config=FROZEN_TTS_CONFIG,
+        )
+    assert anki.updates == []
+
+
+@pytest.mark.parametrize("audio", [b"", None, "not-bytes"])
+def test_synthesizer_output_must_be_nonempty_bytes(audio: object) -> None:
+    anki = FakeAnki(make_unit())
+
+    with pytest.raises(Exception, match="non-empty bytes"):
+        hydrate_audio(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=FakeSynthesizer(audio=audio),
+            tts_config=FROZEN_TTS_CONFIG,
         )
 
-    assert len(anki.updates) == 1
-    assert set(anki.updates[0][1]) == {"audio_1", "audio_2", "audio_3"}
-    assert anki.values["VisualCue"] == "keep-this-cue"
+    assert anki.store_calls == []
+    assert anki.updates == []
+
+
+def test_audio1_readback_mismatch_is_persistence_failure() -> None:
+    anki = FakeAnki(make_unit())
+    anki.apply_updates = False
+
+    with pytest.raises(AudioPersistenceError, match="audio_1"):
+        hydrate_audio(
+            NOTE_ID,
+            anki=anki,
+            synthesizer=FakeSynthesizer(),
+            tts_config=FROZEN_TTS_CONFIG,
+        )
+
+    assert anki.updates and set(anki.updates[0][1]) == {"audio_1"}
+
+
+def test_hydration_never_uses_full_replacement_serialization(monkeypatch) -> None:
+    anki = FakeAnki(make_unit())
+
+    def forbidden_to_note_fields(_self):
+        raise AssertionError("T8 must not call to_note_fields")
+
+    monkeypatch.setattr(VocabUnit, "to_note_fields", forbidden_to_note_fields)
+
+    assert hydrate_audio(
+        NOTE_ID,
+        anki=anki,
+        synthesizer=FakeSynthesizer(),
+        tts_config=FROZEN_TTS_CONFIG,
+    ) is AudioOutcome.CREATED

@@ -1,16 +1,14 @@
-"""Pure tests for T8 context request, schema, parser, and preview types."""
+"""Pure tests for T8 context parsing and immutable preview types."""
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError
 
 import pytest
 
 from vocab.context import (
-    ContextGenerationRequest,
     ContextPreview,
     ContextSchemaError,
-    context_json_schema,
     parse_context_bank,
 )
 from vocab.contracts import CONTEXT_FIELDS
@@ -21,19 +19,6 @@ def valid_bank() -> dict[str, str]:
         field_name: f"context {index}"
         for index, field_name in enumerate(CONTEXT_FIELDS, start=1)
     }
-
-
-def test_context_schema_has_exact_five_string_fields() -> None:
-    schema = context_json_schema()
-
-    assert schema["type"] == "object"
-    assert schema["additionalProperties"] is False
-    assert tuple(schema["required"]) == CONTEXT_FIELDS
-    assert set(schema["properties"]) == set(CONTEXT_FIELDS)
-    assert all(
-        property_schema == {"type": "string"}
-        for property_schema in schema["properties"].values()
-    )
 
 
 def test_parser_rejects_additional_property() -> None:
@@ -69,27 +54,6 @@ def test_parser_copies_without_mutating_input() -> None:
     parsed["Ctx_1"] = "changed result"
 
     assert bank == original
-
-
-def test_schema_calls_return_independent_deep_copies() -> None:
-    first = context_json_schema()
-    first["properties"]["Ctx_1"]["type"] = "integer"
-    first["required"].append("extra")
-
-    second = context_json_schema()
-
-    assert second["properties"]["Ctx_1"] == {"type": "string"}
-    assert tuple(second["required"]) == CONTEXT_FIELDS
-
-
-def test_generation_request_contains_only_allowed_lexical_data() -> None:
-    assert tuple(field.name for field in fields(ContextGenerationRequest)) == (
-        "lemma",
-        "unit_type",
-        "definition_en",
-        "register",
-        "source_sentence",
-    )
 
 
 def test_context_preview_is_immutable_and_validation_is_fixed_true() -> None:

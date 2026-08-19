@@ -18,7 +18,7 @@ from vocab.contracts import (
     NOTE_FIELDS,
     NOVEL_CONTEXT_FIELDS,
 )
-from vocab.media_contract import NOVEL_AUDIO_FIELDS
+from vocab.media_contract import RESERVED_AUDIO_FIELDS
 
 
 def valid_model() -> dict[str, object]:
@@ -228,7 +228,7 @@ def test_l_front_requires_audio_1() -> None:
     assert "TEMPLATE_REQUIRED_FRONT_FIELD_MISSING" in codes(model)
 
 
-@pytest.mark.parametrize("field_name", NOVEL_AUDIO_FIELDS)
+@pytest.mark.parametrize("field_name", RESERVED_AUDIO_FIELDS)
 @pytest.mark.parametrize("side", ["qfmt", "afmt"], ids=["front", "back"])
 def test_novel_audio_is_forbidden_on_either_side(
     field_name: str,

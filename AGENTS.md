@@ -97,15 +97,19 @@ Never invent missing identifiers, state, model metadata, source references, or v
 
 ## T8 hydration safety
 
-T8 LLM and TTS integrations are batch/offline hydration only. Normal Anki
-review consumes persisted context/audio artifacts and never calls OpenAI or
-Azure TTS.
+T8 makes no programmatic LLM call. ChatGPT context generation uses a
+human-mediated deterministic batch-file workflow. T8 uses no paid AI or TTS
+API; new Listening media is local Kokoro `audio_1` only.
 
-For T8: never write a partial context bank or partial audio field set; never
-use `VocabUnit.to_note_fields()` for partial hydration; never mutate
-`VisualCue`; never emit EventLog events in v0; never delete media
-automatically; never regenerate accepted context/audio automatically; and use
-no provider retries or fallbacks.
+`audio_2` and `audio_3` are reserved opaque compatibility fields. T8 must
+never parse, validate, require, generate, clear, overwrite, or include them in
+a stale guard.
+
+For T8: never write a partial context bank; never use
+`VocabUnit.to_note_fields()` for partial hydration; never mutate `VisualCue`;
+never emit EventLog events in v0; never delete media automatically; never
+regenerate accepted context/audio automatically; and use no retries or
+fallbacks. Normal Anki review performs no AI or TTS work.
 
 ## Task scope
 

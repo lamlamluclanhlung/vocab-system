@@ -18,7 +18,7 @@ from .contracts import (
 )
 from .media_contract import (
     NORMAL_REVIEW_AUDIO_FIELD,
-    NOVEL_AUDIO_FIELDS,
+    RESERVED_AUDIO_FIELDS,
 )
 
 
@@ -36,7 +36,7 @@ TARGET_TEMPLATE_FIELDS: Final[tuple[str, ...]] = tuple(
 
 FORBIDDEN_NORMAL_REVIEW_FIELDS: Final[tuple[str, ...]] = (
     *NOVEL_CONTEXT_FIELDS,
-    *NOVEL_AUDIO_FIELDS,
+    *RESERVED_AUDIO_FIELDS,
 )
 
 REQUIRED_FRONT_FIELDS_BY_TEMPLATE_NAME: Final[

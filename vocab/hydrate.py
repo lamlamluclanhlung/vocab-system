@@ -1,96 +1,54 @@
-"""Fail-closed one-unit T8 context and audio hydration orchestration."""
+"""Fail-closed one-unit T8 audio_1 hydration orchestration."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Protocol
 
 from .anki import AnkiConnectClient
-from .context import (
-    ContextGenerationRequest,
-    ContextGenerator,
-    ContextPreview,
-    context_json_schema,
-    parse_context_bank,
-)
 from .contracts import (
     ANKI_NOTE_TYPE_NAME,
     CONTEXT_FIELDS,
     NOTE_FIELDS,
+    STATE_FIELDS,
+    TARGET_FIELDS,
     TARGET_FLAG_VALUE,
-)
-from .media_contract import (
-    AUDIO_OUTPUT_FORMAT,
-    AUDIO_PROVIDER_ID,
-    AUDIO_SLOT_FIELDS,
-    AUDIO_SLOT_NUMBERS,
 )
 from .models import VocabUnit
 from .tts import (
+    FROZEN_TTS_CONFIG,
     SpeechSynthesizer,
     TtsConfig,
     TtsContractError,
     deterministic_audio_filename,
-    parse_t8_sound_markup,
+    parse_audio1_sound_markup,
     sound_markup,
 )
 from .validators import validate_context_bank, validate_forge_unit
 
 
-_CONTEXT_SNAPSHOT_FIELDS = (
+_AUDIO_SNAPSHOT_FIELDS = (
     "unit_key",
     "lemma",
     "lemma_slug",
     "sense_slug",
     "unit_type",
-    "definition_en",
+    *TARGET_FIELDS,
     "register",
+    "definition_en",
     "source_ref",
     "source_sentence",
     *CONTEXT_FIELDS,
+    *STATE_FIELDS,
+    "audio_1",
 )
-
-_AUDIO_SNAPSHOT_FIELDS = (
-    "unit_key",
-    "Target_L",
-    "Ctx_1",
-    *AUDIO_SLOT_FIELDS,
-)
-
-
-class ContextOutcome(str, Enum):
-    CREATED = "CREATED"
-    ALREADY_READY = "ALREADY_READY"
-    DECLINED = "DECLINED"
-    GENERATED_INVALID = "GENERATED_INVALID"
-    EXISTING_PARTIAL = "EXISTING_PARTIAL"
-    EXISTING_INVALID = "EXISTING_INVALID"
-    STALE = "STALE"
 
 
 class AudioOutcome(str, Enum):
     CREATED = "CREATED"
     ALREADY_READY = "ALREADY_READY"
     SKIPPED_NO_L = "SKIPPED_NO_L"
-    NOT_ATTEMPTED = "NOT_ATTEMPTED"
     STALE = "STALE"
-
-
-@dataclass(frozen=True, slots=True)
-class HydrationResult:
-    """Deterministic outcomes for the two sequential T8 artifact stages."""
-
-    context_outcome: ContextOutcome
-    audio_outcome: AudioOutcome
-    violations: tuple[str, ...] = ()
-
-
-class ContextConfirmation(Protocol):
-    """Human confirmation boundary for an immutable validated preview."""
-
-    def __call__(self, preview: ContextPreview) -> bool: ...
 
 
 class HydrationError(RuntimeError):
@@ -113,23 +71,11 @@ class HydrationCoreInvalidError(HydrationError):
 
 
 class HydrationDependencyError(HydrationError):
-    """Raised when the current persisted stage needs an absent dependency."""
-
-
-class HydrationConfirmationError(HydrationError):
-    """Raised when the confirmation boundary does not return an actual bool."""
-
-
-class ContextPersistenceError(HydrationError):
-    """Raised when the atomic context subset write cannot be read back exactly."""
-
-
-class AudioExistingPartialError(HydrationError):
-    """Raised when only part of the persisted three-field audio set exists."""
+    """Raised when empty audio_1 needs an absent synthesizer/config."""
 
 
 class AudioExistingInvalidError(HydrationError):
-    """Raised when a complete audio set has malformed or wrong-slot markup."""
+    """Raised when persisted audio_1 markup is malformed."""
 
 
 class AudioMediaMissingOrInvalidError(HydrationError):
@@ -137,7 +83,7 @@ class AudioMediaMissingOrInvalidError(HydrationError):
 
 
 class AudioContextNotReadyError(HydrationError):
-    """Raised when the latest note no longer has a valid complete context bank."""
+    """Raised when the note does not have a valid complete context bank."""
 
 
 class AudioSynthesisError(HydrationError):
@@ -145,224 +91,74 @@ class AudioSynthesisError(HydrationError):
 
 
 class AudioSynthesisIdentityError(HydrationError):
-    """Raised when synthesis identity cannot be bound to D29 exactly."""
+    """Raised when synthesis identity cannot be bound to frozen D32 config."""
 
 
 class AudioPersistenceError(HydrationError):
-    """Raised when deterministic media or audio field persistence is uncertain."""
+    """Raised when media or audio_1 persistence cannot be proven exact."""
 
 
-def hydrate_unit(
+def hydrate_audio(
     note_id: int,
     *,
     anki: AnkiConnectClient,
-    generator: ContextGenerator | None = None,
-    confirmation: ContextConfirmation | None = None,
     synthesizer: SpeechSynthesizer | None = None,
     tts_config: TtsConfig | None = None,
-) -> HydrationResult:
-    """Hydrate one existing VocabularyUnit without repair or regeneration."""
-    unit = _load_unit(note_id, anki)
-    _require_core_valid(unit)
-
-    context_values = unit.context_fields()
-    context_empty = tuple(value == "" for value in context_values.values())
-    if all(context_empty):
-        if generator is None:
-            raise HydrationDependencyError(
-                "context generation requires a ContextGenerator"
-            )
-        if confirmation is None:
-            raise HydrationDependencyError(
-                "context generation requires human confirmation"
-            )
-        context_result, context_violations = _create_context_bank(
-            note_id,
-            unit,
-            anki=anki,
-            generator=generator,
-            confirmation=confirmation,
-        )
-        if context_result is not ContextOutcome.CREATED:
-            return HydrationResult(
-                context_result,
-                AudioOutcome.NOT_ATTEMPTED,
-                context_violations,
-            )
-        context_outcome = ContextOutcome.CREATED
-    elif all(not is_empty for is_empty in context_empty):
-        violations = validate_context_bank(unit)
-        if violations:
-            return HydrationResult(
-                ContextOutcome.EXISTING_INVALID,
-                AudioOutcome.NOT_ATTEMPTED,
-                violations,
-            )
-        context_outcome = ContextOutcome.ALREADY_READY
-    else:
-        return HydrationResult(
-            ContextOutcome.EXISTING_PARTIAL,
-            AudioOutcome.NOT_ATTEMPTED,
-        )
-
-    audio_outcome = _hydrate_audio(
-        note_id,
-        anki=anki,
-        synthesizer=synthesizer,
-        tts_config=tts_config,
-    )
-    return HydrationResult(context_outcome, audio_outcome)
-
-
-def _create_context_bank(
-    note_id: int,
-    unit: VocabUnit,
-    *,
-    anki: AnkiConnectClient,
-    generator: ContextGenerator,
-    confirmation: ContextConfirmation,
-) -> tuple[ContextOutcome, tuple[str, ...]]:
-    snapshot = _snapshot(unit, _CONTEXT_SNAPSHOT_FIELDS)
-    request = ContextGenerationRequest(
-        lemma=unit.lemma,
-        unit_type=unit.unit_type,
-        definition_en=unit.definition_en,
-        register=unit.register,
-        source_sentence=unit.source_sentence,
-    )
-    generated = generator.generate(
-        request,
-        json_schema=context_json_schema(),
-    )
-    context_fields = parse_context_bank(generated)
-    candidate = replace(unit, **context_fields)
-    violations = validate_context_bank(candidate)
-    if violations:
-        return ContextOutcome.GENERATED_INVALID, violations
-
-    preview = ContextPreview(
-        unit_key=candidate.unit_key,
-        lemma=candidate.lemma,
-        definition_en=candidate.definition_en,
-        register=candidate.register,
-        **context_fields,
-    )
-    confirmed = confirmation(preview)
-    if type(confirmed) is not bool:
-        raise HydrationConfirmationError(
-            "confirmation must return an actual bool"
-        )
-    if not confirmed:
-        return ContextOutcome.DECLINED, ()
-
-    latest = _load_unit(note_id, anki)
-    if _snapshot(latest, _CONTEXT_SNAPSHOT_FIELDS) != snapshot:
-        return ContextOutcome.STALE, ()
-
-    anki.update_note_fields(note_id, context_fields)
-    persisted = _load_unit(note_id, anki)
-    if persisted.context_fields() != context_fields:
-        raise ContextPersistenceError(
-            "context fields did not match the confirmed atomic write"
-        )
-    return ContextOutcome.CREATED, ()
-
-
-def _hydrate_audio(
-    note_id: int,
-    *,
-    anki: AnkiConnectClient,
-    synthesizer: SpeechSynthesizer | None,
-    tts_config: TtsConfig | None,
 ) -> AudioOutcome:
+    """Hydrate only audio_1 for one existing, context-ready VocabularyUnit."""
     unit = _load_unit(note_id, anki)
     _require_core_valid(unit)
     if any(value == "" for value in unit.context_fields().values()) or (
         validate_context_bank(unit)
     ):
         raise AudioContextNotReadyError(
-            "latest note must retain a valid complete context bank"
+            "note must retain a valid complete context bank"
         )
 
     if unit.Target_L != TARGET_FLAG_VALUE:
         return AudioOutcome.SKIPPED_NO_L
 
-    audio_values = unit.audio_fields()
-    audio_empty = tuple(value == "" for value in audio_values.values())
-    if all(not is_empty for is_empty in audio_empty):
-        filenames: list[str] = []
+    if unit.audio_1 != "":
         try:
-            for field_name in AUDIO_SLOT_FIELDS:
-                filenames.append(
-                    parse_t8_sound_markup(field_name, audio_values[field_name])
-                )
+            filename = parse_audio1_sound_markup(unit.audio_1)
         except TtsContractError as exc:
             raise AudioExistingInvalidError(str(exc)) from None
-
-        for filename in filenames:
-            media = anki.retrieve_media_file(filename)
-            if not isinstance(media, bytes) or not media:
-                raise AudioMediaMissingOrInvalidError(
-                    f"referenced media is missing or empty: {filename}"
-                )
+        media = anki.retrieve_media_file(filename)
+        if not isinstance(media, bytes) or not media:
+            raise AudioMediaMissingOrInvalidError(
+                f"referenced media is missing or empty: {filename}"
+            )
         return AudioOutcome.ALREADY_READY
-
-    if not all(audio_empty):
-        raise AudioExistingPartialError(
-            "audio_1 through audio_3 must be all empty or all populated"
-        )
 
     if synthesizer is None:
         raise HydrationDependencyError(
-            "empty enabled audio requires a SpeechSynthesizer"
+            "empty enabled audio_1 requires a SpeechSynthesizer"
         )
     if tts_config is None:
-        raise HydrationDependencyError(
-            "empty enabled audio requires a TtsConfig"
-        )
-    if not isinstance(tts_config, TtsConfig):
+        raise HydrationDependencyError("empty enabled audio_1 requires a TtsConfig")
+    if type(tts_config) is not TtsConfig:
         raise TypeError("tts_config must be a TtsConfig")
+    _require_synthesis_identity(synthesizer, tts_config)
 
-    provider_id, region, output_format = _require_synthesis_identity(
-        synthesizer,
-        tts_config,
+    snapshot = _snapshot(unit)
+    filename = deterministic_audio_filename(
+        config=tts_config,
+        unit_key=unit.unit_key,
+        text=unit.Ctx_1,
     )
-
-    snapshot = _snapshot(unit, _AUDIO_SNAPSHOT_FIELDS)
-    filenames: list[str] = []
-    for slot in AUDIO_SLOT_NUMBERS:
-        voice_id = tts_config.voice_ids[slot - 1]
-        filename = deterministic_audio_filename(
-            provider=provider_id,
-            region=region,
-            unit_key=unit.unit_key,
-            slot=slot,
-            text=unit.Ctx_1,
-            voice_id=voice_id,
-            locale=tts_config.locale,
-            output_format=output_format,
+    existing = anki.retrieve_media_file(filename)
+    if existing is not None and (
+        not isinstance(existing, bytes) or not existing
+    ):
+        raise AudioMediaMissingOrInvalidError(
+            "deterministic media exists but is not non-empty bytes: "
+            f"{filename}"
         )
-        filenames.append(filename)
-        existing = anki.retrieve_media_file(filename)
-        if existing is not None and (
-            not isinstance(existing, bytes) or not existing
-        ):
-            raise AudioMediaMissingOrInvalidError(
-                "deterministic media exists but is not non-empty bytes: "
-                f"{filename}"
-            )
-        if existing is not None:
-            continue
 
-        audio = synthesizer.synthesize(
-            text=unit.Ctx_1,
-            voice_id=voice_id,
-            locale=tts_config.locale,
-        )
+    if existing is None:
+        audio = synthesizer.synthesize(text=unit.Ctx_1)
         if not isinstance(audio, bytes) or not audio:
-            raise AudioSynthesisError(
-                "synthesizer must return non-empty bytes"
-            )
+            raise AudioSynthesisError("synthesizer must return non-empty bytes")
         stored_name = anki.store_media_file(filename, audio)
         if stored_name != filename:
             raise AudioPersistenceError(
@@ -375,57 +171,39 @@ def _hydrate_audio(
             )
 
     latest = _load_unit(note_id, anki)
-    if _snapshot(latest, _AUDIO_SNAPSHOT_FIELDS) != snapshot:
+    if _snapshot(latest) != snapshot:
         return AudioOutcome.STALE
 
-    audio_fields = {
-        field_name: sound_markup(filename)
-        for field_name, filename in zip(AUDIO_SLOT_FIELDS, filenames)
-    }
-    anki.update_note_fields(note_id, audio_fields)
+    markup = sound_markup(filename)
+    anki.update_note_fields(note_id, {"audio_1": markup})
     persisted = _load_unit(note_id, anki)
-    if persisted.audio_fields() != audio_fields:
-        raise AudioPersistenceError(
-            "audio fields did not match the atomic subset write"
-        )
+    if persisted.audio_1 != markup:
+        raise AudioPersistenceError("audio_1 did not match the exact subset write")
     return AudioOutcome.CREATED
 
 
 def _require_synthesis_identity(
     synthesizer: SpeechSynthesizer,
     tts_config: TtsConfig,
-) -> tuple[str, str, str]:
+) -> None:
     try:
-        provider_id = synthesizer.provider_id
-        region = synthesizer.region
-        output_format = synthesizer.output_format
+        identity = synthesizer.synthesis_identity
     except Exception:
         raise AudioSynthesisIdentityError(
             "synthesizer identity metadata is missing or unreadable"
         ) from None
-
-    identity = {
-        "provider_id": provider_id,
-        "region": region,
-        "output_format": output_format,
-    }
-    if any(type(value) is not str for value in identity.values()):
+    if type(identity) is not TtsConfig:
         raise AudioSynthesisIdentityError(
-            "synthesizer identity metadata must contain exact strings"
+            "synthesizer identity metadata must be a TtsConfig"
         )
-    if provider_id != AUDIO_PROVIDER_ID:
+    if tts_config != FROZEN_TTS_CONFIG:
         raise AudioSynthesisIdentityError(
-            "synthesizer provider_id does not match the D29 provider"
+            "TtsConfig does not exactly match the frozen D32 configuration"
         )
-    if region != tts_config.region:
+    if identity != FROZEN_TTS_CONFIG or identity != tts_config:
         raise AudioSynthesisIdentityError(
-            "synthesizer region does not exactly match TtsConfig.region"
+            "synthesizer identity does not exactly match frozen D32 configuration"
         )
-    if output_format != AUDIO_OUTPUT_FORMAT:
-        raise AudioSynthesisIdentityError(
-            "synthesizer output_format does not match the D29 format"
-        )
-    return provider_id, region, output_format
 
 
 def _load_unit(note_id: int, anki: AnkiConnectClient) -> VocabUnit:
@@ -478,8 +256,5 @@ def _require_core_valid(unit: VocabUnit) -> None:
         raise HydrationCoreInvalidError(violations)
 
 
-def _snapshot(
-    unit: VocabUnit,
-    field_names: tuple[str, ...],
-) -> tuple[str, ...]:
-    return tuple(getattr(unit, field_name) for field_name in field_names)
+def _snapshot(unit: VocabUnit) -> tuple[str, ...]:
+    return tuple(getattr(unit, field_name) for field_name in _AUDIO_SNAPSHOT_FIELDS)

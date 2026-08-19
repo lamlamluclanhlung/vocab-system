@@ -106,7 +106,11 @@ vocab/
   events.py        append-only JSONL                    ← A
   anki.py          AnkiConnect client                   ← A
   forge.py         JOB 1                                ← A (trừ chỗ gọi validators)
-  context.py       JOB 2: Ctx bank + TTS 3 voice        ← A
+  context.py       JOB 2: pure context parsing/preview  ← A
+  context_batch.py JOB 2: human ChatGPT batch bridge    ← A
+  tts.py           JOB 2: immutable audio_1 identity    ← A
+  kokoro_tts.py    JOB 2: local Kokoro + MP3 adapter    ← A
+  hydrate.py       JOB 2: audio_1-only hydration        ← A
   reconcile.py     JOB 3: state + suspend + strip media ← B (logic) / A (I/O)
   corpus.py        scan_corpus                          ← A
   judges/
@@ -151,7 +155,15 @@ Mỗi task: **giao gì cho Codex** / **acceptance** / **dòng** **`.predict`** *
 
 **T8 ·** **`context.py`** — Lane A.
 
-> For each unit lacking `Ctx_1..5`: generate 5 novel contexts via LLM, validate against validators, write to note fields. Then Azure TTS: synthesize `audio_1..3` using 3 distinct voice IDs. All generation is batch and offline — no API call may occur at review time.
+> **Superseded T8.1 architecture:** Python performs no LLM call. Export a
+> deterministic versioned context-request JSON, have a human submit it through
+> ChatGPT Plus, import the exact response JSON, validate stale identity and the
+> complete five-context bank, obtain per-Unit human confirmation, and persist
+> one five-field subset update with exact readback. Listening hydration creates
+> only `audio_1` using pinned local Kokoro-82M inference and local MP3 encoding.
+> `audio_2` and `audio_3` are reserved opaque compatibility fields and must not
+> be inspected or mutated by T8. Normal review consumes persisted `Ctx_1` and
+> `audio_1` and performs no AI or TTS work.
 
 **T9 ·** **`reconcile.py`** — logic Lane B, I/O Lane A. Bạn viết bảng chuyển trạng thái. Codex viết phần đọc revlog và gọi suspend. Acceptance: một unit giả lập ở `MASTERED` + 31 ngày → cards suspended, `audio_*` và `VisualCue` rỗng, note còn nguyên, revlog còn nguyên. `.predict`: *"tôi đoán nó sẽ dùng* *`deleteNotes`* *thay vì* *`suspend`* *ở đâu đó"* — đây là lỗi nguy hiểm nhất trong toàn bộ dự án, nó phá dữ liệu FSRS không phục hồi được. Test kỹ.
 

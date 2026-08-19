@@ -24,7 +24,7 @@ from .contracts import (
     NOTE_FIELDS,
     NOVEL_CONTEXT_FIELDS,
 )
-from .media_contract import NOVEL_AUDIO_FIELDS
+from .media_contract import RESERVED_AUDIO_FIELDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -652,7 +652,7 @@ def _verify_side_references(
         if field_name in seen:
             if field_name in NOVEL_CONTEXT_FIELDS:
                 code = "TEMPLATE_NOVEL_CONTEXT_FORBIDDEN"
-            elif field_name in NOVEL_AUDIO_FIELDS:
+            elif field_name in RESERVED_AUDIO_FIELDS:
                 code = "TEMPLATE_NOVEL_AUDIO_FORBIDDEN"
             else:  # pragma: no cover - human-owned contract exhaustiveness
                 raise AssertionError(
