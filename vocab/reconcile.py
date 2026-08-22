@@ -150,6 +150,7 @@ def observe_unit(
             cards_by_channel[channel],
             revlog_by_channel[channel],
             episode_ids[channel],
+            episode_entries[channel],
             assessments_by_channel[channel],
         )
         for channel in CHANNELS
@@ -402,7 +403,7 @@ def _load_revlog(
     cards_by_channel: Mapping[str, Mapping[str, Any]],
     anki: AnkiConnectClient,
     now_utc: datetime,
-) -> dict[str, dict[str, int | None]]:
+) -> dict[str, dict[str, object]]:
     try:
         raw_revlog = anki.get_revlog(list(card_ids))
     except AnkiConnectError as exc:
@@ -424,7 +425,7 @@ def _load_revlog(
         for channel, card in cards_by_channel.items()
     }
     seen_review_ids: set[int] = set()
-    by_channel: dict[str, dict[str, int | None]] = {}
+    by_channel: dict[str, dict[str, object]] = {}
 
     for card_id in card_ids:
         reviews = raw_revlog[str(card_id)]
@@ -483,6 +484,10 @@ def _load_revlog(
             "latest_lapse_review_id": (
                 None if latest_lapse is None else latest_lapse[0]
             ),
+            "lifecycle_review_entries": tuple(
+                (item[0], item[4]) for item in lifecycle
+            ),
+            "lapse_entries": tuple((item[0], item[4]) for item in lapses),
             "lapses_last_30_days": sum(
                 1 for lapse in lapses if lapse[4] >= window_start
             ),
@@ -869,10 +874,27 @@ def _channel_progress(
     channel: str,
     state: str,
     card: Mapping[str, Any],
-    revlog: Mapping[str, int | None],
+    revlog: Mapping[str, object],
     episode_id: str,
+    episode_entry: datetime | None,
     assessments: tuple[LifecycleAssessment, ...],
 ) -> ChannelProgress:
+    lifecycle_review_entries = cast(
+        tuple[tuple[int, datetime], ...],
+        revlog["lifecycle_review_entries"],
+    )
+    lapse_entries = cast(
+        tuple[tuple[int, datetime], ...],
+        revlog["lapse_entries"],
+    )
+    first_review_after_entry = _first_revlog_id_after(
+        lifecycle_review_entries,
+        episode_entry,
+    )
+    first_lapse_after_entry = _first_revlog_id_after(
+        lapse_entries,
+        episode_entry,
+    )
     return ChannelProgress(
         channel=channel,
         state=state,
@@ -897,5 +919,24 @@ def _channel_progress(
             revlog["latest_lapse_review_id"],
         ),
         state_episode_id=episode_id,
+        state_entered_at="" if episode_entry is None else episode_entry.isoformat(),
+        first_lifecycle_review_after_state_entry_id=first_review_after_entry,
+        first_lapse_after_state_entry_id=first_lapse_after_entry,
         assessments=assessments,
+    )
+
+
+def _first_revlog_id_after(
+    entries: Sequence[tuple[int, datetime]],
+    episode_entry: datetime | None,
+) -> int | None:
+    if episode_entry is None:
+        return None
+    return next(
+        (
+            review_id
+            for review_id, instant in entries
+            if instant > episode_entry
+        ),
+        None,
     )

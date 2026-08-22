@@ -1927,3 +1927,58 @@ where `member_transition_ids` is sorted before canonicalization and the same
 JSON settings are used. When `transition_group_id` is present on a T9 record,
 it must already be a lowercase full 64-hex digest. Cross-member group
 verification is deferred to T9.3.
+
+## D40 — Current-episode temporal evidence
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9.1, T9.2
+
+Transition-gate evidence that depends on the current lifecycle episode must be
+available directly at `ChannelProgress` scope. T9.2 remains a pure
+`UnitProgress -> TransitionPlan` decision layer and does not reread EventLog.
+
+`ChannelProgress` gains exactly these fields:
+
+```text
+state_entered_at
+first_lifecycle_review_after_state_entry_id
+first_lapse_after_state_entry_id
+```
+
+### Current-state entry
+
+For the deterministic initial NEW episode, `state_entered_at` is the empty
+string because that sentinel has identity but no historical COMMIT timestamp.
+
+For every non-NEW current state, `state_entered_at` is exactly the normalized
+UTC `ts` of the verified COMMIT transition that entered the current state
+episode. It is not note creation time, first review time, PREPARE time,
+assessment time, or the time of an unrelated STATE record.
+
+### First post-entry lifecycle review
+
+When `state_entered_at` is empty,
+`first_lifecycle_review_after_state_entry_id` is `None`. Otherwise it is the
+earliest revlog ID whose type is in `REVLOG_LIFECYCLE_TYPES` and whose
+epoch-millisecond instant is strictly greater than the current state-entry
+instant. A review at exactly the entry instant does not qualify.
+
+### First post-entry lifecycle lapse
+
+When `state_entered_at` is empty, `first_lapse_after_state_entry_id` is `None`.
+Otherwise it is the earliest revlog ID whose type is `REVLOG_TYPE_REVIEW`,
+whose ease is `REVLOG_EASE_AGAIN`, and whose epoch-millisecond instant is
+strictly greater than the current state-entry instant. Learning and relearning
+Again records do not qualify as lifecycle lapses.
+
+Both selections use validated revlog entries sorted by revlog ID, never input
+list order. Later reviews or lapses do not replace the earliest qualifying
+evidence. The complete raw revlog is private observation input and is not
+exposed in the public model. These fields are observation facts only and do
+not perform lifecycle transitions.
+
+`LifecycleAssessment` remains the complete deterministic ordered assessment
+sequence. T9.2 filters it against `state_entered_at` in memory; no additional
+post-entry assessment field is introduced. Aggregate lifecycle state remains
+derived and is never persisted.

@@ -148,6 +148,9 @@ def test_channel_progress_field_shape_is_exact() -> None:
         "latest_lifecycle_review_id",
         "latest_lapse_review_id",
         "state_episode_id",
+        "state_entered_at",
+        "first_lifecycle_review_after_state_entry_id",
+        "first_lapse_after_state_entry_id",
         "assessments",
     )
 

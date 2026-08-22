@@ -366,6 +366,9 @@ class ChannelProgress:
     latest_lifecycle_review_id: int | None = None
     latest_lapse_review_id: int | None = None
     state_episode_id: str = ""
+    state_entered_at: str = ""
+    first_lifecycle_review_after_state_entry_id: int | None = None
+    first_lapse_after_state_entry_id: int | None = None
     assessments: tuple[LifecycleAssessment, ...] = ()
 
 

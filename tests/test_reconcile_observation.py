@@ -588,6 +588,29 @@ def test_no_review_has_zero_age_and_no_lifecycle_ids() -> None:
     assert progress.first_lifecycle_review_id is None
     assert progress.latest_lifecycle_review_id is None
     assert progress.latest_lapse_review_id is None
+    assert progress.state_entered_at == ""
+    assert progress.first_lifecycle_review_after_state_entry_id is None
+    assert progress.first_lapse_after_state_entry_id is None
+
+
+def test_initial_new_has_no_post_entry_evidence_without_a_commit() -> None:
+    lifecycle_review = review(
+        NOW - timedelta(days=1),
+        review_type=1,
+        ease=1,
+    )
+
+    progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(reviews=[lifecycle_review]),
+        event_log=FakeEventLog(),
+        now=NOW,
+    ).channels[0]
+
+    assert progress.state == "NEW"
+    assert progress.state_entered_at == ""
+    assert progress.first_lifecycle_review_after_state_entry_id is None
+    assert progress.first_lapse_after_state_entry_id is None
 
 
 @pytest.mark.parametrize("review_type", [0, 2], ids=["learning", "relearning"])
@@ -910,7 +933,8 @@ def test_terminal_before_prepare_fails_closed() -> None:
 
 def test_commit_establishes_current_state_episode() -> None:
     unit = make_unit(states={"R": "LEARNING"})
-    events, transition_id = journal_transition()
+    state_entry = NOW - timedelta(days=1)
+    events, transition_id = journal_transition(terminal_ts=state_entry)
     progress = observe_unit(
         NOTE_ID,
         anki=default_anki(unit=unit),
@@ -920,6 +944,126 @@ def test_commit_establishes_current_state_episode() -> None:
 
     assert progress.state == "LEARNING"
     assert progress.state_episode_id == transition_id
+    assert progress.state_entered_at == state_entry.isoformat()
+
+
+def test_earliest_lifecycle_review_strictly_after_state_entry_is_stable() -> None:
+    state_entry = NOW - timedelta(days=1)
+    before = review(
+        state_entry - timedelta(seconds=1),
+        review_type=0,
+        ease=3,
+    )
+    equal = review(state_entry, review_type=1, ease=3)
+    earliest_after = review(
+        state_entry + timedelta(seconds=3),
+        review_type=0,
+        ease=3,
+    )
+    later = review(
+        state_entry + timedelta(seconds=5),
+        review_type=2,
+        ease=3,
+    )
+    events, _transition_id = journal_transition(terminal_ts=state_entry)
+    unit = make_unit(states={"R": "LEARNING"})
+
+    sorted_progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(
+            unit=unit,
+            reviews=[before, equal, earliest_after, later],
+        ),
+        event_log=FakeEventLog(events),
+        now=NOW,
+    ).channels[0]
+    unsorted_progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(
+            unit=unit,
+            reviews=[later, earliest_after, before, equal],
+        ),
+        event_log=FakeEventLog(events),
+        now=NOW,
+    ).channels[0]
+
+    assert sorted_progress.state_entered_at == state_entry.isoformat()
+    assert (
+        sorted_progress.first_lifecycle_review_after_state_entry_id
+        == earliest_after["id"]
+    )
+    assert (
+        unsorted_progress.first_lifecycle_review_after_state_entry_id
+        == earliest_after["id"]
+    )
+
+
+def test_earliest_review_lapse_strictly_after_state_entry_is_stable() -> None:
+    state_entry = NOW - timedelta(days=1)
+    before = review(
+        state_entry - timedelta(seconds=1),
+        review_type=1,
+        ease=1,
+    )
+    equal = review(state_entry, review_type=1, ease=1)
+    learning_again = review(
+        state_entry + timedelta(seconds=1),
+        review_type=0,
+        ease=1,
+    )
+    relearning_again = review(
+        state_entry + timedelta(seconds=2),
+        review_type=2,
+        ease=1,
+    )
+    earliest_lapse = review(
+        state_entry + timedelta(seconds=3),
+        review_type=1,
+        ease=1,
+    )
+    later_lapse = review(
+        state_entry + timedelta(seconds=5),
+        review_type=1,
+        ease=1,
+    )
+    chronological = [
+        before,
+        equal,
+        learning_again,
+        relearning_again,
+        earliest_lapse,
+        later_lapse,
+    ]
+    unsorted = [
+        later_lapse,
+        relearning_again,
+        before,
+        earliest_lapse,
+        equal,
+        learning_again,
+    ]
+    events, _transition_id = journal_transition(terminal_ts=state_entry)
+    unit = make_unit(states={"R": "LEARNING"})
+
+    sorted_progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(unit=unit, reviews=chronological),
+        event_log=FakeEventLog(events),
+        now=NOW,
+    ).channels[0]
+    unsorted_progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(unit=unit, reviews=unsorted),
+        event_log=FakeEventLog(events),
+        now=NOW,
+    ).channels[0]
+
+    assert (
+        sorted_progress.first_lifecycle_review_after_state_entry_id
+        == learning_again["id"]
+    )
+    assert sorted_progress.first_lapse_after_state_entry_id == earliest_lapse["id"]
+    assert unsorted_progress.first_lapse_after_state_entry_id == earliest_lapse["id"]
 
 
 def test_persisted_non_new_state_without_provenance_fails_closed() -> None:
@@ -1136,6 +1280,7 @@ def test_final_persisted_state_mismatch_fails_closed() -> None:
 
 
 def test_multiple_committed_transitions_reconstruct_verified_chain() -> None:
+    first_terminal = NOW - timedelta(days=3)
     events, latest_transition_id = committed_chain(
         "R",
         (
@@ -1143,7 +1288,7 @@ def test_multiple_committed_transitions_reconstruct_verified_chain() -> None:
             ("LEARNING", "STABLE", "STABILITY_GATE"),
             ("STABLE", "MASTERED", "MASTERY_ASSESSMENT_PASS"),
         ),
-        first_terminal_ts=NOW - timedelta(days=3),
+        first_terminal_ts=first_terminal,
     )
 
     channel = observe_unit(
@@ -1155,6 +1300,9 @@ def test_multiple_committed_transitions_reconstruct_verified_chain() -> None:
 
     assert channel.state == "MASTERED"
     assert channel.state_episode_id == latest_transition_id
+    assert channel.state_entered_at == (
+        first_terminal + timedelta(seconds=2)
+    ).isoformat()
 
 
 def test_all_mastered_timestamp_uses_latest_committed_entry() -> None:

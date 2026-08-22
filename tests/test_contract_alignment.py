@@ -195,6 +195,9 @@ def test_per_channel_transition_gate_data_lives_on_channel_progress() -> None:
         "latest_lifecycle_review_id",
         "latest_lapse_review_id",
         "state_episode_id",
+        "state_entered_at",
+        "first_lifecycle_review_after_state_entry_id",
+        "first_lapse_after_state_entry_id",
         "assessments",
     )
     assert unit_field_names == (
