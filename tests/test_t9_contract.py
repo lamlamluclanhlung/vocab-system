@@ -46,6 +46,8 @@ from vocab.media_contract import (
 from vocab.models import (
     ChannelProgress,
     LifecycleAssessment,
+    PlannedTransition,
+    ReconcileDecision,
     UnitProgress,
     VocabUnit,
 )
@@ -162,6 +164,30 @@ def test_unit_progress_field_shape_is_exact() -> None:
         "all_active_channels_mastered_at",
         "has_leech_tag",
     )
+
+
+def test_t9_decision_model_shapes_are_exact() -> None:
+    assert field_names(PlannedTransition) == (
+        "channel",
+        "from_state",
+        "to_state",
+        "trigger",
+        "from_episode_id",
+        "evidence",
+        "transition_id",
+        "transition_group_id",
+    )
+    assert field_names(ReconcileDecision) == (
+        "unit_key",
+        "transitions",
+        "suspend_card_ids",
+        "reactivation_required_card_ids",
+        "leech_rescue_channels",
+    )
+    assert PlannedTransition.__dataclass_params__.frozen is True
+    assert ReconcileDecision.__dataclass_params__.frozen is True
+    assert "__slots__" in PlannedTransition.__dict__
+    assert "__slots__" in ReconcileDecision.__dict__
 
 
 def test_no_aggregate_lifecycle_state_is_persisted() -> None:

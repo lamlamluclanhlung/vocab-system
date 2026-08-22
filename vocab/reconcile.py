@@ -1,8 +1,8 @@
-"""Read-only T9 observation of trustworthy lifecycle evidence.
+"""T9 observation and pure one-step lifecycle decision logic.
 
-T9.1 performs no transition decisions and no persistence. Its only public
-operation transforms explicit Anki and EventLog reads into the frozen
-``UnitProgress`` observation model.
+T9.1 transforms explicit Anki and EventLog reads into ``UnitProgress``.
+T9.2 transforms that frozen snapshot into ``ReconcileDecision`` without I/O
+or persistence.
 """
 
 from __future__ import annotations
@@ -17,14 +17,19 @@ from typing import Any, Protocol, cast
 from .anki import AnkiConnectClient, AnkiConnectError
 from .anki_template import verify_model_snapshot
 from .contracts import (
+    ANKI_LEECH_THRESHOLD,
     ANKI_LEECH_TAG,
     ANKI_NOTE_TYPE_NAME,
     ANKI_QUEUE_SUSPENDED,
     CHANNELS,
     CHANNEL_BY_TEMPLATE_NAME,
+    EVENT_SCHEMA_VERSION,
     INITIAL_NEW_EPISODE_PREFIX,
     LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS,
     LIFECYCLE_SECONDS_PER_DAY,
+    MASTERED_MIN_DELAY_BETWEEN_PASSES_DAYS,
+    MASTERED_MIN_SESSION_PASSES,
+    MASTERED_TO_DORMANT_DAYS,
     NOTE_FIELDS,
     REVLOG_EASE_AGAIN,
     REVLOG_LIFECYCLE_TYPES,
@@ -32,22 +37,39 @@ from .contracts import (
     REVLOG_TYPE_LEARNING,
     REVLOG_TYPE_RELEARNING,
     REVLOG_TYPE_REVIEW,
+    STATE_DORMANT,
+    STATE_LEARNING,
     STATE_MASTERED,
     STATE_NEW,
+    STATE_RELAPSE,
+    STATE_STABLE,
+    STATE_TRIGGER_ASSESSMENT_FAIL,
+    STATE_TRIGGER_DORMANCY_ELAPSED,
+    STATE_TRIGGER_FIRST_REVIEW,
+    STATE_TRIGGER_MASTERY_ASSESSMENT_PASS,
+    STATE_TRIGGER_RELAPSE_REVIEW,
+    STATE_TRIGGER_REVIEW_LAPSE,
+    STATE_TRIGGER_STABILITY_GATE,
     STATE_TRANSITIONS,
     STATE_TRIGGERS,
     STATES,
+    STABLE_MIN_AGE_DAYS,
+    STABLE_MIN_INTERVAL_DAYS,
     STABLE_ZERO_LAPSE_WINDOW_DAYS,
+    T9_DORMANCY_GROUP_KIND,
     T9_STATE_OPTIONAL_PAYLOAD_FIELDS,
     T9_STATE_PHASE_ABORT,
     T9_STATE_PHASE_COMMIT,
     T9_STATE_PHASE_PREPARE,
     T9_STATE_REQUIRED_PAYLOAD_FIELDS,
+    UNIT_KEY_PATTERN,
 )
 from .models import (
     ChannelProgress,
     Event,
     LifecycleAssessment,
+    PlannedTransition,
+    ReconcileDecision,
     UnitProgress,
     VocabUnit,
 )
@@ -79,6 +101,10 @@ class ReconcileEventHistoryError(ReconcileObservationError):
     """Lifecycle event history cannot establish trustworthy provenance."""
 
 
+class ReconcileDecisionError(ValueError):
+    """A pure decision input is structurally impossible or ambiguous."""
+
+
 _KNOWN_REVLOG_TYPES = frozenset(
     (
         REVLOG_TYPE_LEARNING,
@@ -101,6 +127,629 @@ def _lapse_window() -> timedelta:
     return timedelta(
         seconds=STABLE_ZERO_LAPSE_WINDOW_DAYS * LIFECYCLE_SECONDS_PER_DAY
     )
+
+
+def _canonical_sha256(identity: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        identity,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(canonical).hexdigest()
+
+
+def _transition_id(
+    *,
+    version: int,
+    unit_key: str,
+    channel: str,
+    from_state: str,
+    to_state: str,
+    trigger: str,
+    from_episode_id: str,
+    evidence: Mapping[str, Any],
+) -> str:
+    return _canonical_sha256(
+        {
+            "v": version,
+            "unit_key": unit_key,
+            "channel": channel,
+            "from": from_state,
+            "to": to_state,
+            "trigger": trigger,
+            "from_episode_id": from_episode_id,
+            "evidence": evidence,
+        }
+    )
+
+
+def decide_transitions(
+    progress: UnitProgress,
+    *,
+    now: datetime,
+) -> ReconcileDecision:
+    """Return one deterministic transition plan per eligible channel."""
+    now_utc = _decision_now(now)
+    (
+        channels_by_name,
+        state_entries,
+        ordered_assessments,
+        all_mastered_at,
+    ) = _validate_decision_input(progress, now_utc)
+
+    planned_by_channel: dict[str, PlannedTransition] = {}
+    reactivation_required: list[int] = []
+
+    for channel_name in CHANNELS:
+        channel = channels_by_name.get(channel_name)
+        if channel is None:
+            continue
+        state_entry = state_entries[channel_name]
+
+        if channel.state == STATE_NEW:
+            if channel.first_lifecycle_review_id is not None:
+                planned_by_channel[channel_name] = _plan_transition(
+                    progress.unit_key,
+                    channel,
+                    STATE_LEARNING,
+                    STATE_TRIGGER_FIRST_REVIEW,
+                    {
+                        "first_lifecycle_review_id": (
+                            channel.first_lifecycle_review_id
+                        )
+                    },
+                )
+            continue
+
+        if channel.state == STATE_LEARNING:
+            evidence = _stability_gate_evidence(channel, now_utc)
+            if evidence is not None:
+                planned_by_channel[channel_name] = _plan_transition(
+                    progress.unit_key,
+                    channel,
+                    STATE_STABLE,
+                    STATE_TRIGGER_STABILITY_GATE,
+                    evidence,
+                )
+            continue
+
+        if channel.state == STATE_STABLE:
+            if channel.first_lapse_after_state_entry_id is not None:
+                planned_by_channel[channel_name] = _plan_transition(
+                    progress.unit_key,
+                    channel,
+                    STATE_LEARNING,
+                    STATE_TRIGGER_REVIEW_LAPSE,
+                    {
+                        "lapse_revlog_id": (
+                            channel.first_lapse_after_state_entry_id
+                        )
+                    },
+                )
+                continue
+            mastery_evidence = _mastery_evidence(
+                ordered_assessments[channel_name],
+                cast(datetime, state_entry),
+            )
+            if mastery_evidence is not None:
+                planned_by_channel[channel_name] = _plan_transition(
+                    progress.unit_key,
+                    channel,
+                    STATE_MASTERED,
+                    STATE_TRIGGER_MASTERY_ASSESSMENT_PASS,
+                    mastery_evidence,
+                )
+            continue
+
+        if channel.state in (STATE_MASTERED, STATE_DORMANT):
+            failure = _earliest_post_entry_failure(
+                ordered_assessments[channel_name],
+                cast(datetime, state_entry),
+            )
+            if failure is not None:
+                planned_by_channel[channel_name] = _plan_transition(
+                    progress.unit_key,
+                    channel,
+                    STATE_RELAPSE,
+                    STATE_TRIGGER_ASSESSMENT_FAIL,
+                    {"assessment_id": failure.assessment_id},
+                )
+                if channel.state == STATE_DORMANT and channel.is_suspended:
+                    reactivation_required.append(channel.card_id)
+            continue
+
+        if channel.state == STATE_RELAPSE:
+            if channel.first_lifecycle_review_after_state_entry_id is not None:
+                planned_by_channel[channel_name] = _plan_transition(
+                    progress.unit_key,
+                    channel,
+                    STATE_LEARNING,
+                    STATE_TRIGGER_RELAPSE_REVIEW,
+                    {
+                        "review_revlog_id": (
+                            channel.first_lifecycle_review_after_state_entry_id
+                        )
+                    },
+                )
+
+    suspend_card_ids: tuple[int, ...] = ()
+    ordered_channels = tuple(
+        channels_by_name[channel]
+        for channel in CHANNELS
+        if channel in channels_by_name
+    )
+    if (
+        ordered_channels
+        and all(channel.state == STATE_MASTERED for channel in ordered_channels)
+        and not planned_by_channel
+        and all_mastered_at is not None
+    ):
+        dormancy_boundary = all_mastered_at + timedelta(
+            seconds=MASTERED_TO_DORMANT_DAYS * LIFECYCLE_SECONDS_PER_DAY
+        )
+        if now_utc >= dormancy_boundary:
+            planned_by_channel = _dormancy_transitions(
+                progress.unit_key,
+                ordered_channels,
+                progress.all_active_channels_mastered_at,
+                dormancy_boundary,
+            )
+            suspend_card_ids = tuple(
+                channel.card_id for channel in ordered_channels
+            )
+
+    transitions = tuple(
+        planned_by_channel[channel]
+        for channel in CHANNELS
+        if channel in planned_by_channel
+    )
+    leech_rescue_channels = (
+        tuple(
+            channel.channel
+            for channel in ordered_channels
+            if channel.lapses_total >= ANKI_LEECH_THRESHOLD
+        )
+        if progress.has_leech_tag
+        else ()
+    )
+    return ReconcileDecision(
+        unit_key=progress.unit_key,
+        transitions=transitions,
+        suspend_card_ids=suspend_card_ids,
+        reactivation_required_card_ids=tuple(reactivation_required),
+        leech_rescue_channels=leech_rescue_channels,
+    )
+
+
+def _decision_now(now: datetime) -> datetime:
+    if not isinstance(now, datetime):
+        raise ReconcileDecisionError("now must be an aware datetime")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ReconcileDecisionError("now must include a timezone offset")
+    return now.astimezone(timezone.utc)
+
+
+def _validate_decision_input(
+    progress: UnitProgress,
+    now_utc: datetime,
+) -> tuple[
+    dict[str, ChannelProgress],
+    dict[str, datetime | None],
+    dict[str, tuple[tuple[datetime, int, LifecycleAssessment], ...]],
+    datetime | None,
+]:
+    if not isinstance(progress, UnitProgress):
+        raise ReconcileDecisionError("progress must be UnitProgress")
+    if not isinstance(progress.unit_key, str) or re.fullmatch(
+        UNIT_KEY_PATTERN,
+        progress.unit_key,
+    ) is None:
+        raise ReconcileDecisionError("progress unit_key is invalid")
+    if not isinstance(progress.channels, tuple):
+        raise ReconcileDecisionError("progress channels must be a tuple")
+    if type(progress.has_leech_tag) is not bool:
+        raise ReconcileDecisionError("has_leech_tag must be an actual Boolean")
+    if not isinstance(progress.all_active_channels_mastered_at, str):
+        raise ReconcileDecisionError(
+            "all_active_channels_mastered_at must be a string"
+        )
+
+    all_mastered_at = None
+    if progress.all_active_channels_mastered_at:
+        all_mastered_at = _decision_timestamp(
+            progress.all_active_channels_mastered_at,
+            "all_active_channels_mastered_at",
+            now_utc,
+        )
+
+    channels_by_name: dict[str, ChannelProgress] = {}
+    state_entries: dict[str, datetime | None] = {}
+    ordered_assessments: dict[
+        str,
+        tuple[tuple[datetime, int, LifecycleAssessment], ...],
+    ] = {}
+
+    for channel in progress.channels:
+        if not isinstance(channel, ChannelProgress):
+            raise ReconcileDecisionError(
+                "progress channels must contain ChannelProgress values"
+            )
+        if channel.channel not in CHANNELS:
+            raise ReconcileDecisionError("ChannelProgress channel is invalid")
+        if channel.channel in channels_by_name:
+            raise ReconcileDecisionError(
+                f"duplicate ChannelProgress channel {channel.channel}"
+            )
+        if channel.state not in STATES:
+            raise ReconcileDecisionError(
+                f"ChannelProgress state is invalid for {channel.channel}"
+            )
+        if type(channel.card_id) is not int:
+            raise ReconcileDecisionError(
+                f"card_id must be an actual integer for {channel.channel}"
+            )
+        if not isinstance(channel.state_episode_id, str) or not (
+            channel.state_episode_id.strip()
+        ):
+            raise ReconcileDecisionError(
+                f"state_episode_id is required for {channel.channel}"
+            )
+        if type(channel.is_suspended) is not bool:
+            raise ReconcileDecisionError(
+                f"is_suspended must be an actual Boolean for {channel.channel}"
+            )
+        for field_name in (
+            "interval_days",
+            "lapses_total",
+            "lapses_last_30_days",
+            "age_days",
+        ):
+            value = getattr(channel, field_name)
+            if type(value) is not int or value < 0:
+                raise ReconcileDecisionError(
+                    f"{field_name} must be a non-negative actual integer "
+                    f"for {channel.channel}"
+                )
+
+        if channel.state == STATE_NEW:
+            if channel.state_entered_at != "":
+                raise ReconcileDecisionError(
+                    f"NEW channel {channel.channel} cannot have state_entered_at"
+                )
+            state_entry = None
+        else:
+            state_entry = _decision_timestamp(
+                channel.state_entered_at,
+                f"state_entered_at for {channel.channel}",
+                now_utc,
+            )
+
+        review_instants: dict[str, datetime] = {}
+        for field_name in (
+            "first_lifecycle_review_id",
+            "latest_lifecycle_review_id",
+            "latest_lapse_review_id",
+            "first_lifecycle_review_after_state_entry_id",
+            "first_lapse_after_state_entry_id",
+        ):
+            value = getattr(channel, field_name)
+            if value is not None:
+                review_instants[field_name] = _decision_revlog_instant(
+                    value,
+                    field_name,
+                    channel.channel,
+                    now_utc,
+                )
+
+        first_review = channel.first_lifecycle_review_id
+        latest_review = channel.latest_lifecycle_review_id
+        if (
+            first_review is not None
+            and latest_review is not None
+            and first_review > latest_review
+        ):
+            raise ReconcileDecisionError(
+                f"lifecycle review IDs are reversed for {channel.channel}"
+            )
+        if state_entry is None:
+            if (
+                channel.first_lifecycle_review_after_state_entry_id is not None
+                or channel.first_lapse_after_state_entry_id is not None
+            ):
+                raise ReconcileDecisionError(
+                    f"initial NEW channel {channel.channel} has post-entry evidence"
+                )
+        else:
+            for field_name in (
+                "first_lifecycle_review_after_state_entry_id",
+                "first_lapse_after_state_entry_id",
+            ):
+                if (
+                    field_name in review_instants
+                    and review_instants[field_name] <= state_entry
+                ):
+                    raise ReconcileDecisionError(
+                        f"{field_name} is not after state entry for {channel.channel}"
+                    )
+
+        if not isinstance(channel.assessments, tuple):
+            raise ReconcileDecisionError(
+                f"assessments must be a tuple for {channel.channel}"
+            )
+        parsed_assessments: list[
+            tuple[datetime, int, LifecycleAssessment]
+        ] = []
+        for index, assessment in enumerate(channel.assessments):
+            if not isinstance(assessment, LifecycleAssessment):
+                raise ReconcileDecisionError(
+                    f"assessment is invalid for {channel.channel}"
+                )
+            if assessment.channel != channel.channel:
+                raise ReconcileDecisionError(
+                    f"assessment belongs to another channel than {channel.channel}"
+                )
+            if type(assessment.passed) is not bool or type(assessment.novel) is not bool:
+                raise ReconcileDecisionError(
+                    f"assessment Booleans are invalid for {channel.channel}"
+                )
+            for field_name in (
+                "assessment_id",
+                "stimulus_ref",
+                "model_id",
+                "model_version",
+            ):
+                value = getattr(assessment, field_name)
+                if not isinstance(value, str) or not value.strip():
+                    raise ReconcileDecisionError(
+                        f"assessment {field_name} is required for {channel.channel}"
+                    )
+            instant = _decision_timestamp(
+                assessment.ts,
+                f"assessment timestamp for {channel.channel}",
+                now_utc,
+            )
+            parsed_assessments.append((instant, index, assessment))
+
+        parsed_assessments.sort(key=lambda item: (item[0], item[1]))
+        channels_by_name[channel.channel] = channel
+        state_entries[channel.channel] = state_entry
+        ordered_assessments[channel.channel] = tuple(parsed_assessments)
+
+    return (
+        channels_by_name,
+        state_entries,
+        ordered_assessments,
+        all_mastered_at,
+    )
+
+
+def _decision_timestamp(
+    value: str,
+    field_name: str,
+    now_utc: datetime,
+) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ReconcileDecisionError(f"{field_name} must be a normalized UTC timestamp")
+    try:
+        instant = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ReconcileDecisionError(
+            f"{field_name} must be valid ISO-8601"
+        ) from exc
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ReconcileDecisionError(f"{field_name} must include a timezone offset")
+    normalized = instant.astimezone(timezone.utc)
+    if value != normalized.isoformat():
+        raise ReconcileDecisionError(f"{field_name} must be normalized UTC")
+    if normalized > now_utc:
+        raise ReconcileDecisionError(f"{field_name} cannot be in the future")
+    return normalized
+
+
+def _decision_revlog_instant(
+    value: object,
+    field_name: str,
+    channel: str,
+    now_utc: datetime,
+) -> datetime:
+    if type(value) is not int or value < 0:
+        raise ReconcileDecisionError(
+            f"{field_name} must be a non-negative actual integer for {channel}"
+        )
+    try:
+        instant = datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ReconcileDecisionError(
+            f"{field_name} is not a valid revlog timestamp for {channel}"
+        ) from exc
+    if instant > now_utc:
+        raise ReconcileDecisionError(f"{field_name} is in the future for {channel}")
+    return instant
+
+
+def _stability_gate_evidence(
+    channel: ChannelProgress,
+    now_utc: datetime,
+) -> dict[str, Any] | None:
+    if (
+        channel.interval_days < STABLE_MIN_INTERVAL_DAYS
+        or channel.age_days < STABLE_MIN_AGE_DAYS
+        or channel.lapses_last_30_days != 0
+        or channel.is_suspended
+        or channel.first_lifecycle_review_id is None
+        or channel.latest_lifecycle_review_id is None
+    ):
+        return None
+
+    age_boundary = _decision_revlog_instant(
+        channel.first_lifecycle_review_id,
+        "first_lifecycle_review_id",
+        channel.channel,
+        now_utc,
+    ) + timedelta(seconds=STABLE_MIN_AGE_DAYS * LIFECYCLE_SECONDS_PER_DAY)
+    eligibility_boundary = age_boundary
+    if channel.latest_lapse_review_id is not None:
+        lapse_boundary = _decision_revlog_instant(
+            channel.latest_lapse_review_id,
+            "latest_lapse_review_id",
+            channel.channel,
+            now_utc,
+        ) + timedelta(
+            seconds=(
+                STABLE_ZERO_LAPSE_WINDOW_DAYS * LIFECYCLE_SECONDS_PER_DAY
+            )
+        )
+        eligibility_boundary = max(eligibility_boundary, lapse_boundary)
+    if now_utc < eligibility_boundary:
+        return None
+    return {
+        "first_lifecycle_review_id": channel.first_lifecycle_review_id,
+        "latest_lifecycle_review_id": channel.latest_lifecycle_review_id,
+        "latest_lapse_review_id": channel.latest_lapse_review_id,
+        "interval_days": channel.interval_days,
+        "eligibility_boundary": eligibility_boundary.isoformat(),
+    }
+
+
+def _mastery_evidence(
+    assessments: Sequence[tuple[datetime, int, LifecycleAssessment]],
+    state_entry: datetime,
+) -> dict[str, Any] | None:
+    selected: list[tuple[datetime, LifecycleAssessment]] = []
+    selected_stimulus_refs: set[str] = set()
+    streak_assessment_ids: set[str] = set()
+    minimum_delay = timedelta(
+        seconds=(
+            MASTERED_MIN_DELAY_BETWEEN_PASSES_DAYS
+            * LIFECYCLE_SECONDS_PER_DAY
+        )
+    )
+
+    for instant, _index, assessment in assessments:
+        if instant <= state_entry or not assessment.novel:
+            continue
+        if assessment.assessment_id in streak_assessment_ids:
+            raise ReconcileDecisionError(
+                "duplicate assessment_id in a failure-free mastery streak"
+            )
+        streak_assessment_ids.add(assessment.assessment_id)
+        if not assessment.passed:
+            selected.clear()
+            selected_stimulus_refs.clear()
+            streak_assessment_ids.clear()
+            continue
+        if assessment.stimulus_ref in selected_stimulus_refs:
+            continue
+        if selected and instant - selected[-1][0] < minimum_delay:
+            continue
+        selected.append((instant, assessment))
+        selected_stimulus_refs.add(assessment.stimulus_ref)
+        if len(selected) == MASTERED_MIN_SESSION_PASSES:
+            selected_assessments = [item[1] for item in selected]
+            return {
+                "assessment_ids": [
+                    item.assessment_id for item in selected_assessments
+                ],
+                "stimulus_refs": [
+                    item.stimulus_ref for item in selected_assessments
+                ],
+                "decisive_assessment_id": selected_assessments[-1].assessment_id,
+            }
+    return None
+
+
+def _earliest_post_entry_failure(
+    assessments: Sequence[tuple[datetime, int, LifecycleAssessment]],
+    state_entry: datetime,
+) -> LifecycleAssessment | None:
+    return next(
+        (
+            assessment
+            for instant, _index, assessment in assessments
+            if instant > state_entry
+            and assessment.novel
+            and not assessment.passed
+        ),
+        None,
+    )
+
+
+def _plan_transition(
+    unit_key: str,
+    channel: ChannelProgress,
+    to_state: str,
+    trigger: str,
+    evidence: dict[str, Any],
+) -> PlannedTransition:
+    transition_id = _transition_id(
+        version=EVENT_SCHEMA_VERSION,
+        unit_key=unit_key,
+        channel=channel.channel,
+        from_state=channel.state,
+        to_state=to_state,
+        trigger=trigger,
+        from_episode_id=channel.state_episode_id,
+        evidence=evidence,
+    )
+    return PlannedTransition(
+        channel=channel.channel,
+        from_state=channel.state,
+        to_state=to_state,
+        trigger=trigger,
+        from_episode_id=channel.state_episode_id,
+        evidence=evidence,
+        transition_id=transition_id,
+    )
+
+
+def _dormancy_transitions(
+    unit_key: str,
+    channels: Sequence[ChannelProgress],
+    all_mastered_at: str,
+    eligibility_boundary: datetime,
+) -> dict[str, PlannedTransition]:
+    mastered_entry_ids = {
+        channel.channel: channel.state_episode_id for channel in channels
+    }
+    member_plans: dict[str, PlannedTransition] = {}
+    for channel in channels:
+        evidence = {
+            "mastered_entry_transition_ids": dict(mastered_entry_ids),
+            "all_channels_mastered_at": all_mastered_at,
+            "eligibility_boundary": eligibility_boundary.isoformat(),
+        }
+        member_plans[channel.channel] = _plan_transition(
+            unit_key,
+            channel,
+            STATE_DORMANT,
+            STATE_TRIGGER_DORMANCY_ELAPSED,
+            evidence,
+        )
+
+    transition_group_id = _canonical_sha256(
+        {
+            "kind": T9_DORMANCY_GROUP_KIND,
+            "unit_key": unit_key,
+            "member_transition_ids": sorted(
+                plan.transition_id for plan in member_plans.values()
+            ),
+        }
+    )
+    return {
+        channel: PlannedTransition(
+            channel=plan.channel,
+            from_state=plan.from_state,
+            to_state=plan.to_state,
+            trigger=plan.trigger,
+            from_episode_id=plan.from_episode_id,
+            evidence=plan.evidence,
+            transition_id=plan.transition_id,
+            transition_group_id=transition_group_id,
+        )
+        for channel, plan in member_plans.items()
+    }
 
 
 def observe_unit(
@@ -704,24 +1353,16 @@ def _journal_record(
             "STATE journal evidence must be canonical JSON data"
         ) from exc
 
-    transition_identity = {
-        "v": event.v,
-        "unit_key": event.unit_key,
-        "channel": channel,
-        "from": from_state,
-        "to": to_state,
-        "trigger": trigger,
-        "from_episode_id": from_episode_id,
-        "evidence": evidence,
-    }
-    canonical_identity = json.dumps(
-        transition_identity,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    expected_transition_id = _transition_id(
+        version=event.v,
+        unit_key=event.unit_key,
+        channel=cast(str, channel),
+        from_state=cast(str, from_state),
+        to_state=cast(str, to_state),
+        trigger=cast(str, trigger),
+        from_episode_id=from_episode_id,
+        evidence=evidence,
     )
-    expected_transition_id = sha256(canonical_identity.encode("utf-8")).hexdigest()
     if transition_id != expected_transition_id:
         raise ReconcileEventHistoryError(
             "STATE transition_id does not match its canonical identity"
@@ -738,8 +1379,16 @@ def _journal_record(
         "transition_id": transition_id,
         "from_episode_id": from_episode_id,
         "phase": phase,
-        "canonical_identity": canonical_identity,
-        "canonical_evidence": canonical_evidence,
+        "transition_identity": (
+            event.v,
+            event.unit_key,
+            channel,
+            from_state,
+            to_state,
+            trigger,
+            from_episode_id,
+            canonical_evidence,
+        ),
         "transition_group_id": transition_group_id,
         "instant": instant,
         "index": index,
@@ -781,7 +1430,7 @@ def _state_episode_provenance(
         transition_id = cast(str, record["transition_id"])
         phase = cast(str, record["phase"])
         identity = (
-            record["canonical_identity"],
+            record["transition_identity"],
             record["transition_group_id"],
         )
 

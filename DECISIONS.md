@@ -1982,3 +1982,103 @@ not perform lifecycle transitions.
 sequence. T9.2 filters it against `state_entered_at` in memory; no additional
 post-entry assessment field is introduced. Aggregate lifecycle state remains
 derived and is never persisted.
+
+## D41 — Pure one-step reconciliation decision
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9.2, T9.3
+
+T9.2 is the pure function:
+
+```text
+decide_transitions(progress, *, now) -> ReconcileDecision
+```
+
+It performs no Anki or EventLog reads or writes and never suspends, unsuspends,
+or persists journal phases. One invocation may plan independent transitions
+for multiple channels, but at most one transition per channel. A channel is
+never recursively advanced through more than one lifecycle edge; a new
+observation is required after materialization.
+
+### Frozen decision models
+
+`PlannedTransition` contains, in order, `channel`, `from_state`, `to_state`,
+`trigger`, `from_episode_id`, `evidence`, `transition_id`, and optional
+`transition_group_id`. `ReconcileDecision` contains `unit_key`, ordered
+`transitions`, `suspend_card_ids`, `reactivation_required_card_ids`, and
+`leech_rescue_channels`. Neither model introduces persisted aggregate state.
+
+### Validation and ordering
+
+The pure layer fails closed on structurally impossible input, including an
+invalid Unit key, duplicate or unknown channels, unknown states, non-integer
+card IDs, missing episode identity, invalid current-state entry semantics,
+cross-channel assessments, non-normalized assessment or state-entry times, or
+future temporal evidence. Explicit aware `now` is normalized to UTC.
+
+All output collections follow frozen `CHANNELS` order. Safety and degradation
+outrank promotion: STABLE lapse outranks mastery; MASTERED assessment failure
+is checked before dormancy; and any qualifying MASTERED failure prevents
+Unit-level dormancy during that pass.
+
+### Assessment gates
+
+Only assessments with `novel is True` participate in lifecycle gates. They
+must occur strictly after the current `state_entered_at`; equality does not
+qualify. The earliest qualifying failed assessment gates MASTERED or DORMANT
+to RELAPSE and contributes exactly `assessment_id` evidence.
+
+For STABLE to MASTERED, novel failures reset the current streak and non-novel
+records are ignored. Duplicate assessment identity within a failure-free
+streak fails closed. One stimulus identity counts at most once. A pass that is
+too early does not break the streak but is not selected. The earliest pass
+sequence with distinct assessment and stimulus identities, separated from the
+previously selected pass by at least the frozen delay, is decisive. Evidence
+contains the selected assessment IDs, corresponding stimulus references, and
+the final selected assessment ID.
+
+### Channel transition evidence
+
+- NEW to LEARNING uses the globally first lifecycle review ID.
+- LEARNING to STABLE requires every D34 scheduling gate plus first/latest
+  lifecycle review identity. Its stable eligibility boundary is the later of
+  the first-review age boundary and, when present, the latest-lapse clear
+  boundary.
+- STABLE to LEARNING uses the earliest post-entry lifecycle lapse ID.
+- RELAPSE to LEARNING uses the earliest post-entry lifecycle review ID.
+
+Boundaries are normalized UTC instants derived from frozen evidence, never a
+current-time identity value. Missing evidence produces no plan rather than an
+invented value.
+
+### Coordinated dormancy
+
+Dormancy is considered only when every active channel is MASTERED, no channel
+has a qualifying post-entry failure, verified `all_active_channels_mastered_at`
+is available, and the frozen elapsed duration has reached its boundary. Every
+member receives identical evidence containing the channel-keyed current
+MASTERED episode IDs, the all-mastered instant, and the eligibility boundary.
+
+Member transition IDs are computed first. The shared group ID is the full
+lowercase SHA-256 digest of canonical JSON containing the frozen `DORMANCY`
+kind, Unit key, and sorted member transition IDs. Member and suspension order
+remains `CHANNELS` order. Dormancy is the only decision that populates
+`suspend_card_ids`.
+
+A DORMANT channel with qualifying failure plans RELAPSE. When its card is
+currently suspended, its ID is reported in
+`reactivation_required_card_ids`; T9.2 never unsuspends it.
+
+### Transition identity and diagnostics
+
+Every member transition ID uses the exact D38/D39 canonical identity:
+schema version, Unit key, channel, source state, target state, trigger, current
+episode ID, and frozen evidence. Canonical JSON uses `ensure_ascii=False`,
+sorted keys, compact separators, UTF-8, and full lowercase SHA-256. Randomness,
+wall-clock identity entropy, Python `hash()`, note ID, and card ID are absent.
+
+Leech remains diagnostic only. With the leech tag present, channels at or
+above `ANKI_LEECH_THRESHOLD` are reported in channel order; this causes no
+transition, suspension, target change, or VisualCue mutation. A no-op decision
+has empty transitions and suspension IDs while diagnostics may remain present.

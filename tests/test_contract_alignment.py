@@ -24,7 +24,14 @@ from vocab.contracts import (
     STATE_EVENT_REQUIRED_PAYLOAD_FIELDS,
     UNIT_TYPE_VALUES,
 )
-from vocab.models import ChannelProgress, ForgeCandidate, UnitProgress, VocabUnit
+from vocab.models import (
+    ChannelProgress,
+    ForgeCandidate,
+    PlannedTransition,
+    ReconcileDecision,
+    UnitProgress,
+    VocabUnit,
+)
 
 
 def make_unit() -> VocabUnit:
@@ -207,6 +214,28 @@ def test_per_channel_transition_gate_data_lives_on_channel_progress() -> None:
         "has_leech_tag",
     )
     assert "state" not in unit_field_names
+
+
+def test_reconcile_decision_does_not_persist_aggregate_state() -> None:
+    assert tuple(item.name for item in fields(PlannedTransition)) == (
+        "channel",
+        "from_state",
+        "to_state",
+        "trigger",
+        "from_episode_id",
+        "evidence",
+        "transition_id",
+        "transition_group_id",
+    )
+    decision_fields = tuple(item.name for item in fields(ReconcileDecision))
+    assert decision_fields == (
+        "unit_key",
+        "transitions",
+        "suspend_card_ids",
+        "reactivation_required_card_ids",
+        "leech_rescue_channels",
+    )
+    assert "state" not in decision_fields
 
 def test_anki_note_type_contract_is_stable() -> None:
     assert ANKI_NOTE_TYPE_NAME == "VocabularyUnit"

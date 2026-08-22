@@ -387,6 +387,31 @@ class UnitProgress:
     has_leech_tag: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class PlannedTransition:
+    """One deterministic, unmaterialized per-channel lifecycle transition."""
+
+    channel: str
+    from_state: str
+    to_state: str
+    trigger: str
+    from_episode_id: str
+    evidence: dict[str, Any]
+    transition_id: str
+    transition_group_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileDecision:
+    """Pure one-step T9 reconciliation output with no persistence effects."""
+
+    unit_key: str
+    transitions: tuple[PlannedTransition, ...] = ()
+    suspend_card_ids: tuple[int, ...] = ()
+    reactivation_required_card_ids: tuple[int, ...] = ()
+    leech_rescue_channels: tuple[str, ...] = ()
+
+
 # ============================================================
 # 6. ENCOUNTER DATA
 # ============================================================
