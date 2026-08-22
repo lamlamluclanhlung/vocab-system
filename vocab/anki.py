@@ -255,6 +255,20 @@ class AnkiConnectClient:
             )
         return result
 
+    def cards_info(self, card_ids: Sequence[int]) -> list[dict[str, Any]]:
+        """Return current Anki card information for explicit card IDs."""
+        cards = self._normalize_ids("card_ids", card_ids)
+        result = self._invoke("cardsInfo", {"cards": cards})
+        if not isinstance(result, list) or any(
+            not isinstance(item, dict) for item in result
+        ):
+            raise AnkiResponseError(
+                "cardsInfo",
+                "result must be a list of card objects",
+                response=result,
+            )
+        return result
+
     def update_note_fields(
         self,
         note_id: int,
@@ -395,8 +409,8 @@ class AnkiConnectClient:
             raise AnkiLeechConfigMismatchError(violations)
         return True
 
-    def verify_note_type(self) -> bool:
-        """Read and verify the complete note-type snapshot without repair."""
+    def verified_note_type_snapshot(self) -> dict[str, Any]:
+        """Return the complete verified VocabularyUnit model snapshot."""
         models = self._invoke(
             "findModelsByName",
             {"modelNames": [ANKI_NOTE_TYPE_NAME]},
@@ -418,6 +432,11 @@ class AnkiConnectClient:
         violations = verify_model_snapshot(models[0])
         if violations:
             raise AnkiCardTemplateError(violations)
+        return models[0]
+
+    def verify_note_type(self) -> bool:
+        """Read and verify the complete note-type snapshot without repair."""
+        self.verified_note_type_snapshot()
         return True
 
     @staticmethod
