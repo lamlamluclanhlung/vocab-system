@@ -22,6 +22,7 @@ from .contracts import (
     ANKI_QUEUE_SUSPENDED,
     CHANNELS,
     CHANNEL_BY_TEMPLATE_NAME,
+    INITIAL_NEW_EPISODE_PREFIX,
     LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS,
     LIFECYCLE_SECONDS_PER_DAY,
     NOTE_FIELDS,
@@ -36,6 +37,7 @@ from .contracts import (
     STATE_TRANSITIONS,
     STATE_TRIGGERS,
     STATES,
+    STABLE_ZERO_LAPSE_WINDOW_DAYS,
     T9_STATE_OPTIONAL_PAYLOAD_FIELDS,
     T9_STATE_PHASE_ABORT,
     T9_STATE_PHASE_COMMIT,
@@ -93,7 +95,12 @@ _JOURNAL_MARKER_FIELDS = frozenset(
         *T9_STATE_OPTIONAL_PAYLOAD_FIELDS,
     )
 )
-_LAPSE_WINDOW = timedelta(days=30)
+
+
+def _lapse_window() -> timedelta:
+    return timedelta(
+        seconds=STABLE_ZERO_LAPSE_WINDOW_DAYS * LIFECYCLE_SECONDS_PER_DAY
+    )
 
 
 def observe_unit(
@@ -467,7 +474,7 @@ def _load_revlog(
         first = lifecycle[0] if lifecycle else None
         latest = lifecycle[-1] if lifecycle else None
         latest_lapse = lapses[-1] if lapses else None
-        window_start = now_utc - _LAPSE_WINDOW
+        window_start = now_utc - _lapse_window()
 
         channel = card_to_channel[card_id]
         by_channel[channel] = {
@@ -641,6 +648,7 @@ def _journal_record(
     to_state = payload.get("to")
     trigger = payload.get("trigger")
     transition_id = payload.get("transition_id")
+    from_episode_id = payload.get("from_episode_id")
     phase = payload.get("phase")
     evidence = payload.get("evidence")
     if channel not in CHANNELS:
@@ -657,6 +665,10 @@ def _journal_record(
         raise ReconcileEventHistoryError(
             "STATE transition_id must be a lowercase full SHA-256 digest"
         )
+    if not isinstance(from_episode_id, str) or not from_episode_id:
+        raise ReconcileEventHistoryError(
+            "STATE from_episode_id must be a non-empty string"
+        )
     if phase not in (
         T9_STATE_PHASE_PREPARE,
         T9_STATE_PHASE_COMMIT,
@@ -668,10 +680,11 @@ def _journal_record(
 
     transition_group_id = payload.get("transition_group_id")
     if "transition_group_id" in payload and (
-        not isinstance(transition_group_id, str) or not transition_group_id.strip()
+        not isinstance(transition_group_id, str)
+        or not _TRANSITION_ID_RE.fullmatch(transition_group_id)
     ):
         raise ReconcileEventHistoryError(
-            "STATE transition_group_id must be a non-empty string when present"
+            "STATE transition_group_id must be a lowercase full SHA-256 digest"
         )
     try:
         canonical_evidence = json.dumps(
@@ -686,6 +699,29 @@ def _journal_record(
             "STATE journal evidence must be canonical JSON data"
         ) from exc
 
+    transition_identity = {
+        "v": event.v,
+        "unit_key": event.unit_key,
+        "channel": channel,
+        "from": from_state,
+        "to": to_state,
+        "trigger": trigger,
+        "from_episode_id": from_episode_id,
+        "evidence": evidence,
+    }
+    canonical_identity = json.dumps(
+        transition_identity,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_transition_id = sha256(canonical_identity.encode("utf-8")).hexdigest()
+    if transition_id != expected_transition_id:
+        raise ReconcileEventHistoryError(
+            "STATE transition_id does not match its canonical identity"
+        )
+
     instant = _event_instant(event.ts, "STATE")
     if instant > now_utc:
         raise ReconcileEventHistoryError("STATE journal timestamp is in the future")
@@ -695,7 +731,9 @@ def _journal_record(
         "to": to_state,
         "trigger": trigger,
         "transition_id": transition_id,
+        "from_episode_id": from_episode_id,
         "phase": phase,
+        "canonical_identity": canonical_identity,
         "canonical_evidence": canonical_evidence,
         "transition_group_id": transition_group_id,
         "instant": instant,
@@ -731,45 +769,49 @@ def _state_episode_provenance(
     active_states: Mapping[str, str],
     records: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, str], dict[str, datetime | None]]:
-    phases_by_transition: dict[str, dict[str, Mapping[str, Any]]] = {}
-    identity_by_transition: dict[str, tuple[object, ...]] = {}
+    journal_by_transition: dict[str, dict[str, object]] = {}
+    committed: list[Mapping[str, Any]] = []
 
     for record in records:
         transition_id = cast(str, record["transition_id"])
         phase = cast(str, record["phase"])
         identity = (
-            record["channel"],
-            record["from"],
-            record["to"],
-            record["trigger"],
-            record["canonical_evidence"],
+            record["canonical_identity"],
             record["transition_group_id"],
         )
-        previous_identity = identity_by_transition.setdefault(
-            transition_id,
-            identity,
-        )
-        if previous_identity != identity:
+
+        if phase == T9_STATE_PHASE_PREPARE:
+            if transition_id in journal_by_transition:
+                raise ReconcileEventHistoryError(
+                    f"STATE transition {transition_id} duplicates phase PREPARE"
+                )
+            journal_by_transition[transition_id] = {
+                "identity": identity,
+                "terminal": None,
+            }
+            continue
+
+        journal = journal_by_transition.get(transition_id)
+        if journal is None:
+            raise ReconcileEventHistoryError(
+                f"STATE transition {transition_id} terminal phase requires PREPARE"
+            )
+        if journal["identity"] != identity:
             raise ReconcileEventHistoryError(
                 f"STATE transition {transition_id} changes identity across phases"
             )
-        phases = phases_by_transition.setdefault(transition_id, {})
-        if phase in phases:
-            raise ReconcileEventHistoryError(
-                f"STATE transition {transition_id} duplicates phase {phase}"
-            )
-        phases[phase] = record
-
-    committed: list[Mapping[str, Any]] = []
-    for transition_id, phases in phases_by_transition.items():
-        has_commit = T9_STATE_PHASE_COMMIT in phases
-        has_abort = T9_STATE_PHASE_ABORT in phases
-        if has_commit and has_abort:
+        terminal = journal["terminal"]
+        if terminal is not None:
+            if terminal == phase:
+                raise ReconcileEventHistoryError(
+                    f"STATE transition {transition_id} duplicates phase {phase}"
+                )
             raise ReconcileEventHistoryError(
                 f"STATE transition {transition_id} has COMMIT and ABORT terminals"
             )
-        if has_commit:
-            committed.append(phases[T9_STATE_PHASE_COMMIT])
+        journal["terminal"] = phase
+        if phase == T9_STATE_PHASE_COMMIT:
+            committed.append(record)
 
     committed_by_channel: dict[str, list[Mapping[str, Any]]] = {
         channel: [] for channel in active_states
@@ -781,30 +823,30 @@ def _state_episode_provenance(
 
     episode_ids: dict[str, str] = {}
     episode_entries: dict[str, datetime | None] = {}
-    for channel, state in active_states.items():
-        channel_commits = sorted(
-            committed_by_channel[channel],
-            key=lambda item: (item["instant"], item["index"]),
-        )
-        if state == STATE_NEW:
-            if channel_commits:
+    for channel, persisted_state in active_states.items():
+        current_state = STATE_NEW
+        current_episode_id = _initial_new_episode_id(unit_key, channel)
+        current_entry: datetime | None = None
+        for commit in committed_by_channel[channel]:
+            if commit["from"] != current_state:
                 raise ReconcileEventHistoryError(
-                    f"persisted NEW channel {channel} conflicts with committed history"
+                    f"STATE channel {channel} COMMIT breaks the lifecycle chain"
                 )
-            episode_ids[channel] = _initial_new_episode_id(unit_key, channel)
-            episode_entries[channel] = None
-            continue
-        if not channel_commits:
+            if commit["from_episode_id"] != current_episode_id:
+                raise ReconcileEventHistoryError(
+                    f"STATE channel {channel} COMMIT breaks episode provenance"
+                )
+            current_state = cast(str, commit["to"])
+            current_episode_id = cast(str, commit["transition_id"])
+            current_entry = cast(datetime, commit["instant"])
+
+        if current_state != persisted_state:
             raise ReconcileEventHistoryError(
-                f"persisted {state} channel {channel} has no committed provenance"
+                f"persisted {persisted_state} channel {channel} conflicts "
+                "with reconstructed journal state"
             )
-        latest = channel_commits[-1]
-        if latest["to"] != state:
-            raise ReconcileEventHistoryError(
-                f"persisted {state} channel {channel} conflicts with latest COMMIT"
-            )
-        episode_ids[channel] = cast(str, latest["transition_id"])
-        episode_entries[channel] = cast(datetime, latest["instant"])
+        episode_ids[channel] = current_episode_id
+        episode_entries[channel] = current_entry
 
     return episode_ids, episode_entries
 
@@ -820,7 +862,7 @@ def _initial_new_episode_id(unit_key: str, channel: str) -> str:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return "initial-new:" + sha256(canonical).hexdigest()
+    return INITIAL_NEW_EPISODE_PREFIX + sha256(canonical).hexdigest()
 
 
 def _channel_progress(

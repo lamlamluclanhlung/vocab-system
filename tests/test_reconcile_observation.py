@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from typing import Any
 
 import pytest
+import vocab.reconcile as reconcile_module
 
 from vocab.anki import (
     AnkiConnectClient,
@@ -18,7 +21,10 @@ from vocab.contracts import (
     ANKI_NOTE_TYPE_NAME,
     ANKI_SORT_FIELD,
     CARD_TEMPLATE_NAMES,
+    INITIAL_NEW_EPISODE_PREFIX,
+    LIFECYCLE_SECONDS_PER_DAY,
     NOTE_FIELDS,
+    STABLE_ZERO_LAPSE_WINDOW_DAYS,
     TARGET_FIELD_BY_CHANNEL,
 )
 from vocab.models import Event, VocabUnit
@@ -180,24 +186,133 @@ def stored_event(
     )
 
 
+def canonical_digest(identity: dict[str, object]) -> str:
+    canonical = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(canonical).hexdigest()
+
+
+def initial_episode_id(
+    channel: str,
+    unit_key: str = "subtle::small-difference",
+) -> str:
+    return INITIAL_NEW_EPISODE_PREFIX + canonical_digest(
+        {"channel": channel, "unit_key": unit_key}
+    )
+
+
 def state_payload(
     *,
     channel: str = "R",
     from_state: str = "NEW",
     to_state: str = "LEARNING",
     trigger: str = "FIRST_REVIEW",
-    transition_id: str = "a" * 64,
-    phase: str = "COMMIT",
+    from_episode_id: str | None = None,
+    phase: str = "PREPARE",
+    evidence: dict[str, object] | None = None,
+    transition_id: str | None = None,
+    transition_group_id: str | None = None,
+    unit_key: str = "subtle::small-difference",
 ) -> dict[str, object]:
-    return {
+    selected_episode_id = (
+        initial_episode_id(channel, unit_key)
+        if from_episode_id is None
+        else from_episode_id
+    )
+    selected_evidence = (
+        {"fixture": f"{channel}:{from_state}:{to_state}:{trigger}"}
+        if evidence is None
+        else evidence
+    )
+    expected_transition_id = canonical_digest(
+        {
+            "v": 1,
+            "unit_key": unit_key,
+            "channel": channel,
+            "from": from_state,
+            "to": to_state,
+            "trigger": trigger,
+            "from_episode_id": selected_episode_id,
+            "evidence": selected_evidence,
+        }
+    )
+    payload: dict[str, object] = {
         "channel": channel,
         "from": from_state,
         "to": to_state,
         "trigger": trigger,
-        "transition_id": transition_id,
+        "transition_id": (
+            expected_transition_id if transition_id is None else transition_id
+        ),
+        "from_episode_id": selected_episode_id,
         "phase": phase,
-        "evidence": {"test": transition_id[0]},
+        "evidence": selected_evidence,
     }
+    if transition_group_id is not None:
+        payload["transition_group_id"] = transition_group_id
+    return payload
+
+
+def journal_transition(
+    *,
+    channel: str = "R",
+    from_state: str = "NEW",
+    to_state: str = "LEARNING",
+    trigger: str = "FIRST_REVIEW",
+    from_episode_id: str | None = None,
+    evidence: dict[str, object] | None = None,
+    phases: tuple[str, ...] = ("PREPARE", "COMMIT"),
+    terminal_ts: datetime = NOW - timedelta(days=1),
+    unit_key: str = "subtle::small-difference",
+) -> tuple[list[Event], str]:
+    base = state_payload(
+        channel=channel,
+        from_state=from_state,
+        to_state=to_state,
+        trigger=trigger,
+        from_episode_id=from_episode_id,
+        evidence=evidence,
+        unit_key=unit_key,
+    )
+    transition_id = str(base["transition_id"])
+    events = []
+    for phase in phases:
+        payload = dict(base)
+        payload["phase"] = phase
+        ts = (
+            terminal_ts - timedelta(milliseconds=1)
+            if phase == "PREPARE" and len(phases) > 1
+            else terminal_ts
+        )
+        events.append(
+            stored_event("STATE", payload, ts=ts, unit_key=unit_key)
+        )
+    return events, transition_id
+
+
+def committed_chain(
+    channel: str,
+    steps: tuple[tuple[str, str, str], ...],
+    *,
+    first_terminal_ts: datetime,
+) -> tuple[list[Event], str]:
+    events: list[Event] = []
+    episode_id = initial_episode_id(channel)
+    for index, (from_state, to_state, trigger) in enumerate(steps):
+        transition_events, episode_id = journal_transition(
+            channel=channel,
+            from_state=from_state,
+            to_state=to_state,
+            trigger=trigger,
+            from_episode_id=episode_id,
+            terminal_ts=first_terminal_ts + timedelta(seconds=index),
+        )
+        events.extend(transition_events)
+    return events, episode_id
 
 
 class FakeAnki:
@@ -524,12 +639,27 @@ def test_cram_is_ignored_as_lifecycle_evidence() -> None:
 @pytest.mark.parametrize(
     ("age", "expected"),
     [
-        (timedelta(days=30), 1),
-        (timedelta(days=30, milliseconds=1), 0),
+        (
+            timedelta(
+                seconds=(
+                    STABLE_ZERO_LAPSE_WINDOW_DAYS * LIFECYCLE_SECONDS_PER_DAY
+                )
+            ),
+            1,
+        ),
+        (
+            timedelta(
+                seconds=(
+                    STABLE_ZERO_LAPSE_WINDOW_DAYS * LIFECYCLE_SECONDS_PER_DAY
+                ),
+                milliseconds=1,
+            ),
+            0,
+        ),
     ],
     ids=["exact-boundary-inclusive", "one-ms-outside"],
 )
-def test_lapse_window_uses_exact_elapsed_30_day_boundary(
+def test_lapse_window_uses_exact_contract_boundary(
     age: timedelta,
     expected: int,
 ) -> None:
@@ -542,6 +672,25 @@ def test_lapse_window_uses_exact_elapsed_30_day_boundary(
     ).channels[0]
 
     assert progress.lapses_last_30_days == expected
+
+
+def test_lapse_window_is_derived_from_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reconcile_module, "STABLE_ZERO_LAPSE_WINDOW_DAYS", 1)
+    included = review(NOW - timedelta(days=1), review_type=1, ease=1)
+    excluded = review(
+        NOW - timedelta(days=1, milliseconds=1),
+        review_type=1,
+        ease=1,
+    )
+
+    progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(reviews=[included, excluded]),
+        event_log=FakeEventLog(),
+        now=NOW,
+    ).channels[0]
+
+    assert progress.lapses_last_30_days == 1
 
 
 def test_future_revlog_id_fails_closed() -> None:
@@ -706,36 +855,66 @@ def test_malformed_lifecycle_judge_fails_closed(
         )
 
 
-@pytest.mark.parametrize("phase", ["PREPARE", "ABORT"])
-def test_non_commit_phase_does_not_establish_state_episode(phase: str) -> None:
-    unit = make_unit(states={"R": "LEARNING"})
-    event = stored_event(
-        "STATE",
-        state_payload(phase=phase),
-        ts=NOW - timedelta(days=1),
-    )
+def test_prepare_only_is_valid_incomplete_and_does_not_advance_state() -> None:
+    events, _transition_id = journal_transition(phases=("PREPARE",))
 
-    with pytest.raises(ReconcileEventHistoryError, match="no committed"):
+    progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(),
+        event_log=FakeEventLog(events),
+        now=NOW,
+    ).channels[0]
+
+    assert progress.state == "NEW"
+    assert progress.state_episode_id == initial_episode_id("R")
+
+
+def test_prepare_then_abort_is_valid_and_does_not_advance_state() -> None:
+    events, _transition_id = journal_transition(phases=("PREPARE", "ABORT"))
+
+    progress = observe_unit(
+        NOTE_ID,
+        anki=default_anki(),
+        event_log=FakeEventLog(events),
+        now=NOW,
+    ).channels[0]
+
+    assert progress.state == "NEW"
+    assert progress.state_episode_id == initial_episode_id("R")
+
+
+@pytest.mark.parametrize("phase", ["COMMIT", "ABORT"])
+def test_terminal_without_prepare_fails_closed(phase: str) -> None:
+    events, _transition_id = journal_transition(phases=(phase,))
+
+    with pytest.raises(ReconcileEventHistoryError, match="requires PREPARE"):
         observe_unit(
             NOTE_ID,
-            anki=default_anki(unit=unit),
-            event_log=FakeEventLog([event]),
+            anki=default_anki(),
+            event_log=FakeEventLog(events),
+            now=NOW,
+        )
+
+
+def test_terminal_before_prepare_fails_closed() -> None:
+    events, _transition_id = journal_transition(phases=("COMMIT", "PREPARE"))
+
+    with pytest.raises(ReconcileEventHistoryError, match="requires PREPARE"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(),
+            event_log=FakeEventLog(events),
             now=NOW,
         )
 
 
 def test_commit_establishes_current_state_episode() -> None:
     unit = make_unit(states={"R": "LEARNING"})
-    transition_id = "b" * 64
-    event = stored_event(
-        "STATE",
-        state_payload(transition_id=transition_id),
-        ts=NOW - timedelta(days=1),
-    )
+    events, transition_id = journal_transition()
     progress = observe_unit(
         NOTE_ID,
         anki=default_anki(unit=unit),
-        event_log=FakeEventLog([event]),
+        event_log=FakeEventLog(events),
         now=NOW,
     ).channels[0]
 
@@ -746,7 +925,7 @@ def test_commit_establishes_current_state_episode() -> None:
 def test_persisted_non_new_state_without_provenance_fails_closed() -> None:
     unit = make_unit(states={"R": "STABLE"})
 
-    with pytest.raises(ReconcileEventHistoryError, match="no committed"):
+    with pytest.raises(ReconcileEventHistoryError, match="reconstructed"):
         observe_unit(
             NOTE_ID,
             anki=default_anki(unit=unit),
@@ -769,7 +948,7 @@ def test_historical_pre_d38_state_does_not_invent_episode_provenance() -> None:
         ts=NOW - timedelta(days=1),
     )
 
-    with pytest.raises(ReconcileEventHistoryError, match="no committed"):
+    with pytest.raises(ReconcileEventHistoryError, match="reconstructed"):
         observe_unit(
             NOTE_ID,
             anki=default_anki(unit=unit),
@@ -787,8 +966,9 @@ def test_initial_new_episode_identity_is_deterministic() -> None:
 
     first_id = first.channels[0].state_episode_id
     assert first_id == second.channels[0].state_episode_id
-    assert first_id.startswith("initial-new:")
-    assert len(first_id) == len("initial-new:") + 64
+    assert first_id == INITIAL_NEW_EPISODE_PREFIX + sha256(
+        b'{"channel":"R","unit_key":"subtle::small-difference"}'
+    ).hexdigest()
 
     listening = observe_unit(
         NOTE_ID,
@@ -802,6 +982,181 @@ def test_initial_new_episode_identity_is_deterministic() -> None:
     assert listening.channels[0].state_episode_id != first_id
 
 
+def test_wrong_full_hex_transition_digest_fails_closed() -> None:
+    payload = state_payload()
+    transition_id = str(payload["transition_id"])
+    replacement = "0" if transition_id[0] != "0" else "1"
+    payload["transition_id"] = replacement + transition_id[1:]
+    event = stored_event("STATE", payload, ts=NOW - timedelta(days=1))
+
+    with pytest.raises(ReconcileEventHistoryError, match="canonical identity"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(),
+            event_log=FakeEventLog([event]),
+            now=NOW,
+        )
+
+
+def test_missing_from_episode_id_fails_closed() -> None:
+    payload = state_payload()
+    del payload["from_episode_id"]
+    event = stored_event("STATE", payload, ts=NOW - timedelta(days=1))
+
+    with pytest.raises(ReconcileEventHistoryError, match="missing"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(),
+            event_log=FakeEventLog([event]),
+            now=NOW,
+        )
+
+
+@pytest.mark.parametrize("changed_field", ["evidence", "from_episode_id"])
+def test_transition_identity_cannot_change_across_phases(
+    changed_field: str,
+) -> None:
+    prepare = state_payload()
+    terminal = dict(prepare)
+    terminal["phase"] = "COMMIT"
+    if changed_field == "evidence":
+        terminal["evidence"] = {"changed": True}
+    else:
+        terminal["from_episode_id"] = initial_episode_id("L")
+    events = [
+        stored_event("STATE", prepare, ts=NOW - timedelta(days=1, seconds=1)),
+        stored_event("STATE", terminal, ts=NOW - timedelta(days=1)),
+    ]
+
+    with pytest.raises(ReconcileEventHistoryError, match="canonical identity"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(),
+            event_log=FakeEventLog(events),
+            now=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "phases",
+    [
+        ("PREPARE", "PREPARE"),
+        ("PREPARE", "COMMIT", "COMMIT"),
+        ("PREPARE", "ABORT", "ABORT"),
+    ],
+    ids=["prepare", "commit", "abort"],
+)
+def test_duplicate_journal_phase_fails_closed(phases: tuple[str, ...]) -> None:
+    events, _transition_id = journal_transition(phases=phases)
+
+    with pytest.raises(ReconcileEventHistoryError, match="duplicates phase"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(),
+            event_log=FakeEventLog(events),
+            now=NOW,
+        )
+
+
+def test_commit_and_abort_for_one_transition_fail_closed() -> None:
+    events, _transition_id = journal_transition(
+        phases=("PREPARE", "COMMIT", "ABORT")
+    )
+
+    with pytest.raises(ReconcileEventHistoryError, match="COMMIT and ABORT"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(),
+            event_log=FakeEventLog(events),
+            now=NOW,
+        )
+
+
+def test_present_transition_group_id_must_be_full_lower_hex() -> None:
+    payload = state_payload(transition_group_id="DORMANCY")
+    event = stored_event("STATE", payload, ts=NOW - timedelta(days=1))
+
+    with pytest.raises(ReconcileEventHistoryError, match="transition_group_id"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(),
+            event_log=FakeEventLog([event]),
+            now=NOW,
+        )
+
+
+def test_broken_intermediate_state_chain_fails_closed() -> None:
+    first, first_id = journal_transition()
+    broken, _broken_id = journal_transition(
+        from_state="STABLE",
+        to_state="MASTERED",
+        trigger="MASTERY_ASSESSMENT_PASS",
+        from_episode_id=first_id,
+        terminal_ts=NOW - timedelta(hours=12),
+    )
+
+    with pytest.raises(ReconcileEventHistoryError, match="lifecycle chain"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(unit=make_unit(states={"R": "MASTERED"})),
+            event_log=FakeEventLog([*first, *broken]),
+            now=NOW,
+        )
+
+
+def test_broken_intermediate_episode_chain_fails_closed() -> None:
+    first, _first_id = journal_transition()
+    broken, _broken_id = journal_transition(
+        from_state="LEARNING",
+        to_state="STABLE",
+        trigger="STABILITY_GATE",
+        from_episode_id="f" * 64,
+        terminal_ts=NOW - timedelta(hours=12),
+    )
+
+    with pytest.raises(ReconcileEventHistoryError, match="episode provenance"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(unit=make_unit(states={"R": "STABLE"})),
+            event_log=FakeEventLog([*first, *broken]),
+            now=NOW,
+        )
+
+
+def test_final_persisted_state_mismatch_fails_closed() -> None:
+    events, _transition_id = journal_transition()
+
+    with pytest.raises(ReconcileEventHistoryError, match="reconstructed"):
+        observe_unit(
+            NOTE_ID,
+            anki=default_anki(unit=make_unit(states={"R": "STABLE"})),
+            event_log=FakeEventLog(events),
+            now=NOW,
+        )
+
+
+def test_multiple_committed_transitions_reconstruct_verified_chain() -> None:
+    events, latest_transition_id = committed_chain(
+        "R",
+        (
+            ("NEW", "LEARNING", "FIRST_REVIEW"),
+            ("LEARNING", "STABLE", "STABILITY_GATE"),
+            ("STABLE", "MASTERED", "MASTERY_ASSESSMENT_PASS"),
+        ),
+        first_terminal_ts=NOW - timedelta(days=3),
+    )
+
+    channel = observe_unit(
+        NOTE_ID,
+        anki=default_anki(unit=make_unit(states={"R": "MASTERED"})),
+        event_log=FakeEventLog(events),
+        now=NOW,
+    ).channels[0]
+
+    assert channel.state == "MASTERED"
+    assert channel.state_episode_id == latest_transition_id
+
+
 def test_all_mastered_timestamp_uses_latest_committed_entry() -> None:
     unit = make_unit(states={"R": "MASTERED", "L": "MASTERED"})
     anki = FakeAnki(
@@ -810,35 +1165,29 @@ def test_all_mastered_timestamp_uses_latest_committed_entry() -> None:
     )
     first_entry = NOW - timedelta(days=12)
     latest_entry = NOW - timedelta(days=10)
-    events = [
-        stored_event(
-            "STATE",
-            state_payload(
-                channel="R",
-                from_state="STABLE",
-                to_state="MASTERED",
-                trigger="MASTERY_ASSESSMENT_PASS",
-                transition_id="c" * 64,
-            ),
-            ts=first_entry,
+    r_events, _r_latest = committed_chain(
+        "R",
+        (
+            ("NEW", "LEARNING", "FIRST_REVIEW"),
+            ("LEARNING", "STABLE", "STABILITY_GATE"),
+            ("STABLE", "MASTERED", "MASTERY_ASSESSMENT_PASS"),
         ),
-        stored_event(
-            "STATE",
-            state_payload(
-                channel="L",
-                from_state="STABLE",
-                to_state="MASTERED",
-                trigger="MASTERY_ASSESSMENT_PASS",
-                transition_id="d" * 64,
-            ),
-            ts=latest_entry,
+        first_terminal_ts=first_entry - timedelta(seconds=2),
+    )
+    l_events, _l_latest = committed_chain(
+        "L",
+        (
+            ("NEW", "LEARNING", "FIRST_REVIEW"),
+            ("LEARNING", "STABLE", "STABILITY_GATE"),
+            ("STABLE", "MASTERED", "MASTERY_ASSESSMENT_PASS"),
         ),
-    ]
+        first_terminal_ts=latest_entry - timedelta(seconds=2),
+    )
 
     progress = observe_unit(
         NOTE_ID,
         anki=anki,
-        event_log=FakeEventLog(events),
+        event_log=FakeEventLog([*r_events, *l_events]),
         now=NOW,
     )
 
@@ -851,35 +1200,28 @@ def test_one_non_mastered_channel_keeps_unit_mastered_timestamp_empty() -> None:
         unit,
         [card_record(101, 0), card_record(102, 1)],
     )
-    events = [
-        stored_event(
-            "STATE",
-            state_payload(
-                channel="R",
-                from_state="STABLE",
-                to_state="MASTERED",
-                trigger="MASTERY_ASSESSMENT_PASS",
-                transition_id="e" * 64,
-            ),
-            ts=NOW - timedelta(days=10),
+    r_events, _r_latest = committed_chain(
+        "R",
+        (
+            ("NEW", "LEARNING", "FIRST_REVIEW"),
+            ("LEARNING", "STABLE", "STABILITY_GATE"),
+            ("STABLE", "MASTERED", "MASTERY_ASSESSMENT_PASS"),
         ),
-        stored_event(
-            "STATE",
-            state_payload(
-                channel="L",
-                from_state="LEARNING",
-                to_state="STABLE",
-                trigger="STABILITY_GATE",
-                transition_id="f" * 64,
-            ),
-            ts=NOW - timedelta(days=5),
+        first_terminal_ts=NOW - timedelta(days=10, seconds=2),
+    )
+    l_events, _l_latest = committed_chain(
+        "L",
+        (
+            ("NEW", "LEARNING", "FIRST_REVIEW"),
+            ("LEARNING", "STABLE", "STABILITY_GATE"),
         ),
-    ]
+        first_terminal_ts=NOW - timedelta(days=5, seconds=1),
+    )
 
     progress = observe_unit(
         NOTE_ID,
         anki=anki,
-        event_log=FakeEventLog(events),
+        event_log=FakeEventLog([*r_events, *l_events]),
         now=NOW,
     )
 

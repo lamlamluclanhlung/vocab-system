@@ -1827,3 +1827,103 @@ A coordinated dormancy operation uses one `transition_group_id` and one member
 `state_*` fields in one subset update, suspends the required active cards,
 performs exact readback, and then COMMITs every member. It does not persist an
 aggregate Unit state.
+
+## D39 — Verifiable T9 journal state identity and chain provenance
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9.1, T9.2, T9.3, T12
+
+D39 hardens the read-only T9 journal observation contract. It refines D38
+without rewriting its accepted history. Historical pre-D38 STATE records remain
+readable through the unchanged generic v1 event decoder and are not assigned
+T9 journal semantics.
+
+Every T9-produced STATE payload contains exactly these required fields:
+
+```text
+channel
+from
+to
+trigger
+transition_id
+from_episode_id
+phase
+evidence
+```
+
+`transition_group_id` remains the only optional T9 STATE payload field. The
+generic `EVENT_PAYLOAD_REQUIRED_FIELDS["STATE"]` contract remains unchanged.
+
+### Initial NEW episode identity
+
+The initial episode for an active channel is the lowercase full SHA-256 digest
+of canonical JSON containing:
+
+```json
+{"channel":"<channel>","unit_key":"<unit_key>"}
+```
+
+Canonical JSON uses `ensure_ascii=False`, `sort_keys=True`, and
+`separators=(",", ":")`. The episode ID is the literal prefix
+`initial-new:` followed by that digest. No timestamp, UUID, randomness, or
+Python `hash()` participates in the identity.
+
+### Independently verified transition identity
+
+The observer independently recomputes every T9 `transition_id` from:
+
+```text
+v
+unit_key
+channel
+from
+to
+trigger
+from_episode_id
+evidence
+```
+
+using the same canonical JSON settings and full lowercase SHA-256 digest frozen
+by D38. Merely supplying a string that has the shape of a digest is
+insufficient: an incorrect digest fails closed.
+
+### Phase integrity
+
+Journal order is authoritative. PREPARE must be the first record for a
+`transition_id`, followed by exactly one terminal COMMIT or ABORT. A terminal
+record without its preceding PREPARE, a terminal before PREPARE, a duplicate
+phase, both terminal phases, or a change to any frozen transition identity
+field fails closed. A PREPARE without a terminal record is a valid incomplete
+operation and does not change lifecycle state.
+
+### Channel-chain provenance
+
+For each active channel, verified reconstruction starts at `NEW` with the
+canonical initial-episode sentinel. COMMITTED transitions are applied in
+journal order. Each transition must name the reconstructed current state in
+`from` and the reconstructed current episode in `from_episode_id`. The chain
+then advances to `to`, and its episode becomes that committed
+`transition_id`.
+
+After the journal is processed, the persisted channel state must equal the
+reconstructed state. A NEW channel therefore reports the initial sentinel as
+its `state_episode_id`; any other reconstructed state reports the most recent
+COMMITTED transition ID. `all_mastered_at` is derived only from these verified
+chains. No aggregate lifecycle state is persisted.
+
+### Dormancy transition-group identity
+
+The frozen group kind is the literal `DORMANCY`. A dormancy group identity is
+the lowercase full SHA-256 digest of canonical JSON containing:
+
+```text
+kind
+unit_key
+member_transition_ids
+```
+
+where `member_transition_ids` is sorted before canonicalization and the same
+JSON settings are used. When `transition_group_id` is present on a T9 record,
+it must already be a lowercase full 64-hex digest. Cross-member group
+verification is deferred to T9.3.

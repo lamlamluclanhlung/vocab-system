@@ -15,6 +15,7 @@ from vocab.contracts import (
     EVENT_PAYLOAD_REQUIRED_FIELDS,
     EVENT_SCHEMA_VERSION,
     EVENT_TYPES,
+    INITIAL_NEW_EPISODE_PREFIX,
     LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS,
     LIFECYCLE_SECONDS_PER_DAY,
     NOTE_FIELDS,
@@ -28,9 +29,11 @@ from vocab.contracts import (
     REVLOG_TYPE_REVIEW,
     STATE_TRANSITIONS,
     STATE_TRIGGERS,
+    STABLE_ZERO_LAPSE_WINDOW_DAYS,
     T9_AUTO_UNSUSPEND,
     T9_LEECH_AUTOCREATE_VISUAL_CUE,
     T9_LEECH_AUTO_TRANSITION,
+    T9_DORMANCY_GROUP_KIND,
     T9_STATE_OPTIONAL_PAYLOAD_FIELDS,
     T9_STATE_PHASES,
     T9_STATE_REQUIRED_PAYLOAD_FIELDS,
@@ -93,12 +96,19 @@ def test_t9_state_journal_phases_and_payload_shape_are_exact() -> None:
         "to",
         "trigger",
         "transition_id",
+        "from_episode_id",
         "phase",
         "evidence",
     )
     assert T9_STATE_OPTIONAL_PAYLOAD_FIELDS == (
         "transition_group_id",
     )
+    assert INITIAL_NEW_EPISODE_PREFIX == "initial-new:"
+    assert T9_DORMANCY_GROUP_KIND == "DORMANCY"
+
+
+def test_stable_zero_lapse_window_is_frozen() -> None:
+    assert STABLE_ZERO_LAPSE_WINDOW_DAYS == 30
 
 
 def test_t9_reactivation_and_leech_policies_are_exact() -> None:

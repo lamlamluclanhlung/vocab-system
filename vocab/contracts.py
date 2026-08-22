@@ -438,6 +438,7 @@ T9_STATE_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
     "to",
     "trigger",
     "transition_id",
+    "from_episode_id",
     "phase",
     "evidence",
 )
@@ -445,6 +446,9 @@ T9_STATE_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
 T9_STATE_OPTIONAL_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
     "transition_group_id",
 )
+
+INITIAL_NEW_EPISODE_PREFIX: Final[str] = "initial-new:"
+T9_DORMANCY_GROUP_KIND: Final[str] = "DORMANCY"
 
 T9_STATE_PHASE_PREPARE: Final[str] = "PREPARE"
 T9_STATE_PHASE_COMMIT: Final[str] = "COMMIT"
