@@ -1424,3 +1424,406 @@ not inspected before accepting such an artifact.
 
 Malformed or missing-media existing `audio_1` fails closed and is not
 automatically repaired. Media is never deleted automatically.
+
+## D33 — Anki observation and card attribution
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9
+
+T9 observes one `VocabularyUnit` note with `notesInfo`. Card IDs come from the
+note's `cards` value; normal per-note reconciliation does not require
+`findCards`. T9 obtains current card observations with `cardsInfo`.
+
+Before attributing any card, the installed `VocabularyUnit` model must pass the
+existing semantic model verifier. Channel attribution is exactly:
+
+```text
+card.ord
+-> ordinal in the verified current model snapshot
+-> template name
+-> CHANNEL_BY_TEMPLATE_NAME
+-> R/L/W/S
+```
+
+An ordinal is only a runtime lookup key. It is never the semantic channel
+identity. T9 must not hard-code an ordinal/channel association, even if a
+runtime snapshot currently has `0 -> R`, `1 -> L`, `2 -> W`, and `3 -> S`.
+
+Each enabled `Target_X` must resolve to exactly one card for template `X`.
+Reconciliation fails closed for the Unit on any of these observations:
+
+- unknown card ID;
+- `cardsInfo` cardinality mismatch;
+- card belongs to another note;
+- unknown ordinal;
+- unknown template name;
+- duplicate cards for one enabled channel;
+- enabled channel has no card;
+- card exists for a disabled target channel;
+- malformed interval, lapses, queue, or revlog shape.
+
+The frozen Anki revlog meanings are:
+
+```text
+0 = learning
+1 = review
+2 = relearning
+3 = cram
+```
+
+Only types `0`, `1`, and `2` are lifecycle review evidence. Type `3` is not
+lifecycle evidence. `ease == 1` means Again.
+
+A lifecycle lapse is exactly:
+
+```text
+review.type == REVLOG_TYPE_REVIEW
+AND review.ease == REVLOG_EASE_AGAIN
+```
+
+Learning or relearning Again does not increment `lapses_last_30_days`. The
+first lifecycle review is the earliest revlog entry whose type is one of the
+lifecycle types. Channel age is measured from that review:
+
+```text
+floor((now_utc - first_review_utc) / 86400 seconds)
+```
+
+It is not note age. `cardsInfo.interval` is the current channel interval used
+by the STABLE gate. `cardsInfo.lapses` is total card-level lapse evidence and
+may be used to attribute leech rescue diagnostics. Suspension is exactly
+`queue == -1`; buried states are not suspension.
+
+## D34 — Channel lifecycle gates and clock semantics
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9
+
+`STATE_TRANSITIONS` remains authoritative. T9 may not invent another lifecycle
+edge.
+
+The gates are frozen as follows.
+
+### NEW -> LEARNING
+
+The first lifecycle review exists for that exact channel.
+
+### LEARNING -> STABLE
+
+All of these are true for that exact channel:
+
+- `interval_days >= STABLE_MIN_INTERVAL_DAYS`;
+- `age_days >= STABLE_MIN_AGE_DAYS`;
+- zero lifecycle lapses during the preceding
+  `STABLE_ZERO_LAPSE_WINDOW_DAYS`;
+- the card is not suspended.
+
+### STABLE -> LEARNING
+
+A lifecycle lapse occurred after entry into the current STABLE episode for
+that exact channel.
+
+### STABLE -> MASTERED
+
+The D35 qualifying mastery evidence is satisfied for that exact channel.
+
+### MASTERED -> RELAPSE
+
+A D35 qualifying failed lifecycle assessment occurred after entry into the
+current MASTERED episode for that exact channel.
+
+### MASTERED -> DORMANT
+
+Every enabled channel is currently MASTERED, every active channel has
+trustworthy committed MASTERED-entry provenance, and:
+
+```text
+now_utc - all_channels_mastered_at
+    >= MASTERED_TO_DORMANT_DAYS * 86400 seconds
+```
+
+where `all_channels_mastered_at` is the latest MASTERED-entry instant among all
+enabled channels.
+
+This is elapsed UTC duration, not the "31st calendar day". It does not use
+`Event.day` for timing and does not use the mutable `graduated` note field as
+authority. Dormancy is a Unit-level gate that materializes as one per-channel
+transition for every active channel.
+
+### DORMANT -> RELAPSE
+
+A qualifying failed D35 lifecycle assessment for that exact channel occurred
+after the channel entered DORMANT. Other dormant channels remain DORMANT.
+
+### RELAPSE -> LEARNING
+
+The first lifecycle review for that exact card occurred after RELAPSE entry.
+
+No transition may use evidence from another channel. Missing or ambiguous
+transition evidence means no transition and no STATE COMMIT; reconciliation
+fails closed and reports insufficient evidence. Aggregate `VocabUnit` state
+remains derived only and is never persisted.
+
+## D35 — Lifecycle assessment evidence
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Supersedes:** D14's pre-T9-v2 session, encounter-failure, and corpus-misuse
+field representation; D14's transition-scope principle remains accepted.
+**Blocks:** T9, T11, T12
+
+`JUDGE` is the only assessment event type that directly gates lifecycle
+mastery or relapse decisions in T9.
+
+`SPEAK` alone never changes lifecycle state. A future speech assessment may
+emit SPEAK evidence, but a producer that intends the result to affect state
+must also emit a qualifying channel-scoped JUDGE record.
+
+`ENCOUNTER` alone never changes lifecycle state. ENCOUNTER may make a dormant
+Unit a candidate for assessment; only a subsequent failed qualifying JUDGE may
+cause DORMANT -> RELAPSE.
+
+The existing generic JUDGE fields remain:
+
+```text
+channel
+passed
+model_id
+model_version
+```
+
+A JUDGE record is lifecycle-eligible only when it also contains:
+
+```text
+assessment_id
+stimulus_ref
+novel
+```
+
+`assessment_id` is a non-empty stable identity for the assessment.
+`stimulus_ref` is a non-empty stable identity for the assessment stimulus.
+`novel` must be an actual Boolean and must be `True` for mastery evidence.
+
+These additional fields are producer-level lifecycle requirements. They do not
+make old `EVENT_SCHEMA_VERSION=1` logs unreadable when a historical or
+non-lifecycle JUDGE lacks them.
+
+STABLE -> MASTERED requires `MASTERED_MIN_SESSION_PASSES` qualifying passed
+JUDGE records for the same channel. The records must have distinct
+`assessment_id` values, distinct `stimulus_ref` values, and be consecutive
+qualifying results after entry into the current STABLE episode. Adjacent
+qualifying passes must be separated by at least
+`MASTERED_MIN_DELAY_BETWEEN_PASSES_DAYS` elapsed UTC days. A qualifying failed
+JUDGE breaks the consecutive-pass sequence.
+
+A qualifying failed JUDGE after MASTERED or DORMANT entry can gate the
+corresponding RELAPSE transition.
+
+T9 checks structure, channel, ordering, distinct identity, timing, and
+`novel == True`. The future T11/T12 producer owns truthful construction of
+`stimulus_ref` and the assessment semantics.
+
+## D36 — Dormancy retains all artifacts
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Supersedes:** The historical dormancy media-stripping rule in
+`docs/VOCAB_SYSTEM_SPEC.md`.
+**Blocks:** T9
+
+`DORMANT_CLEAR_FIELDS` is exactly the empty tuple.
+
+Dormancy v0 means:
+
+- lifecycle state becomes DORMANT;
+- active cards are suspended.
+
+Dormancy does not:
+
+- clear `audio_1`;
+- clear `audio_2` or `audio_3`;
+- clear `VisualCue`;
+- delete physical Anki media;
+- delete the note;
+- delete or reset revlog;
+- regenerate media.
+
+`DORMANT_DELETE_NOTE` remains `False` and `DORMANT_PRESERVE_REVLOG` remains
+`True`. Suspension alone removes normal review workload. Retaining artifacts
+makes dormancy reversible and avoids unnecessary regeneration or loss of
+legacy media identity. D31 and D32 remain authoritative for T8 audio ownership.
+
+## D37 — Safe suspension and selective reactivation
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9
+
+MASTERED -> DORMANT automatically suspends only active-channel cards.
+Reconciliation never calls `deleteNotes`.
+
+T9 v0 never automatically unsuspends a card. Anki does not expose trustworthy
+card-level provenance proving that a current suspension should be removed by
+T9 rather than preserved as a human decision.
+
+DORMANT -> RELAPSE changes only the failed channel's state. Other dormant
+channels remain DORMANT and remain suspended. If the failed card is suspended,
+T9 reports that selective reactivation is required. Unsuspension requires an
+explicit human-confirmed action, and that action may unsuspend only the failed
+channel's card. Existing or manual suspension must never be silently removed.
+
+RELAPSE -> LEARNING still requires an actual lifecycle review after RELAPSE
+entry. A Unit may therefore legitimately remain with `state_X == RELAPSE` and
+`card_X` still suspended until a human explicitly reactivates the card.
+
+`RELAPSE_REACTIVATE_FAILED_CHANNEL_ONLY` remains `True`.
+`T9_AUTO_UNSUSPEND` is `False` and
+`T9_UNSUSPEND_REQUIRES_HUMAN_CONFIRMATION` is `True`.
+
+Leech remains a note-level rescue signal and never directly causes a lifecycle
+transition. `cardsInfo.lapses` may identify channel-specific rescue candidates,
+but T9 v0 reports rescue diagnostics only. It does not automatically create a
+`VisualCue` or change target flags. Accordingly,
+`T9_LEECH_AUTO_TRANSITION` and `T9_LEECH_AUTOCREATE_VISUAL_CUE` are both
+`False`.
+
+## D38 — Crash-safe two-phase STATE journal
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9, T12
+
+T9 spans two independent persistence boundaries: EventLog and Anki. There is
+no shared transaction. Neither `update Anki -> append event` nor
+`append event -> update Anki` is crash safe by itself.
+
+T9 therefore uses an append-only, two-phase STATE journal in the existing
+EventLog. It does not add SQLite, PostgreSQL, or another registry.
+
+Each logical transition has a deterministic `transition_id`. T9-produced STATE
+records have one of three phases, in order:
+
+```text
+PREPARE
+COMMIT
+ABORT
+```
+
+The closed trigger vocabulary is:
+
+```text
+FIRST_REVIEW
+STABILITY_GATE
+REVIEW_LAPSE
+MASTERY_ASSESSMENT_PASS
+ASSESSMENT_FAIL
+DORMANCY_ELAPSED
+RELAPSE_REVIEW
+```
+
+Every T9-produced STATE payload contains:
+
+```text
+channel
+from
+to
+trigger
+transition_id
+phase
+evidence
+```
+
+`transition_group_id` is optional and is used for coordinated Unit-level
+dormancy. These are producer requirements; the global v1 decoder is unchanged
+so historical STATE records remain readable.
+
+### Deterministic transition identity
+
+`transition_id` is the lowercase full 64-hex SHA-256 digest. It never uses a
+UUID, randomness, Python `hash()`, or a current timestamp as identity entropy.
+
+The canonical identity input contains:
+
+```text
+v
+unit_key
+channel
+from
+to
+trigger
+from_episode_id
+evidence
+```
+
+Canonical bytes are:
+
+```python
+json.dumps(
+    identity,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
+```
+
+and the ID is:
+
+```python
+sha256(canonical_bytes).hexdigest()
+```
+
+The initial NEW episode uses one deterministic sentinel derived from
+`unit_key + channel`. Otherwise `from_episode_id` is the `transition_id` of the
+latest COMMITTED transition that entered the current state.
+
+Evidence must contain stable identifiers sufficient for rerunning the same
+logical decision to produce the same `transition_id`. At minimum:
+
+- FIRST_REVIEW: revlog ID;
+- REVIEW_LAPSE: lapse revlog ID;
+- MASTERY_ASSESSMENT_PASS: qualifying assessment IDs and the decisive
+  assessment ID;
+- ASSESSMENT_FAIL: `assessment_id`;
+- RELAPSE_REVIEW: revlog ID;
+- STABILITY_GATE: first lifecycle review ID, latest lifecycle review ID,
+  latest lifecycle lapse ID or null, current `interval_days`, and eligibility
+  boundary;
+- DORMANCY_ELAPSED: committed MASTERED-entry transition IDs for every active
+  channel, `all_channels_mastered_at`, and eligibility boundary.
+
+### Execution protocol
+
+T9 computes a deterministic TransitionPlan. If the `transition_id` has no
+existing terminal record, T9 appends and fsyncs PREPARE before Anki mutation.
+It then materializes the explicit subset state update, performs required
+automatic side effects (currently only dormancy suspension), reads back the
+required Anki state exactly, and appends COMMIT only after materialization is
+verified.
+
+### Recovery
+
+For PREPARE without COMMIT or ABORT:
+
+- if the old state still exists and the exact frozen evidence still supports
+  the same plan, resume materialization and then COMMIT;
+- if target state and side effects are already present, verify the exact state
+  and then COMMIT;
+- if current state or evidence conflicts with the prepared plan, do not guess
+  and do not overwrite newer state; append ABORT with the same `transition_id`
+  and report a recovery conflict.
+
+Only COMMIT counts as a completed lifecycle transition for reports and future
+state-episode provenance. ABORT never changes lifecycle state.
+
+Repeated reconciliation after COMMIT performs zero duplicate STATE
+transitions, zero duplicate state writes, and zero duplicate suspension calls.
+
+### Unit-level dormancy
+
+A coordinated dormancy operation uses one `transition_group_id` and one member
+`transition_id` per active channel. T9 PREPAREs every member, updates all active
+`state_*` fields in one subset update, suspends the required active cards,
+performs exact readback, and then COMMITs every member. It does not persist an
+aggregate Unit state.

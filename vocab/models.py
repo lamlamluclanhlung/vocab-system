@@ -328,6 +328,20 @@ class ForgeRejection:
 
 
 @dataclass(frozen=True, slots=True)
+class LifecycleAssessment:
+    """One channel-scoped JUDGE observation eligible for T9 evaluation."""
+
+    channel: str
+    passed: bool
+    assessment_id: str
+    stimulus_ref: str
+    novel: bool
+    ts: str
+    model_id: str
+    model_version: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChannelProgress:
     """
     Observed review/assessment state for one enabled target channel.
@@ -339,16 +353,20 @@ class ChannelProgress:
 
     channel: str
     state: str
+    card_id: int
+    template_name: str
+    template_ordinal: int
     interval_days: int
+    lapses_total: int
     lapses_last_30_days: int
     age_days: int
+    is_suspended: bool
 
-    session_passes_consecutive: int = 0
-    last_session_date: str = ""
-    last_session_result: str = "NONE"  # PASS | FAIL | NONE
-
-    encountered_and_failed: bool = False
-    corpus_misuse_detected: bool = False
+    first_lifecycle_review_id: int | None = None
+    latest_lifecycle_review_id: int | None = None
+    latest_lapse_review_id: int | None = None
+    state_episode_id: str = ""
+    assessments: tuple[LifecycleAssessment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,7 +380,7 @@ class UnitProgress:
 
     unit_key: str
     channels: tuple[ChannelProgress, ...] = ()
-    days_all_active_channels_mastered: int = 0
+    all_active_channels_mastered_at: str = ""
     has_leech_tag: bool = False
 
 

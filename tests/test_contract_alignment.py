@@ -177,20 +177,33 @@ def test_card_template_names_map_stably_to_channels() -> None:
 
 
 def test_per_channel_transition_gate_data_lives_on_channel_progress() -> None:
-    channel_field_names = {item.name for item in fields(ChannelProgress)}
-    unit_field_names = {item.name for item in fields(UnitProgress)}
+    channel_field_names = tuple(item.name for item in fields(ChannelProgress))
+    unit_field_names = tuple(item.name for item in fields(UnitProgress))
 
-    per_channel_gate_fields = {
-        "session_passes_consecutive",
-        "last_session_date",
-        "last_session_result",
-        "encountered_and_failed",
-        "corpus_misuse_detected",
-    }
-
-    assert per_channel_gate_fields.issubset(channel_field_names)
-    assert per_channel_gate_fields.isdisjoint(unit_field_names)
-    assert "failed_channels" not in unit_field_names
+    assert channel_field_names == (
+        "channel",
+        "state",
+        "card_id",
+        "template_name",
+        "template_ordinal",
+        "interval_days",
+        "lapses_total",
+        "lapses_last_30_days",
+        "age_days",
+        "is_suspended",
+        "first_lifecycle_review_id",
+        "latest_lifecycle_review_id",
+        "latest_lapse_review_id",
+        "state_episode_id",
+        "assessments",
+    )
+    assert unit_field_names == (
+        "unit_key",
+        "channels",
+        "all_active_channels_mastered_at",
+        "has_leech_tag",
+    )
+    assert "state" not in unit_field_names
 
 def test_anki_note_type_contract_is_stable() -> None:
     assert ANKI_NOTE_TYPE_NAME == "VocabularyUnit"

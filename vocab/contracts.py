@@ -389,6 +389,16 @@ EVENT_PAYLOAD_REQUIRED_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     ),
 }
 
+# Additional producer-level requirements for JUDGE evidence that may gate a
+# T9 lifecycle transition. These are deliberately not unconditional v1 event
+# decoder requirements, so historical/non-lifecycle JUDGE records remain
+# readable.
+LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "assessment_id",
+    "stimulus_ref",
+    "novel",
+)
+
 EVENT_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
     "v",
     "ts",
@@ -418,6 +428,52 @@ EVENT_DAY_FORMAT: Final[str] = "%Y-%m-%d"
 # STATE events are channel-scoped; aggregate state is never persisted.
 STATE_EVENT_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
     EVENT_PAYLOAD_REQUIRED_FIELDS["STATE"]
+)
+
+# T9 producer requirements extend the backwards-compatible generic STATE
+# payload without changing the EVENT_SCHEMA_VERSION=1 decoder contract.
+T9_STATE_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "channel",
+    "from",
+    "to",
+    "trigger",
+    "transition_id",
+    "phase",
+    "evidence",
+)
+
+T9_STATE_OPTIONAL_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "transition_group_id",
+)
+
+T9_STATE_PHASE_PREPARE: Final[str] = "PREPARE"
+T9_STATE_PHASE_COMMIT: Final[str] = "COMMIT"
+T9_STATE_PHASE_ABORT: Final[str] = "ABORT"
+
+T9_STATE_PHASES: Final[tuple[str, ...]] = (
+    T9_STATE_PHASE_PREPARE,
+    T9_STATE_PHASE_COMMIT,
+    T9_STATE_PHASE_ABORT,
+)
+
+STATE_TRIGGER_FIRST_REVIEW: Final[str] = "FIRST_REVIEW"
+STATE_TRIGGER_STABILITY_GATE: Final[str] = "STABILITY_GATE"
+STATE_TRIGGER_REVIEW_LAPSE: Final[str] = "REVIEW_LAPSE"
+STATE_TRIGGER_MASTERY_ASSESSMENT_PASS: Final[str] = (
+    "MASTERY_ASSESSMENT_PASS"
+)
+STATE_TRIGGER_ASSESSMENT_FAIL: Final[str] = "ASSESSMENT_FAIL"
+STATE_TRIGGER_DORMANCY_ELAPSED: Final[str] = "DORMANCY_ELAPSED"
+STATE_TRIGGER_RELAPSE_REVIEW: Final[str] = "RELAPSE_REVIEW"
+
+STATE_TRIGGERS: Final[tuple[str, ...]] = (
+    STATE_TRIGGER_FIRST_REVIEW,
+    STATE_TRIGGER_STABILITY_GATE,
+    STATE_TRIGGER_REVIEW_LAPSE,
+    STATE_TRIGGER_MASTERY_ASSESSMENT_PASS,
+    STATE_TRIGGER_ASSESSMENT_FAIL,
+    STATE_TRIGGER_DORMANCY_ELAPSED,
+    STATE_TRIGGER_RELAPSE_REVIEW,
 )
 
 # ============================================================
@@ -466,6 +522,8 @@ MASTERED_MIN_DELAY_BETWEEN_PASSES_DAYS: Final[int] = 7
 MASTERED_TO_DORMANT_DAYS: Final[int] = 30
 LEECH_LAPSE_THRESHOLD: Final[int] = 4
 PARAMETER_RECALIBRATION_AFTER_DAYS: Final[int] = 90
+
+LIFECYCLE_SECONDS_PER_DAY: Final[int] = 86400
 
 TRANSITION_NEW_TO_LEARNING: Final[tuple[str, str]] = (
     STATE_NEW,
@@ -517,6 +575,15 @@ STATE_TRANSITIONS: Final[tuple[tuple[str, str], ...]] = (
 # Degradation is represented by explicit per-channel state transitions above.
 RELAPSE_REACTIVATE_FAILED_CHANNEL_ONLY: Final[bool] = True
 
+# T9 never silently removes suspension. Reactivation is a separate,
+# human-confirmed action restricted to the failed channel's card.
+T9_AUTO_UNSUSPEND: Final[bool] = False
+T9_UNSUSPEND_REQUIRES_HUMAN_CONFIRMATION: Final[bool] = True
+
+# Leech evidence is diagnostic only in T9 v0.
+T9_LEECH_AUTO_TRANSITION: Final[bool] = False
+T9_LEECH_AUTOCREATE_VISUAL_CUE: Final[bool] = False
+
 # Unit-level dormancy is only valid once every enabled channel has reached
 # MASTERED (and the dormancy timing rule is satisfied by reconcile.py).
 DORMANT_REQUIRES_ALL_ACTIVE_CHANNELS_MASTERED: Final[bool] = True
@@ -526,7 +593,7 @@ DORMANT_REQUIRES_ALL_ACTIVE_CHANNELS_MASTERED: Final[bool] = True
 # 7. RECONCILIATION / RETENTION CONTRACT
 # ============================================================
 
-DORMANT_CLEAR_FIELDS: Final[tuple[str, ...]] = MEDIA_FIELDS
+DORMANT_CLEAR_FIELDS: Final[tuple[str, ...]] = ()
 DORMANT_DELETE_NOTE: Final[bool] = False
 DORMANT_PRESERVE_REVLOG: Final[bool] = True
 
@@ -540,3 +607,21 @@ ANKI_SORT_FIELD: Final[str] = "unit_key"
 ANKI_LEECH_THRESHOLD: Final[int] = LEECH_LAPSE_THRESHOLD
 ANKI_LEECH_ACTION: Final[str] = "tag_only"
 ANKI_LEECH_TAG: Final[str] = "leech"
+
+# Anki revlog type/ease semantics consumed by T9 observation. Cram entries are
+# recognized but are not lifecycle evidence.
+REVLOG_TYPE_LEARNING: Final[int] = 0
+REVLOG_TYPE_REVIEW: Final[int] = 1
+REVLOG_TYPE_RELEARNING: Final[int] = 2
+REVLOG_TYPE_CRAM: Final[int] = 3
+
+REVLOG_LIFECYCLE_TYPES: Final[tuple[int, ...]] = (
+    REVLOG_TYPE_LEARNING,
+    REVLOG_TYPE_REVIEW,
+    REVLOG_TYPE_RELEARNING,
+)
+
+REVLOG_EASE_AGAIN: Final[int] = 1
+
+# Anki cardsInfo queue sentinel. Buried queues are not suspension.
+ANKI_QUEUE_SUSPENDED: Final[int] = -1
