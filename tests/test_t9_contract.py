@@ -48,6 +48,7 @@ from vocab.models import (
     LifecycleAssessment,
     PlannedTransition,
     ReconcileDecision,
+    ReconcileRunResult,
     UnitProgress,
     VocabUnit,
 )
@@ -188,6 +189,19 @@ def test_t9_decision_model_shapes_are_exact() -> None:
     assert ReconcileDecision.__dataclass_params__.frozen is True
     assert "__slots__" in PlannedTransition.__dict__
     assert "__slots__" in ReconcileDecision.__dict__
+
+
+def test_t9_reconcile_run_result_shape_is_exact() -> None:
+    assert field_names(ReconcileRunResult) == (
+        "unit_key",
+        "committed_transition_ids",
+        "recovered_transition_ids",
+        "aborted_transition_ids",
+        "reactivation_required_card_ids",
+        "leech_rescue_channels",
+    )
+    assert ReconcileRunResult.__dataclass_params__.frozen is True
+    assert "__slots__" in ReconcileRunResult.__dict__
 
 
 def test_no_aggregate_lifecycle_state_is_persisted() -> None:

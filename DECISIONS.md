@@ -2082,3 +2082,125 @@ Leech remains diagnostic only. With the leech tag present, channels at or
 above `ANKI_LEECH_THRESHOLD` are reported in channel order; this causes no
 transition, suspension, target change, or VisualCue mutation. A no-op decision
 has empty transitions and suspension IDs while diagnostics may remain present.
+
+## D42 — Recovery-first crash-safe materialization
+
+**Date:** 2026-08-22
+**Status:** Accepted
+**Blocks:** T9.3
+
+The public automatic persistence API is:
+
+```text
+reconcile_unit(note_id, *, anki, event_log, now) -> ReconcileRunResult
+```
+
+Every run performs recovery preflight before normal observation. It resolves
+one unambiguous incomplete T9 operation first. If recovery appends a COMMIT or
+ABORT, or otherwise completes materialization, the run returns or raises its
+recovery result immediately and does not plan another lifecycle edge. A later
+invocation obtains a fresh observation.
+
+### Run result
+
+`ReconcileRunResult` contains the Unit key, every transition ID COMMITTED in
+the current run, the subset recovered from PREPARE records that predated the
+run, transition IDs ABORTED while resolving recovery conflicts, required
+manual-reactivation card IDs, and leech rescue channels. A no-op has empty
+transition-ID tuples. Pure-decision diagnostics remain visible.
+
+### Journal validation and uncertainty
+
+One helper converts a frozen `PlannedTransition` and phase into the exact T9
+STATE payload. The optional group ID is emitted only when non-empty. Before
+the first PREPARE, materialization independently revalidates the lifecycle
+edge, trigger, transition digest, optional group digest, group membership,
+and canonical JSON evidence. This detects mutation of the otherwise mutable
+evidence dictionary after T9.2.
+
+EventLog remains the only journal and its existing flush/fsync append boundary
+is authoritative. PREPARE is durable before any Anki mutation. Transport,
+Anki-update, readback, or COMMIT-append uncertainty after PREPARE never causes
+an automatic ABORT; the PREPARE remains for deterministic recovery.
+
+### Normal independent transitions
+
+Independent plans execute in `CHANNELS` order. Each appends PREPARE, updates
+only its `state_X` field, verifies exact note readback, and then appends COMMIT.
+Failure of a later channel does not roll back an earlier COMMIT.
+
+### Normal coordinated dormancy
+
+A dormancy decision is one group. Every member is MASTERED to DORMANT with the
+same verified group ID and exact ordered suspension set. All PREPARE records
+are appended before one subset update containing only active `state_X` fields.
+Every state is read back before suspension. All required cards are then
+suspended and read back with `queue == ANKI_QUEUE_SUSPENDED` before any member
+COMMIT is appended. No media, target, identity, or revlog field is changed.
+
+### Pending discovery
+
+Recovery uses the D39 parser and identity checks. Historical pre-D38 STATE
+records remain non-journal history. A pending transaction has PREPARE and no
+terminal. The only supported incomplete shape is one ungrouped transaction or
+one dormancy group, which may have a partial/all PREPARE set and may include
+already COMMITTED members. Multiple unrelated ungrouped operations, multiple
+groups, or grouped/ungrouped mixtures fail closed.
+
+### Source-state recovery
+
+When the exact source state remains persisted, recovery performs normal
+trustworthy observation and pure decision again. The fresh plan must reproduce
+the exact pending transition ID, or for dormancy the exact group ID and member
+identities. If it matches, existing PREPARE records are not duplicated;
+missing dormancy member PREPAREs are appended before coordinated
+materialization, readback, and pending-member COMMITs.
+
+If fresh evidence no longer reproduces the prepared identity, recovery appends
+ABORT for currently pending prepared members only, performs no Anki mutation,
+and reports a recovery conflict. A failed ABORT append is propagated rather
+than hidden.
+
+### Target-state recovery
+
+When the exact ungrouped target already exists, recovery verifies it and
+appends COMMIT without repeating the state update. DORMANT to RELAPSE never
+unsuspends automatically.
+
+When every dormancy target state already exists, recovery verifies every state
+and current queue, suspends only cards not already suspended, verifies all
+queues, preserves existing member COMMITs, and appends only missing COMMITs.
+This covers crashes after the state update, after suspension, or partway
+through member COMMIT appends.
+
+Persisted state that is neither the exact source nor exact target, including a
+mixed dormancy source/target pattern, is a recovery conflict. Recovery does not
+guess, roll back, or overwrite newer state. It ABORTs still-pending prepared
+members where safe and leaves already COMMITTED members untouched.
+
+### Exact readback and reactivation
+
+State readback requires exactly the requested VocabularyUnit note and exact
+expected state-field values. Card readback requires exact requested card IDs,
+note ownership, actual integer queues, and the required suspension state.
+
+Automatic reconciliation never calls `unsuspend`. Human-confirmed selective
+reactivation is the separate API:
+
+```text
+reactivate_relapse_channel(
+    note_id,
+    channel,
+    *,
+    anki,
+    event_log,
+    now,
+    confirmed,
+) -> bool
+```
+
+Only literal `confirmed is True` may proceed. Trustworthy observation must show
+the requested active channel in RELAPSE. An already-active card returns
+`False`. Otherwise exactly that card is unsuspended and exact card readback
+must prove it is no longer suspended before returning `True`. This emits no
+STATE event; RELAPSE to LEARNING still requires a later lifecycle review.

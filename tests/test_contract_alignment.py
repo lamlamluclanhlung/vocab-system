@@ -29,6 +29,7 @@ from vocab.models import (
     ForgeCandidate,
     PlannedTransition,
     ReconcileDecision,
+    ReconcileRunResult,
     UnitProgress,
     VocabUnit,
 )
@@ -236,6 +237,16 @@ def test_reconcile_decision_does_not_persist_aggregate_state() -> None:
         "leech_rescue_channels",
     )
     assert "state" not in decision_fields
+    run_result_fields = tuple(item.name for item in fields(ReconcileRunResult))
+    assert run_result_fields == (
+        "unit_key",
+        "committed_transition_ids",
+        "recovered_transition_ids",
+        "aborted_transition_ids",
+        "reactivation_required_card_ids",
+        "leech_rescue_channels",
+    )
+    assert "state" not in run_result_fields
 
 def test_anki_note_type_contract_is_stable() -> None:
     assert ANKI_NOTE_TYPE_NAME == "VocabularyUnit"

@@ -412,6 +412,18 @@ class ReconcileDecision:
     leech_rescue_channels: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ReconcileRunResult:
+    """Materialization/recovery outcome for one automatic reconciliation run."""
+
+    unit_key: str
+    committed_transition_ids: tuple[str, ...] = ()
+    recovered_transition_ids: tuple[str, ...] = ()
+    aborted_transition_ids: tuple[str, ...] = ()
+    reactivation_required_card_ids: tuple[int, ...] = ()
+    leech_rescue_channels: tuple[str, ...] = ()
+
+
 # ============================================================
 # 6. ENCOUNTER DATA
 # ============================================================

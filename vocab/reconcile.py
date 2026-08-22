@@ -2,7 +2,8 @@
 
 T9.1 transforms explicit Anki and EventLog reads into ``UnitProgress``.
 T9.2 transforms that frozen snapshot into ``ReconcileDecision`` without I/O
-or persistence.
+or persistence. T9.3 durably journals and materializes those plans with
+recovery before normal observation.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from .contracts import (
     STATE_NEW,
     STATE_RELAPSE,
     STATE_STABLE,
+    STATE_FIELD_BY_CHANNEL,
     STATE_TRIGGER_ASSESSMENT_FAIL,
     STATE_TRIGGER_DORMANCY_ELAPSED,
     STATE_TRIGGER_FIRST_REVIEW,
@@ -70,6 +72,7 @@ from .models import (
     LifecycleAssessment,
     PlannedTransition,
     ReconcileDecision,
+    ReconcileRunResult,
     UnitProgress,
     VocabUnit,
 )
@@ -79,6 +82,16 @@ from .validators import validate_forge_unit
 class _EventLogReader(Protocol):
     def read(self) -> list[Event]:
         """Return decoded events without writing."""
+
+
+class _EventLogJournal(_EventLogReader, Protocol):
+    def log(
+        self,
+        event: str,
+        unit_key: str,
+        payload: dict[str, Any],
+    ) -> Event:
+        """Durably append one validated event."""
 
 
 class ReconcileObservationError(RuntimeError):
@@ -103,6 +116,31 @@ class ReconcileEventHistoryError(ReconcileObservationError):
 
 class ReconcileDecisionError(ValueError):
     """A pure decision input is structurally impossible or ambiguous."""
+
+
+class ReconcileMaterializationError(RuntimeError):
+    """A journal or Anki materialization boundary could not be verified."""
+
+
+class ReconcileRecoveryError(ReconcileMaterializationError):
+    """An incomplete T9 journal operation cannot be safely recovered."""
+
+
+class ReconcileRecoveryConflictError(ReconcileRecoveryError):
+    """Persisted state or fresh evidence conflicts with a pending operation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        aborted_transition_ids: tuple[str, ...] = (),
+    ) -> None:
+        self.aborted_transition_ids = aborted_transition_ids
+        super().__init__(message)
+
+
+class ReconcileReactivationError(RuntimeError):
+    """A requested human-confirmed selective reactivation is unsafe."""
 
 
 _KNOWN_REVLOG_TYPES = frozenset(
@@ -321,6 +359,100 @@ def decide_transitions(
         reactivation_required_card_ids=tuple(reactivation_required),
         leech_rescue_channels=leech_rescue_channels,
     )
+
+
+def reconcile_unit(
+    note_id: int,
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogJournal,
+    now: datetime,
+) -> ReconcileRunResult:
+    """Recover first, otherwise observe, decide, and durably materialize."""
+    now_utc = _decision_now(now)
+    unit, card_ids, _has_leech_tag = _load_note(note_id, anki)
+    recovered = _recover_pending_operation(
+        note_id,
+        unit,
+        card_ids,
+        anki=anki,
+        event_log=event_log,
+        now_utc=now_utc,
+    )
+    if recovered is not None:
+        return recovered
+
+    progress = observe_unit(
+        note_id,
+        anki=anki,
+        event_log=event_log,
+        now=now_utc,
+    )
+    decision = decide_transitions(progress, now=now_utc)
+    return _materialize_decision(
+        note_id,
+        progress,
+        decision,
+        anki=anki,
+        event_log=event_log,
+    )
+
+
+def reactivate_relapse_channel(
+    note_id: int,
+    channel: str,
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogReader,
+    now: datetime,
+    confirmed: bool,
+) -> bool:
+    """Unsuspend one confirmed RELAPSE card without changing lifecycle state."""
+    if confirmed is not True:
+        raise ReconcileReactivationError(
+            "reactivation requires literal confirmed=True"
+        )
+    if channel not in CHANNELS:
+        raise ReconcileReactivationError("reactivation channel is invalid")
+
+    progress = observe_unit(
+        note_id,
+        anki=anki,
+        event_log=event_log,
+        now=now,
+    )
+    selected = next(
+        (item for item in progress.channels if item.channel == channel),
+        None,
+    )
+    if selected is None:
+        raise ReconcileReactivationError(
+            f"channel {channel} is not active for the requested Unit"
+        )
+    if selected.state != STATE_RELAPSE:
+        raise ReconcileReactivationError(
+            f"channel {channel} must be RELAPSE before reactivation"
+        )
+    if not selected.is_suspended:
+        return False
+
+    try:
+        anki.unsuspend([selected.card_id])
+    except Exception as exc:
+        raise ReconcileReactivationError(
+            f"unsuspend failed for channel {channel}"
+        ) from exc
+    queues = _read_card_queues(
+        note_id,
+        (selected.card_id,),
+        anki,
+        error_type=ReconcileReactivationError,
+    )
+    if queues[selected.card_id] == ANKI_QUEUE_SUSPENDED:
+        raise ReconcileReactivationError(
+            f"card {selected.card_id} remained suspended after reactivation"
+        )
+    return True
 
 
 def _decision_now(now: datetime) -> datetime:
@@ -750,6 +882,1057 @@ def _dormancy_transitions(
         )
         for channel, plan in member_plans.items()
     }
+
+
+def _state_payload(
+    plan: PlannedTransition,
+    phase: str,
+) -> dict[str, Any]:
+    if phase not in (
+        T9_STATE_PHASE_PREPARE,
+        T9_STATE_PHASE_COMMIT,
+        T9_STATE_PHASE_ABORT,
+    ):
+        raise ReconcileMaterializationError("STATE journal phase is invalid")
+    evidence = json.loads(
+        json.dumps(
+            plan.evidence,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    payload: dict[str, Any] = {
+        "channel": plan.channel,
+        "from": plan.from_state,
+        "to": plan.to_state,
+        "trigger": plan.trigger,
+        "transition_id": plan.transition_id,
+        "from_episode_id": plan.from_episode_id,
+        "phase": phase,
+        "evidence": evidence,
+    }
+    if plan.transition_group_id:
+        payload["transition_group_id"] = plan.transition_group_id
+    return payload
+
+
+def _freeze_validated_plan(
+    unit_key: str,
+    plan: PlannedTransition,
+) -> PlannedTransition:
+    if not isinstance(plan, PlannedTransition):
+        raise ReconcileMaterializationError(
+            "decision transitions must contain PlannedTransition values"
+        )
+    if plan.channel not in CHANNELS:
+        raise ReconcileMaterializationError("planned channel is invalid")
+    if (plan.from_state, plan.to_state) not in STATE_TRANSITIONS:
+        raise ReconcileMaterializationError("planned lifecycle edge is invalid")
+    if plan.trigger not in STATE_TRIGGERS:
+        raise ReconcileMaterializationError("planned trigger is invalid")
+    if not isinstance(plan.from_episode_id, str) or not plan.from_episode_id:
+        raise ReconcileMaterializationError(
+            "planned from_episode_id must be non-empty"
+        )
+    if not isinstance(plan.evidence, dict):
+        raise ReconcileMaterializationError("planned evidence must be an object")
+    try:
+        canonical_evidence = json.dumps(
+            plan.evidence,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        frozen_evidence = json.loads(canonical_evidence)
+    except (TypeError, ValueError) as exc:
+        raise ReconcileMaterializationError(
+            "planned evidence must be canonical JSON data"
+        ) from exc
+    if not isinstance(frozen_evidence, dict):
+        raise ReconcileMaterializationError("planned evidence must remain an object")
+    expected_transition_id = _transition_id(
+        version=EVENT_SCHEMA_VERSION,
+        unit_key=unit_key,
+        channel=plan.channel,
+        from_state=plan.from_state,
+        to_state=plan.to_state,
+        trigger=plan.trigger,
+        from_episode_id=plan.from_episode_id,
+        evidence=frozen_evidence,
+    )
+    if (
+        not isinstance(plan.transition_id, str)
+        or not _TRANSITION_ID_RE.fullmatch(plan.transition_id)
+        or plan.transition_id != expected_transition_id
+    ):
+        raise ReconcileMaterializationError(
+            "planned transition_id does not match its canonical identity"
+        )
+    if not isinstance(plan.transition_group_id, str):
+        raise ReconcileMaterializationError(
+            "planned transition_group_id must be a string"
+        )
+    if plan.transition_group_id and not _TRANSITION_ID_RE.fullmatch(
+        plan.transition_group_id
+    ):
+        raise ReconcileMaterializationError(
+            "planned transition_group_id must be a full lowercase SHA-256 digest"
+        )
+    return PlannedTransition(
+        channel=plan.channel,
+        from_state=plan.from_state,
+        to_state=plan.to_state,
+        trigger=plan.trigger,
+        from_episode_id=plan.from_episode_id,
+        evidence=frozen_evidence,
+        transition_id=plan.transition_id,
+        transition_group_id=plan.transition_group_id,
+    )
+
+
+def _validate_materialization_decision(
+    progress: UnitProgress,
+    decision: ReconcileDecision,
+) -> tuple[PlannedTransition, ...]:
+    if not isinstance(decision, ReconcileDecision):
+        raise ReconcileMaterializationError("decision must be ReconcileDecision")
+    if decision.unit_key != progress.unit_key:
+        raise ReconcileMaterializationError(
+            "decision unit_key does not match observed progress"
+        )
+    if not isinstance(decision.transitions, tuple):
+        raise ReconcileMaterializationError("decision transitions must be a tuple")
+
+    progress_by_channel = {item.channel: item for item in progress.channels}
+    frozen_plans: list[PlannedTransition] = []
+    seen_channels: set[str] = set()
+    last_channel_index = -1
+    for plan in decision.transitions:
+        frozen = _freeze_validated_plan(progress.unit_key, plan)
+        if frozen.channel in seen_channels:
+            raise ReconcileMaterializationError(
+                f"decision duplicates channel {frozen.channel}"
+            )
+        channel_index = CHANNELS.index(frozen.channel)
+        if channel_index <= last_channel_index:
+            raise ReconcileMaterializationError(
+                "decision transitions are not in frozen channel order"
+            )
+        last_channel_index = channel_index
+        seen_channels.add(frozen.channel)
+        observed = progress_by_channel.get(frozen.channel)
+        if observed is None:
+            raise ReconcileMaterializationError(
+                f"planned channel {frozen.channel} is not active"
+            )
+        if (
+            frozen.from_state != observed.state
+            or frozen.from_episode_id != observed.state_episode_id
+        ):
+            raise ReconcileMaterializationError(
+                f"planned source identity is stale for {frozen.channel}"
+            )
+        frozen_plans.append(frozen)
+
+    plans = tuple(frozen_plans)
+    grouped = tuple(plan for plan in plans if plan.transition_group_id)
+    if grouped:
+        if len(grouped) != len(plans):
+            raise ReconcileMaterializationError(
+                "grouped and ungrouped transitions cannot be mixed"
+            )
+        _validate_dormancy_group(progress.unit_key, plans)
+        expected_suspend_ids = tuple(
+            progress_by_channel[plan.channel].card_id for plan in plans
+        )
+        if decision.suspend_card_ids != expected_suspend_ids:
+            raise ReconcileMaterializationError(
+                "dormancy suspension IDs do not match member channel order"
+            )
+    elif decision.suspend_card_ids:
+        raise ReconcileMaterializationError(
+            "only a dormancy group may request automatic suspension"
+        )
+    return plans
+
+
+def _validate_dormancy_group(
+    unit_key: str,
+    plans: Sequence[PlannedTransition],
+) -> None:
+    if not plans:
+        raise ReconcileMaterializationError("dormancy group cannot be empty")
+    group_ids = {plan.transition_group_id for plan in plans}
+    if len(group_ids) != 1 or not next(iter(group_ids)):
+        raise ReconcileMaterializationError(
+            "dormancy members must share one non-empty group ID"
+        )
+    canonical_evidence = json.dumps(
+        plans[0].evidence,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    evidence = plans[0].evidence
+    if set(evidence) != {
+        "mastered_entry_transition_ids",
+        "all_channels_mastered_at",
+        "eligibility_boundary",
+    }:
+        raise ReconcileMaterializationError(
+            "dormancy evidence shape is invalid"
+        )
+    mastered_entry_ids = evidence["mastered_entry_transition_ids"]
+    member_channels = tuple(plan.channel for plan in plans)
+    if (
+        not isinstance(mastered_entry_ids, dict)
+        or set(mastered_entry_ids) != set(member_channels)
+        or any(
+            mastered_entry_ids.get(plan.channel) != plan.from_episode_id
+            for plan in plans
+        )
+    ):
+        raise ReconcileMaterializationError(
+            "dormancy evidence does not match member episode identity"
+        )
+    if any(
+        not isinstance(evidence[field_name], str)
+        or not cast(str, evidence[field_name])
+        for field_name in ("all_channels_mastered_at", "eligibility_boundary")
+    ):
+        raise ReconcileMaterializationError(
+            "dormancy temporal evidence must be non-empty strings"
+        )
+    for plan in plans:
+        if (
+            plan.from_state != STATE_MASTERED
+            or plan.to_state != STATE_DORMANT
+            or plan.trigger != STATE_TRIGGER_DORMANCY_ELAPSED
+        ):
+            raise ReconcileMaterializationError(
+                "grouped transition is not MASTERED to DORMANT"
+            )
+        if json.dumps(
+            plan.evidence,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) != canonical_evidence:
+            raise ReconcileMaterializationError(
+                "dormancy member evidence must be identical"
+            )
+    expected_group_id = _canonical_sha256(
+        {
+            "kind": T9_DORMANCY_GROUP_KIND,
+            "unit_key": unit_key,
+            "member_transition_ids": sorted(
+                plan.transition_id for plan in plans
+            ),
+        }
+    )
+    if next(iter(group_ids)) != expected_group_id:
+        raise ReconcileMaterializationError(
+            "dormancy transition_group_id does not match member identity"
+        )
+
+
+def _materialize_decision(
+    note_id: int,
+    progress: UnitProgress,
+    decision: ReconcileDecision,
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogJournal,
+) -> ReconcileRunResult:
+    plans = _validate_materialization_decision(progress, decision)
+    if not plans:
+        return ReconcileRunResult(
+            unit_key=progress.unit_key,
+            reactivation_required_card_ids=(
+                decision.reactivation_required_card_ids
+            ),
+            leech_rescue_channels=decision.leech_rescue_channels,
+        )
+
+    committed: list[str] = []
+    if plans[0].transition_group_id:
+        _materialize_dormancy_plans(
+            note_id,
+            progress.unit_key,
+            plans,
+            decision.suspend_card_ids,
+            anki=anki,
+            event_log=event_log,
+            prepare_ids={plan.transition_id for plan in plans},
+            commit_ids={plan.transition_id for plan in plans},
+        )
+        committed.extend(plan.transition_id for plan in plans)
+    else:
+        for plan in plans:
+            _materialize_ungrouped_plan(
+                note_id,
+                progress.unit_key,
+                plan,
+                anki=anki,
+                event_log=event_log,
+                append_prepare=True,
+            )
+            committed.append(plan.transition_id)
+
+    return ReconcileRunResult(
+        unit_key=progress.unit_key,
+        committed_transition_ids=tuple(committed),
+        reactivation_required_card_ids=(
+            decision.reactivation_required_card_ids
+        ),
+        leech_rescue_channels=decision.leech_rescue_channels,
+    )
+
+
+def _materialize_ungrouped_plan(
+    note_id: int,
+    unit_key: str,
+    plan: PlannedTransition,
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogJournal,
+    append_prepare: bool,
+) -> None:
+    if append_prepare:
+        _append_state_event(
+            event_log,
+            unit_key,
+            plan,
+            T9_STATE_PHASE_PREPARE,
+        )
+    state_updates = {STATE_FIELD_BY_CHANNEL[plan.channel]: plan.to_state}
+    _update_note_states(note_id, state_updates, anki)
+    _verify_note_states(note_id, state_updates, anki)
+    _append_state_event(
+        event_log,
+        unit_key,
+        plan,
+        T9_STATE_PHASE_COMMIT,
+    )
+
+
+def _materialize_dormancy_plans(
+    note_id: int,
+    unit_key: str,
+    plans: Sequence[PlannedTransition],
+    suspend_card_ids: Sequence[int],
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogJournal,
+    prepare_ids: set[str],
+    commit_ids: set[str],
+) -> None:
+    for plan in plans:
+        if plan.transition_id in prepare_ids:
+            _append_state_event(
+                event_log,
+                unit_key,
+                plan,
+                T9_STATE_PHASE_PREPARE,
+            )
+
+    state_updates = {
+        STATE_FIELD_BY_CHANNEL[plan.channel]: plan.to_state for plan in plans
+    }
+    _update_note_states(note_id, state_updates, anki)
+    _verify_note_states(note_id, state_updates, anki)
+    _suspend_cards(tuple(suspend_card_ids), anki)
+    queues = _read_card_queues(
+        note_id,
+        tuple(suspend_card_ids),
+        anki,
+        error_type=ReconcileMaterializationError,
+    )
+    if any(
+        queues[card_id] != ANKI_QUEUE_SUSPENDED
+        for card_id in suspend_card_ids
+    ):
+        raise ReconcileMaterializationError(
+            "dormancy card readback did not verify suspension"
+        )
+
+    for plan in plans:
+        if plan.transition_id in commit_ids:
+            _append_state_event(
+                event_log,
+                unit_key,
+                plan,
+                T9_STATE_PHASE_COMMIT,
+            )
+
+
+def _append_state_event(
+    event_log: _EventLogJournal,
+    unit_key: str,
+    plan: PlannedTransition,
+    phase: str,
+) -> None:
+    payload = _state_payload(plan, phase)
+    try:
+        event_log.log("STATE", unit_key, payload)
+    except Exception as exc:
+        raise ReconcileMaterializationError(
+            f"STATE {phase} append failed for {plan.transition_id}"
+        ) from exc
+
+
+def _update_note_states(
+    note_id: int,
+    state_updates: Mapping[str, str],
+    anki: AnkiConnectClient,
+) -> None:
+    if not state_updates or any(
+        field_name not in STATE_FIELD_BY_CHANNEL.values()
+        for field_name in state_updates
+    ):
+        raise ReconcileMaterializationError(
+            "T9 state update must contain only explicit state_* fields"
+        )
+    try:
+        anki.update_note_fields(note_id, dict(state_updates))
+    except Exception as exc:
+        raise ReconcileMaterializationError("Anki state update failed") from exc
+
+
+def _verify_note_states(
+    note_id: int,
+    expected_states: Mapping[str, str],
+    anki: AnkiConnectClient,
+) -> None:
+    try:
+        notes = anki.notes_info([note_id])
+    except Exception as exc:
+        raise ReconcileMaterializationError("state notesInfo readback failed") from exc
+    if not isinstance(notes, list) or len(notes) != 1:
+        raise ReconcileMaterializationError(
+            "state readback must return exactly one note"
+        )
+    note = notes[0]
+    if not isinstance(note, Mapping):
+        raise ReconcileMaterializationError("state readback note must be an object")
+    if type(note.get("noteId")) is not int or note.get("noteId") != note_id:
+        raise ReconcileMaterializationError("state readback returned another note")
+    if note.get("modelName") != ANKI_NOTE_TYPE_NAME:
+        raise ReconcileMaterializationError(
+            "state readback note type is not VocabularyUnit"
+        )
+    fields = note.get("fields")
+    if not isinstance(fields, Mapping):
+        raise ReconcileMaterializationError("state readback fields are malformed")
+    for field_name, expected_value in expected_states.items():
+        field = fields.get(field_name)
+        if not isinstance(field, Mapping) or field.get("value") != expected_value:
+            raise ReconcileMaterializationError(
+                f"state readback mismatch for {field_name}"
+            )
+
+
+def _read_card_queues(
+    note_id: int,
+    card_ids: tuple[int, ...],
+    anki: AnkiConnectClient,
+    *,
+    error_type: type[RuntimeError],
+) -> dict[int, int]:
+    try:
+        rows = anki.cards_info(list(card_ids))
+    except Exception as exc:
+        raise error_type("cardsInfo queue readback failed") from exc
+    if not isinstance(rows, list) or len(rows) != len(card_ids):
+        raise error_type("cardsInfo queue readback cardinality mismatch")
+    expected_ids = set(card_ids)
+    queues: dict[int, int] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise error_type("cardsInfo queue row must be an object")
+        card_id = row.get("cardId")
+        card_note_id = row.get("note")
+        queue = row.get("queue")
+        if type(card_id) is not int or card_id not in expected_ids:
+            raise error_type("cardsInfo queue readback returned an unknown card")
+        if card_id in queues:
+            raise error_type("cardsInfo queue readback duplicated a card")
+        if type(card_note_id) is not int or card_note_id != note_id:
+            raise error_type("cardsInfo queue readback returned a foreign note")
+        if type(queue) is not int:
+            raise error_type("cardsInfo queue must be an actual integer")
+        queues[card_id] = queue
+    if set(queues) != expected_ids:
+        raise error_type("cardsInfo queue readback omitted a card")
+    return queues
+
+
+def _suspend_cards(
+    card_ids: tuple[int, ...],
+    anki: AnkiConnectClient,
+) -> None:
+    if not card_ids:
+        return
+    try:
+        result = anki.suspend(list(card_ids))
+    except Exception as exc:
+        raise ReconcileMaterializationError("Anki suspension failed") from exc
+    if result is not True:
+        raise ReconcileMaterializationError(
+            "Anki suspension did not confirm success"
+        )
+
+
+def _recover_pending_operation(
+    note_id: int,
+    unit: VocabUnit,
+    card_ids: tuple[int, ...],
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogJournal,
+    now_utc: datetime,
+) -> ReconcileRunResult | None:
+    transactions = _read_recovery_transactions(
+        unit.unit_key,
+        event_log,
+        now_utc,
+    )
+    pending = {
+        transition_id: transaction
+        for transition_id, transaction in transactions.items()
+        if transaction["terminal_phase"] is None
+    }
+    if not pending:
+        return None
+
+    pending_group_ids = {
+        cast(Mapping[str, Any], transaction["prepare"])[
+            "transition_group_id"
+        ]
+        for transaction in pending.values()
+    }
+    if pending_group_ids == {None}:
+        if len(pending) != 1:
+            raise ReconcileRecoveryError(
+                "multiple unrelated ungrouped pending transitions are ambiguous"
+            )
+        transition_id, transaction = next(iter(pending.items()))
+        plan = _plan_from_prepare(
+            unit.unit_key,
+            cast(Mapping[str, Any], transaction["prepare"]),
+        )
+        if plan.transition_id != transition_id or plan.transition_group_id:
+            raise ReconcileRecoveryError(
+                "ungrouped pending transition identity is inconsistent"
+            )
+        cards_by_channel = _load_recovery_cards(
+            note_id,
+            unit,
+            card_ids,
+            anki,
+        )
+        return _recover_ungrouped(
+            note_id,
+            unit,
+            plan,
+            cards_by_channel,
+            anki=anki,
+            event_log=event_log,
+            now_utc=now_utc,
+        )
+
+    if None in pending_group_ids or len(pending_group_ids) != 1:
+        raise ReconcileRecoveryError(
+            "grouped and ungrouped or multiple pending groups are ambiguous"
+        )
+    group_id = cast(str, next(iter(pending_group_ids)))
+    group_transactions = {
+        transition_id: transaction
+        for transition_id, transaction in transactions.items()
+        if cast(Mapping[str, Any], transaction["prepare"])[
+            "transition_group_id"
+        ]
+        == group_id
+    }
+    plans, transactions_by_channel = _reconstruct_dormancy_group(
+        unit.unit_key,
+        group_id,
+        group_transactions,
+    )
+    active_channels = tuple(unit.active_channel_states())
+    if tuple(plan.channel for plan in plans) != active_channels:
+        raise ReconcileRecoveryError(
+            "pending dormancy members do not match every active channel"
+        )
+    cards_by_channel = _load_recovery_cards(
+        note_id,
+        unit,
+        card_ids,
+        anki,
+    )
+    return _recover_dormancy_group(
+        note_id,
+        unit,
+        plans,
+        transactions_by_channel,
+        cards_by_channel,
+        anki=anki,
+        event_log=event_log,
+        now_utc=now_utc,
+    )
+
+
+def _read_recovery_transactions(
+    unit_key: str,
+    event_log: _EventLogReader,
+    now_utc: datetime,
+) -> dict[str, dict[str, object]]:
+    try:
+        events = event_log.read()
+    except Exception as exc:
+        raise ReconcileRecoveryError("EventLog recovery scan failed") from exc
+    if not isinstance(events, list) or any(
+        not isinstance(event, Event) for event in events
+    ):
+        raise ReconcileRecoveryError(
+            "EventLog recovery scan must return Event values"
+        )
+    records: list[Mapping[str, Any]] = []
+    try:
+        for index, event in enumerate(events):
+            if event.unit_key != unit_key or event.event != "STATE":
+                continue
+            record = _journal_record(event, index, now_utc)
+            if record is not None:
+                records.append(record)
+        return _journal_transactions(records)
+    except ReconcileEventHistoryError as exc:
+        raise ReconcileRecoveryError(
+            "T9 recovery journal failed D39 verification"
+        ) from exc
+
+
+def _load_recovery_cards(
+    note_id: int,
+    unit: VocabUnit,
+    card_ids: tuple[int, ...],
+    anki: AnkiConnectClient,
+) -> dict[str, dict[str, Any]]:
+    try:
+        model_snapshot = anki.verified_note_type_snapshot()
+    except Exception as exc:
+        raise ReconcileRecoveryError(
+            "VocabularyUnit model cannot be verified for recovery"
+        ) from exc
+    ordinal_to_template = _verified_ordinal_map(model_snapshot)
+    try:
+        return _load_cards(
+            note_id,
+            unit,
+            card_ids,
+            ordinal_to_template,
+            anki,
+        )
+    except ReconcileObservationError as exc:
+        raise ReconcileRecoveryError(
+            "card attribution cannot be verified for recovery"
+        ) from exc
+
+
+def _plan_from_prepare(
+    unit_key: str,
+    record: Mapping[str, Any],
+) -> PlannedTransition:
+    plan = PlannedTransition(
+        channel=cast(str, record["channel"]),
+        from_state=cast(str, record["from"]),
+        to_state=cast(str, record["to"]),
+        trigger=cast(str, record["trigger"]),
+        from_episode_id=cast(str, record["from_episode_id"]),
+        evidence=dict(cast(Mapping[str, Any], record["evidence"])),
+        transition_id=cast(str, record["transition_id"]),
+        transition_group_id=(
+            ""
+            if record["transition_group_id"] is None
+            else cast(str, record["transition_group_id"])
+        ),
+    )
+    return _freeze_validated_plan(unit_key, plan)
+
+
+def _recover_ungrouped(
+    note_id: int,
+    unit: VocabUnit,
+    prepared_plan: PlannedTransition,
+    cards_by_channel: Mapping[str, Mapping[str, Any]],
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogJournal,
+    now_utc: datetime,
+) -> ReconcileRunResult:
+    current_state = unit.active_channel_states().get(prepared_plan.channel)
+    if current_state == prepared_plan.from_state:
+        progress = observe_unit(
+            note_id,
+            anki=anki,
+            event_log=event_log,
+            now=now_utc,
+        )
+        decision = decide_transitions(progress, now=now_utc)
+        fresh_plans = _validate_materialization_decision(progress, decision)
+        matching = next(
+            (
+                plan
+                for plan in fresh_plans
+                if plan.transition_id == prepared_plan.transition_id
+            ),
+            None,
+        )
+        if matching is None or matching.transition_group_id:
+            aborted = _abort_prepared_plans(
+                unit.unit_key,
+                (prepared_plan,),
+                event_log,
+            )
+            raise ReconcileRecoveryConflictError(
+                "fresh decision no longer reproduces pending transition",
+                aborted_transition_ids=aborted,
+            )
+        _materialize_ungrouped_plan(
+            note_id,
+            unit.unit_key,
+            matching,
+            anki=anki,
+            event_log=event_log,
+            append_prepare=False,
+        )
+        return ReconcileRunResult(
+            unit_key=unit.unit_key,
+            committed_transition_ids=(matching.transition_id,),
+            recovered_transition_ids=(matching.transition_id,),
+            reactivation_required_card_ids=(
+                decision.reactivation_required_card_ids
+            ),
+            leech_rescue_channels=decision.leech_rescue_channels,
+        )
+
+    if current_state == prepared_plan.to_state:
+        _verify_note_states(
+            note_id,
+            {STATE_FIELD_BY_CHANNEL[prepared_plan.channel]: prepared_plan.to_state},
+            anki,
+        )
+        _append_state_event(
+            event_log,
+            unit.unit_key,
+            prepared_plan,
+            T9_STATE_PHASE_COMMIT,
+        )
+        reactivation_required: tuple[int, ...] = ()
+        if (
+            prepared_plan.from_state == STATE_DORMANT
+            and prepared_plan.to_state == STATE_RELAPSE
+        ):
+            card = cards_by_channel.get(prepared_plan.channel)
+            if card is None:
+                raise ReconcileRecoveryError(
+                    "failed RELAPSE channel card is missing during recovery"
+                )
+            if cast(bool, card["is_suspended"]):
+                reactivation_required = (cast(int, card["card_id"]),)
+        return ReconcileRunResult(
+            unit_key=unit.unit_key,
+            committed_transition_ids=(prepared_plan.transition_id,),
+            recovered_transition_ids=(prepared_plan.transition_id,),
+            reactivation_required_card_ids=reactivation_required,
+        )
+
+    aborted = _abort_prepared_plans(
+        unit.unit_key,
+        (prepared_plan,),
+        event_log,
+    )
+    raise ReconcileRecoveryConflictError(
+        "persisted channel state is neither pending source nor target",
+        aborted_transition_ids=aborted,
+    )
+
+
+def _reconstruct_dormancy_group(
+    unit_key: str,
+    group_id: str,
+    transactions: Mapping[str, Mapping[str, object]],
+) -> tuple[
+    tuple[PlannedTransition, ...],
+    dict[str, Mapping[str, object]],
+]:
+    if not transactions:
+        raise ReconcileRecoveryError("pending dormancy group is empty")
+    first_transaction = next(iter(transactions.values()))
+    first_record = cast(Mapping[str, Any], first_transaction["prepare"])
+    evidence = dict(cast(Mapping[str, Any], first_record["evidence"]))
+    if set(evidence) != {
+        "mastered_entry_transition_ids",
+        "all_channels_mastered_at",
+        "eligibility_boundary",
+    }:
+        raise ReconcileRecoveryError("pending dormancy evidence shape is invalid")
+    mastered_entry_ids = evidence["mastered_entry_transition_ids"]
+    if not isinstance(mastered_entry_ids, dict) or not mastered_entry_ids:
+        raise ReconcileRecoveryError(
+            "pending dormancy member episode mapping is invalid"
+        )
+    if any(
+        channel not in CHANNELS
+        or not isinstance(episode_id, str)
+        or not episode_id
+        for channel, episode_id in mastered_entry_ids.items()
+    ):
+        raise ReconcileRecoveryError(
+            "pending dormancy member episode identity is invalid"
+        )
+    member_channels = tuple(
+        channel for channel in CHANNELS if channel in mastered_entry_ids
+    )
+    plans = tuple(
+        _freeze_validated_plan(
+            unit_key,
+            PlannedTransition(
+                channel=channel,
+                from_state=STATE_MASTERED,
+                to_state=STATE_DORMANT,
+                trigger=STATE_TRIGGER_DORMANCY_ELAPSED,
+                from_episode_id=cast(str, mastered_entry_ids[channel]),
+                evidence=dict(evidence),
+                transition_id=_transition_id(
+                    version=EVENT_SCHEMA_VERSION,
+                    unit_key=unit_key,
+                    channel=channel,
+                    from_state=STATE_MASTERED,
+                    to_state=STATE_DORMANT,
+                    trigger=STATE_TRIGGER_DORMANCY_ELAPSED,
+                    from_episode_id=cast(str, mastered_entry_ids[channel]),
+                    evidence=evidence,
+                ),
+                transition_group_id=group_id,
+            ),
+        )
+        for channel in member_channels
+    )
+    _validate_dormancy_group(unit_key, plans)
+    plan_by_channel = {plan.channel: plan for plan in plans}
+    transactions_by_channel: dict[str, Mapping[str, object]] = {}
+    for transaction in transactions.values():
+        record = cast(Mapping[str, Any], transaction["prepare"])
+        channel = cast(str, record["channel"])
+        if channel in transactions_by_channel:
+            raise ReconcileRecoveryError(
+                f"pending dormancy group duplicates channel {channel}"
+            )
+        plan = plan_by_channel.get(channel)
+        if plan is None:
+            raise ReconcileRecoveryError(
+                "pending dormancy record is not a declared group member"
+            )
+        prepared_plan = _plan_from_prepare(unit_key, record)
+        if prepared_plan != plan:
+            raise ReconcileRecoveryError(
+                f"pending dormancy member identity mismatch for {channel}"
+            )
+        terminal_phase = transaction["terminal_phase"]
+        if terminal_phase not in (None, T9_STATE_PHASE_COMMIT):
+            raise ReconcileRecoveryError(
+                "pending dormancy group contains an aborted member"
+            )
+        transactions_by_channel[channel] = transaction
+    return plans, transactions_by_channel
+
+
+def _recover_dormancy_group(
+    note_id: int,
+    unit: VocabUnit,
+    plans: tuple[PlannedTransition, ...],
+    transactions_by_channel: Mapping[str, Mapping[str, object]],
+    cards_by_channel: Mapping[str, Mapping[str, Any]],
+    *,
+    anki: AnkiConnectClient,
+    event_log: _EventLogJournal,
+    now_utc: datetime,
+) -> ReconcileRunResult:
+    pending_plans = tuple(
+        plan
+        for plan in plans
+        if plan.channel in transactions_by_channel
+        and transactions_by_channel[plan.channel]["terminal_phase"] is None
+    )
+    existing_prepared_ids = {
+        cast(str, cast(Mapping[str, Any], transaction["prepare"])["transition_id"])
+        for transaction in transactions_by_channel.values()
+    }
+    current_states = unit.active_channel_states()
+    states = tuple(current_states.get(plan.channel) for plan in plans)
+
+    if all(state == STATE_MASTERED for state in states):
+        if any(
+            transaction["terminal_phase"] == T9_STATE_PHASE_COMMIT
+            for transaction in transactions_by_channel.values()
+        ):
+            aborted = _abort_prepared_plans(
+                unit.unit_key,
+                pending_plans,
+                event_log,
+            )
+            raise ReconcileRecoveryConflictError(
+                "committed dormancy member conflicts with persisted source state",
+                aborted_transition_ids=aborted,
+            )
+        progress = observe_unit(
+            note_id,
+            anki=anki,
+            event_log=event_log,
+            now=now_utc,
+        )
+        decision = decide_transitions(progress, now=now_utc)
+        fresh_plans = _validate_materialization_decision(progress, decision)
+        if (
+            len(fresh_plans) != len(plans)
+            or not fresh_plans
+            or fresh_plans[0].transition_group_id != plans[0].transition_group_id
+            or tuple(plan.transition_id for plan in fresh_plans)
+            != tuple(plan.transition_id for plan in plans)
+        ):
+            aborted = _abort_prepared_plans(
+                unit.unit_key,
+                pending_plans,
+                event_log,
+            )
+            raise ReconcileRecoveryConflictError(
+                "fresh decision no longer reproduces pending dormancy group",
+                aborted_transition_ids=aborted,
+            )
+        missing_prepare_ids = {
+            plan.transition_id
+            for plan in fresh_plans
+            if plan.transition_id not in existing_prepared_ids
+        }
+        suspend_ids = tuple(
+            cast(int, cards_by_channel[plan.channel]["card_id"])
+            for plan in fresh_plans
+        )
+        _materialize_dormancy_plans(
+            note_id,
+            unit.unit_key,
+            fresh_plans,
+            suspend_ids,
+            anki=anki,
+            event_log=event_log,
+            prepare_ids=missing_prepare_ids,
+            commit_ids={plan.transition_id for plan in fresh_plans},
+        )
+        return ReconcileRunResult(
+            unit_key=unit.unit_key,
+            committed_transition_ids=tuple(
+                plan.transition_id for plan in fresh_plans
+            ),
+            recovered_transition_ids=tuple(
+                plan.transition_id
+                for plan in fresh_plans
+                if plan.transition_id in existing_prepared_ids
+            ),
+            leech_rescue_channels=decision.leech_rescue_channels,
+        )
+
+    if all(state == STATE_DORMANT for state in states):
+        missing_transactions = tuple(
+            plan.channel
+            for plan in plans
+            if plan.channel not in transactions_by_channel
+        )
+        if missing_transactions:
+            raise ReconcileRecoveryError(
+                "target dormancy exists without every member PREPARE"
+            )
+        state_updates = {
+            STATE_FIELD_BY_CHANNEL[plan.channel]: STATE_DORMANT for plan in plans
+        }
+        _verify_note_states(note_id, state_updates, anki)
+        card_ids = tuple(
+            cast(int, cards_by_channel[plan.channel]["card_id"])
+            for plan in plans
+        )
+        queues = _read_card_queues(
+            note_id,
+            card_ids,
+            anki,
+            error_type=ReconcileRecoveryError,
+        )
+        unsuspended = tuple(
+            card_id
+            for card_id in card_ids
+            if queues[card_id] != ANKI_QUEUE_SUSPENDED
+        )
+        _suspend_cards(unsuspended, anki)
+        verified_queues = _read_card_queues(
+            note_id,
+            card_ids,
+            anki,
+            error_type=ReconcileRecoveryError,
+        )
+        if any(
+            verified_queues[card_id] != ANKI_QUEUE_SUSPENDED
+            for card_id in card_ids
+        ):
+            raise ReconcileRecoveryError(
+                "recovered dormancy queues are not all suspended"
+            )
+        committed_now: list[str] = []
+        for plan in plans:
+            transaction = transactions_by_channel[plan.channel]
+            if transaction["terminal_phase"] is None:
+                _append_state_event(
+                    event_log,
+                    unit.unit_key,
+                    plan,
+                    T9_STATE_PHASE_COMMIT,
+                )
+                committed_now.append(plan.transition_id)
+        return ReconcileRunResult(
+            unit_key=unit.unit_key,
+            committed_transition_ids=tuple(committed_now),
+            recovered_transition_ids=tuple(committed_now),
+        )
+
+    aborted = _abort_prepared_plans(
+        unit.unit_key,
+        pending_plans,
+        event_log,
+    )
+    raise ReconcileRecoveryConflictError(
+        "dormancy member states are mixed or outside source/target",
+        aborted_transition_ids=aborted,
+    )
+
+
+def _abort_prepared_plans(
+    unit_key: str,
+    plans: Sequence[PlannedTransition],
+    event_log: _EventLogJournal,
+) -> tuple[str, ...]:
+    aborted: list[str] = []
+    for plan in plans:
+        _append_state_event(
+            event_log,
+            unit_key,
+            plan,
+            T9_STATE_PHASE_ABORT,
+        )
+        aborted.append(plan.transition_id)
+    return tuple(aborted)
 
 
 def observe_unit(
@@ -1379,6 +2562,7 @@ def _journal_record(
         "transition_id": transition_id,
         "from_episode_id": from_episode_id,
         "phase": phase,
+        "evidence": dict(evidence),
         "transition_identity": (
             event.v,
             event.unit_key,
@@ -1423,49 +2607,15 @@ def _state_episode_provenance(
     active_states: Mapping[str, str],
     records: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, str], dict[str, datetime | None]]:
-    journal_by_transition: dict[str, dict[str, object]] = {}
-    committed: list[Mapping[str, Any]] = []
-
-    for record in records:
-        transition_id = cast(str, record["transition_id"])
-        phase = cast(str, record["phase"])
-        identity = (
-            record["transition_identity"],
-            record["transition_group_id"],
-        )
-
-        if phase == T9_STATE_PHASE_PREPARE:
-            if transition_id in journal_by_transition:
-                raise ReconcileEventHistoryError(
-                    f"STATE transition {transition_id} duplicates phase PREPARE"
-                )
-            journal_by_transition[transition_id] = {
-                "identity": identity,
-                "terminal": None,
-            }
-            continue
-
-        journal = journal_by_transition.get(transition_id)
-        if journal is None:
-            raise ReconcileEventHistoryError(
-                f"STATE transition {transition_id} terminal phase requires PREPARE"
-            )
-        if journal["identity"] != identity:
-            raise ReconcileEventHistoryError(
-                f"STATE transition {transition_id} changes identity across phases"
-            )
-        terminal = journal["terminal"]
-        if terminal is not None:
-            if terminal == phase:
-                raise ReconcileEventHistoryError(
-                    f"STATE transition {transition_id} duplicates phase {phase}"
-                )
-            raise ReconcileEventHistoryError(
-                f"STATE transition {transition_id} has COMMIT and ABORT terminals"
-            )
-        journal["terminal"] = phase
-        if phase == T9_STATE_PHASE_COMMIT:
-            committed.append(record)
+    journal_by_transition = _journal_transactions(records)
+    committed = sorted(
+        (
+            cast(Mapping[str, Any], transaction["terminal"])
+            for transaction in journal_by_transition.values()
+            if transaction["terminal_phase"] == T9_STATE_PHASE_COMMIT
+        ),
+        key=lambda record: cast(int, record["index"]),
+    )
 
     committed_by_channel: dict[str, list[Mapping[str, Any]]] = {
         channel: [] for channel in active_states
@@ -1503,6 +2653,56 @@ def _state_episode_provenance(
         episode_entries[channel] = current_entry
 
     return episode_ids, episode_entries
+
+
+def _journal_transactions(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, object]]:
+    journal_by_transition: dict[str, dict[str, object]] = {}
+
+    for record in records:
+        transition_id = cast(str, record["transition_id"])
+        phase = cast(str, record["phase"])
+        identity = (
+            record["transition_identity"],
+            record["transition_group_id"],
+        )
+
+        if phase == T9_STATE_PHASE_PREPARE:
+            if transition_id in journal_by_transition:
+                raise ReconcileEventHistoryError(
+                    f"STATE transition {transition_id} duplicates phase PREPARE"
+                )
+            journal_by_transition[transition_id] = {
+                "identity": identity,
+                "prepare": record,
+                "terminal": None,
+                "terminal_phase": None,
+            }
+            continue
+
+        journal = journal_by_transition.get(transition_id)
+        if journal is None:
+            raise ReconcileEventHistoryError(
+                f"STATE transition {transition_id} terminal phase requires PREPARE"
+            )
+        if journal["identity"] != identity:
+            raise ReconcileEventHistoryError(
+                f"STATE transition {transition_id} changes identity across phases"
+            )
+        terminal_phase = journal["terminal_phase"]
+        if terminal_phase is not None:
+            if terminal_phase == phase:
+                raise ReconcileEventHistoryError(
+                    f"STATE transition {transition_id} duplicates phase {phase}"
+                )
+            raise ReconcileEventHistoryError(
+                f"STATE transition {transition_id} has COMMIT and ABORT terminals"
+            )
+        journal["terminal"] = record
+        journal["terminal_phase"] = phase
+
+    return journal_by_transition
 
 
 def _initial_new_episode_id(unit_key: str, channel: str) -> str:
