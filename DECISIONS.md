@@ -2623,3 +2623,1880 @@ Corpus scanning implementation, runtime corpus tests, recursive directories,
 symlinks, portability normalization, URL parsing, matcher refactoring,
 validator changes, EventLog schema changes, lifecycle behavior, scheduling,
 retries, caching, incremental scans, and supersession remain out of scope.
+
+## D51 — T11 semantic-assessment boundary and T12 ownership
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T11, T12
+
+T11 separates semantic assessment from session provenance and persistence.
+
+T11 has exactly two conceptual layers.
+
+### T11 Core
+
+T11 Core owns deterministic and locally testable assessment mechanics:
+
+- channel-specific request validation;
+- deterministic evidence-sufficiency checks;
+- D19 target-presence checks only where D52 allows them;
+- construction of deterministic semantic-assessment request artifacts;
+- strict parsing of semantic-assessor output;
+- validation of closed outcome, failure, reason, and provenance codes;
+- validation that a human approval decision approves or rejects the exact
+  semantic proposal without editing it.
+
+T11 Core performs no:
+
+- Anki read or write;
+- EventLog read or write;
+- exposure-ledger read or write;
+- lifecycle observation or transition;
+- T9 call;
+- state-field mutation;
+- wall-clock-dependent lifecycle decision.
+
+### T11 Semantic Bridge
+
+The semantic bridge is external and may be nondeterministic.
+
+T11 v1 uses a human-mediated ChatGPT Plus workflow:
+
+```text
+deterministic request artifact
+    ->
+human submits through ChatGPT Plus
+    ->
+structured response artifact
+    ->
+strict deterministic import
+    ->
+human APPROVE or REJECT of the exact proposed verdict
+```
+
+Python performs no paid LLM API call.
+
+A reviewer may:
+
+```
+APPROVE
+REJECT
+```
+
+A reviewer may not rewrite:
+
+-  PASS to FAIL;
+-  FAIL to PASS;
+-  failure codes;
+-  reason codes;
+-  semantic rationale;
+-  any other semantic field.
+
+`REJECT` produces an audit-only ABSTAIN result. It is not an alternative
+
+semantic verdict.
+
+Direct human semantic judging and fully automatic local-LLM lifecycle judging
+
+are outside T11 v1.
+
+### T12 ownership
+
+T12 owns:
+
+-  session manifests;
+-  runtime attempt identity;
+-  cognitive stimulus identity;
+-  exact rendered stimulus artifact identity;
+-  stimulus exposure reservation;
+-  learner-response capture;
+-  response artifact identity;
+-  novelty proof;
+-  lifecycle-field construction;
+-  producer-history preflight;
+-  JUDGE/SPEAK EventLog emission.
+
+T12 may produce assessment evidence but does not:
+
+-  decide lifecycle transitions;
+-  mutate `state_*`;
+-  call T9 as part of event production.
+
+T9 remains an independent consumer of EventLog history.
+
+A shared contract module may define identity grammar, canonicalization, and
+
+pure formulas. Runtime construction and persistence ownership remain T12's.
+
+**Reason:** Semantic judgment and historical provenance answer different
+
+questions. Novelty and idempotency depend on prior durable history and must not
+
+be hidden inside a semantic judge. Keeping T11 free of assessment-history I/O
+
+prevents a semantic assessor from becoming a second lifecycle engine.
+
+**Out of scope:** session scheduling, report UI, automatic lifecycle
+
+reconciliation, paid AI APIs, and direct Anki state mutation.
+
+## D52 — Channel-specific assessment evidence
+
+**Date:** 2026-08-23
+
+**Status:** Accepted
+
+**Blocks:** T11, T12
+
+Assessment evidence is channel-scoped. Evidence for one channel never promotes
+
+or degrades another channel.
+
+The v1 assessment task kinds are:
+
+```
+R -> reading_comprehension
+L -> listening_comprehension
+W -> written_production
+S -> spoken_production
+```
+
+A different task kind requires an explicit future contract rather than being
+
+silently interpreted as one of these four.
+
+### Reading — R
+
+R measures contextual lexical comprehension from written evidence.
+
+The learner response may paraphrase the Unit without repeating the Unit.
+
+Example:
+
+```
+stimulus:
+    Her meticulous records made the audit easy.
+
+response:
+    It means very careful and precise.
+```
+
+The response may PASS even though it does not contain `meticulous`.
+
+D19 target-presence matching is therefore not a response gate for R.
+
+A genuine R FAIL requires trustworthy evidence that the learner attributes an
+
+incorrect meaning to the target Unit in the assessed context.
+
+### Listening — L
+
+L measures contextual lexical comprehension from a spoken stimulus.
+
+The learner must not receive the written stimulus text as part of the ordinary
+
+v1 listening-comprehension task.
+
+The response need not repeat or transcribe the Unit.
+
+D19 target-presence matching is therefore not a response gate for L.
+
+A genuine L FAIL requires trustworthy evidence that the learner assigns an
+
+incorrect interpretation to the target Unit in the heard context.
+
+Transcription, spelling, accent discrimination, and speaker discrimination are
+
+different task kinds and do not silently substitute for v1 listening
+
+comprehension.
+
+### Writing — W
+
+W measures productive written use of the Unit.
+
+The task explicitly requires use of the target Unit.
+
+T11 reuses the frozen D19 matcher to test whether the Unit is present in the
+
+captured written response.
+
+```
+target absent
+    -> OMITTED
+
+target present
+    -> semantic assessment
+```
+
+Presence alone never means correct use.
+
+A genuine W FAIL requires that the Unit is present and its actual use violates
+
+one of the closed D53 lexical-failure contracts.
+
+### Speaking — S
+
+S v1 measures productive lexical use in speech.
+
+It does not claim to measure:
+
+-  pronunciation quality;
+-  accent;
+-  prosody;
+-  phonetic accuracy;
+-  acoustic intelligibility as a separate construct.
+
+The learner produces an immutable raw audio artifact. Only a D56 human-verified
+
+SUCCESS transcript may enter the D19 presence gate.
+
+```
+verified transcript + target absent
+    -> OMITTED
+
+verified transcript + target present
+    -> semantic assessment
+
+unverified / uncertain transcript
+    -> ABSTAIN
+```
+
+Presence alone never means correct use.
+
+A genuine S FAIL requires that a trustworthy transcript contains the Unit and
+
+its actual lexical use violates one of the closed D53 failure contracts.
+
+### Shared rule
+
+D19 remains the single lexical matching authority wherever presence matching
+
+is required. T11 must not create a second word/chunk/frame matcher.
+
+D19 determines lexical presence only. It does not determine:
+
+-  meaning;
+-  sense correctness;
+-  grammatical appropriateness;
+-  collocational appropriateness;
+-  comprehension;
+-  mastery.
+
+**Reason:** Recognition, listening comprehension, written production, and
+
+spoken production are distinct constructs. A universal target-presence gate
+
+would incorrectly reject valid R/L paraphrases and contaminate channel
+
+evidence.
+
+**Out of scope:** cross-channel scoring, pronunciation assessment, generic
+
+language proficiency scoring, and band scores.
+
+## D53 — Assessment outcomes and lifecycle-failure semantics
+
+**Date:** 2026-08-23
+
+**Status:** Accepted
+
+**Blocks:** T11, T12
+
+The T11/T12 assessment outcome set is exactly:
+
+```
+PASS
+FAIL
+OMITTED
+ABSTAIN
+```
+
+For every producer JUDGE or SPEAK result:
+
+```
+passed == (outcome == "PASS")
+```
+
+`passed == False` alone never means learner failure.
+
+Consumers and reports must distinguish the closed `outcome` value.
+
+### PASS
+
+PASS means sufficient trustworthy evidence demonstrates success for the exact
+
+channel contract in D52.
+
+PASS may become lifecycle evidence only through the complete D35 field set.
+
+### FAIL
+
+FAIL means sufficient trustworthy evidence establishes a genuine lexical error
+
+inside the construct being assessed.
+
+The only v1 lifecycle FAIL codes are:
+
+```
+R:
+    wrong_meaning
+
+L:
+    wrong_interpretation
+
+W:
+    semantic_misuse
+    collocation_misuse
+    form_misuse
+
+S:
+    semantic_misuse
+    collocation_misuse
+    form_misuse
+```
+
+R/L FAIL requires explicit evidence of an incorrect lexical meaning or
+
+interpretation.
+
+W/S FAIL requires all of:
+
+-  trustworthy target presence;
+-  sufficient evidence of the actual target use;
+-  one or more applicable closed lexical-error codes above.
+
+Task noncompliance alone is not lexical failure.
+
+These do not become lifecycle FAIL merely because they are clear or
+
+interpretable:
+
+-  off-topic response;
+-  refusal;
+-  unrelated response;
+-  failure to follow directions;
+-  insufficient engagement.
+
+Unless independent evidence establishes one of the closed FAIL codes, those
+
+cases are ABSTAIN.
+
+### OMITTED
+
+OMITTED means a productive W/S task explicitly required the target Unit and
+
+trustworthy evidence proves the Unit was absent.
+
+The only v1 OMITTED reason is:
+
+```
+target_absent
+```
+
+OMITTED is lifecycle-inert.
+
+R/L normal comprehension tasks do not use OMITTED merely because the learner
+
+response does not repeat the Unit.
+
+### ABSTAIN
+
+ABSTAIN means the system cannot make a trustworthy lexical PASS/FAIL decision.
+
+Closed v1 ABSTAIN reason codes are:
+
+```
+off_topic
+refusal
+explicit_skip
+no_response
+insufficient_lexical_evidence
+response_unintelligible
+audio_unusable
+transcription_uncertain
+transcription_failed
+semantic_uncertainty
+reviewer_rejected
+invalid_artifact
+infrastructure_failure
+```
+
+Machine, infrastructure, parsing, reviewer, transcription, or semantic
+
+uncertainty must never be converted into learner FAIL.
+
+### D35 lifecycle-field rule
+
+PASS and FAIL producer JUDGE records carry the complete D35 set:
+
+```
+assessment_id
+stimulus_ref
+novel
+```
+
+`novel` is the truthful D55 result and may be either `True` or `False`.
+
+OMITTED and ABSTAIN JUDGE records contain zero fields from that set.
+
+A producer must never emit a partial D35 set.
+
+Therefore:
+
+```
+PASS/FAIL + novel=True
+    -> lifecycle-eligible under existing D35/T9 rules
+
+PASS/FAIL + novel=False
+    -> parsed assessment evidence, but lifecycle-inert under T9
+
+OMITTED/ABSTAIN
+    -> audit-only and not parsed as LifecycleAssessment
+```
+
+This decision does not alter D35 or T9.
+
+**Reason:** `novel=True, passed=False` can reset a mastery streak and gate
+
+RELAPSE. Only genuine lexical failure may carry that meaning. Omission,
+
+off-task behavior, and machine uncertainty must not silently become lifecycle
+
+degradation.
+
+**Out of scope:** numeric scores, confidence-to-grade mapping, band scores, and
+
+generic task-compliance grading.
+
+## D54 — Cognitive stimulus, artifact, response, attempt, and assessment identity
+
+**Date:** 2026-08-23
+
+**Status:** Accepted
+
+**Blocks:** T11, T12
+
+All T11/T12 content identities use full lowercase SHA-256 over canonical JSON
+
+unless an exact raw-byte digest is explicitly required.
+
+Canonical JSON is:
+
+```
+json.dumps(
+    value,
+    ensure_ascii=False,
+    allow_nan=False,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
+```
+
+Every identity projection contains an explicit domain/version so identities
+
+from different semantic namespaces cannot collide by interpretation.
+
+### Canonical stimulus text
+
+For cognitive text identity only:
+
+1.  Unicode normalize with NFKC;
+2.  normalize line endings;
+3.  collapse Unicode whitespace runs to one ASCII space;
+4.  trim surrounding whitespace;
+5.  preserve case;
+6.  preserve punctuation.
+
+Display styling, line wrapping, HTML presentation, audio encoding, voice, and
+
+container metadata are not cognitive content unless the task kind explicitly
+
+claims those features as the assessed construct.
+
+### Cognitive stimulus identity
+
+The stable cognitive identity is:
+
+```
+stimulus:v1:<full-lowercase-sha256>
+```
+
+The canonical projection is channel-specific.
+
+R:
+
+```
+domain
+v
+unit_key
+channel = R
+task_kind = reading_comprehension
+canonical_passage
+canonical_question
+```
+
+L:
+
+```
+domain
+v
+unit_key
+channel = L
+task_kind = listening_comprehension
+canonical_spoken_script
+canonical_question
+```
+
+W:
+
+```
+domain
+v
+unit_key
+channel = W
+task_kind = written_production
+canonical_production_prompt
+canonical_semantic_constraints
+```
+
+S:
+
+```
+domain
+v
+unit_key
+channel = S
+task_kind = spoken_production
+canonical_production_prompt
+canonical_semantic_constraints
+```
+
+The exact field names used in code may be frozen as machine constants later,
+
+but they must preserve this semantic projection exactly.
+
+For L, rendering the same spoken script with another voice does not create a
+
+new cognitive stimulus.
+
+For R/W/S, trivial layout or formatting changes do not create a new cognitive
+
+stimulus.
+
+A future task where voice, accent, formatting, or another presentation feature
+
+is itself the assessed construct requires another task kind and identity
+
+projection.
+
+### Stimulus artifact identity
+
+The exact rendered artifact is separate:
+
+```
+sha256:<SHA256(exact artifact bytes)>
+```
+
+This may distinguish different audio renderings or displayed artifacts without
+
+inflating cognitive novelty.
+
+### Session and item identity
+
+T12 freezes an immutable session manifest before presentation.
+
+Each attempt references:
+
+```
+session_id
+item_ordinal
+```
+
+`session_id` is a stable explicit identity of that persisted session manifest.
+
+The same manifest must reuse the same `session_id` on resume.
+
+`item_ordinal` is an actual non-negative integer unique within that session
+
+manifest.
+
+Changing `session_id` or `item_ordinal` merely to reprocess an existing
+
+captured learner response is forbidden.
+
+The exact future creation policy for new session IDs belongs to T12 session
+
+implementation; once assigned, the identity is immutable.
+
+### Attempt identity
+
+```
+attempt:v1:<full-lowercase-sha256>
+```
+
+is SHA-256 of canonical JSON containing:
+
+```
+domain
+v
+producer
+producer_version
+session_id
+item_ordinal
+unit_key
+channel
+presented_stimulus_ref
+```
+
+A deliberate later re-presentation receives a new attempt identity but retains
+
+the same cognitive stimulus identity.
+
+### Response artifact identity
+
+Text response identity is:
+
+```
+sha256:<SHA256(exact captured UTF-8 learner-response bytes)>
+```
+
+Speech response identity is:
+
+```
+sha256:<SHA256(exact immutable raw learner-audio bytes)>
+```
+
+For speech, none of these may enter learner-response identity:
+
+-  transcript text;
+-  transcript digest;
+-  STT model;
+-  decoder settings;
+-  STT confidence;
+-  semantic verdict.
+
+Those are processing provenance only.
+
+### Assessment identity
+
+For T12 assessment producer v1:
+
+```
+assessment_id == attempt_id
+stimulus_ref == presented_stimulus_ref
+```
+
+Rejudging or retranscribing one attempt therefore cannot create an independent
+
+mastery observation.
+
+Changing any of these under one attempt identity is a conflict:
+
+-  Unit;
+-  channel;
+-  cognitive stimulus;
+-  captured response artifact;
+-  outcome;
+-  semantic payload.
+
+Judge identity, model version, rubric version, prompt version, verdict,
+
+timestamp, and STT output are excluded from `assessment_id`.
+
+A changed verdict for an existing attempt is not a new assessment. T12 v1
+
+fails closed. Automatic supersession and revision history are not defined.
+
+**Reason:** Independent mastery evidence must correspond to genuinely distinct
+
+learner attempts and cognitive stimuli, not model upgrades, retranscription,
+
+rerendering, formatting changes, or repeated judging of the same response.
+
+**Out of scope:** automatic supersession, revision counters, pronunciation
+
+stimulus identity, and cross-task identity equivalence.
+
+## D55 — Durable exposure reservation and crash-safe novelty
+
+**Date:** 2026-08-23
+
+**Status:** Accepted
+
+**Blocks:** T12, T11 lifecycle evidence
+
+Novelty is an exposure-history fact, not a semantic-model opinion.
+
+T12 owns a separate append-only exposure ledger at the explicit sibling path:
+
+```
+t12-exposures.jsonl
+```
+
+The path is supplied explicitly at runtime alongside the EventLog path.
+
+The ledger is not:
+
+-  a vocabulary registry;
+-  a Unit database;
+-  lifecycle state;
+-  a replacement for Anki;
+-  a replacement for EventLog outcomes.
+
+Its single authority is:
+
+> which assessment-attempt stimulus identities have consumed novelty.
+
+EventLog remains authoritative for assessment outcomes.
+
+### Exposure record
+
+Each exposure reservation contains exactly:
+
+```
+v
+producer
+producer_version
+reserved_at
+attempt_id
+session_id
+item_ordinal
+unit_key
+channel
+presented_stimulus_ref
+stimulus_artifact_ref
+```
+
+The v1 producer is the frozen T12 assessment producer defined by D57.
+
+`reserved_at` is a normalized UTC ISO-8601 timestamp with explicit `+00:00`
+
+offset. It is audit metadata and does not define slot identity or novelty
+
+ordering.
+
+`item_ordinal` is an actual non-negative integer; Boolean is not accepted.
+
+All strings required as identities are non-empty and must satisfy their frozen
+
+identity grammar.
+
+### Ledger serialization
+
+Each record is serialized as one UTF-8 JSONL line using exactly:
+
+```
+json.dumps(
+    record,
+    ensure_ascii=False,
+    allow_nan=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+```
+
+followed by exactly one newline.
+
+Before append:
+
+-  the complete record is validated;
+-  JSON serialization must succeed;
+-  the current ledger history must be valid.
+
+Append then performs:
+
+```
+write complete line
+flush
+fsync
+```
+
+and exact readback verification of the appended record.
+
+The ledger is append-only.
+
+T12 v1 never:
+
+-  rewrites;
+-  deletes;
+-  truncates;
+-  automatically repairs;
+-  silently ignores an interior malformed record.
+
+Malformed, duplicate, conflicting, undecodable, or structurally invalid
+
+history fails closed.
+
+### Slot identity
+
+Exposure-ledger slot identity is exactly:
+
+```
+producer
+producer_version
+attempt_id
+```
+
+A duplicate physical slot fails closed even when byte-for-byte or semantically
+
+identical.
+
+Reusing an attempt ID with changed Unit, channel, session, ordinal, cognitive
+
+stimulus, or rendered artifact is a conflict.
+
+Physical ledger order is authoritative reservation order. `reserved_at` is not
+
+used to reorder history.
+
+### Reserve before display
+
+The required sequence is:
+
+```
+1. validate complete ledger
+2. validate current session / attempt / stimulus identities
+3. construct and serialize exact reservation
+4. append reservation
+5. flush + fsync
+6. exact readback
+7. issue one-use in-memory display permit
+8. only then display the stimulus
+```
+
+If reservation or readback fails, the stimulus must not be shown.
+
+An already durable reservation is not a reusable display permit after restart.
+
+After restart:
+
+-  if an immutable learner response for that same attempt was already captured,
+   processing may resume without redisplaying the stimulus;
+-  otherwise that attempt is abandoned;
+-  a later presentation uses a new attempt ID.
+
+The existing reservation remains and conservatively consumes novelty.
+
+### Crash asymmetry
+
+```
+crash before durable reservation:
+    no display was authorized
+
+crash after reservation but before display:
+    false non-novel is possible
+    this is conservative and safe
+
+crash after display:
+    exposure evidence already exists
+
+crash after response capture:
+    same attempt may resume without redisplay
+```
+
+False non-novel is preferred over false novel because the former loses an
+
+assessment opportunity while the latter can create false independent mastery
+
+evidence.
+
+### Novelty rule
+
+For the current attempt:
+
+```
+novel == True
+```
+
+iff all are true:
+
+1.  the complete exposure ledger is valid;
+2.  the current attempt has exactly one verified durable reservation;
+3.  no earlier physical ledger record with a different `attempt_id` has the
+    same:
+
+```
+unit_key
+channel
+presented_stimulus_ref
+```
+
+The current attempt's own reservation does not make itself non-novel.
+
+Every reservation consumes novelty, including attempts that later become:
+
+-  PASS;
+-  FAIL;
+-  OMITTED;
+-  ABSTAIN;
+-  interrupted;
+-  never displayed after reservation;
+-  never represented by a final EventLog outcome.
+
+JUDGE history is not a substitute for exposure history.
+
+Every T12 JUDGE/SPEAK event must cross-check to exactly one compatible durable
+
+exposure reservation. A ledger reservation is allowed to have no final event,
+
+because crash/abandonment is valid.
+
+If the ledger is missing, corrupt, ambiguous, or incomplete:
+
+```
+novel=True is forbidden
+no new lifecycle-bearing JUDGE may be emitted
+```
+
+T12 does not convert that uncertainty into learner failure.
+
+**Reason:** A stimulus may already influence the learner even when no outcome
+
+event was ever written. Pre-display durable reservation makes false novelty
+
+impossible across ordinary crash boundaries.
+
+**Out of scope:** distributed locking, concurrent session writers, automatic
+
+ledger repair, exposure deletion, and a second Unit registry.
+
+## D56 — Speech transcription evidence and SPEAK semantics
+
+**Date:** 2026-08-23
+
+**Status:** Accepted
+
+**Blocks:** T11, T12
+
+S v1 assesses lexical use through an immutable learner audio artifact plus a
+
+human-verified transcript.
+
+Raw audio is never sent directly to an unscripted semantic judge.
+
+Speech recognition is local. Paid Azure/OpenAI/Anthropic speech APIs are not
+
+part of the active v1 architecture.
+
+### Transcription status
+
+The closed values are:
+
+```
+SUCCESS
+UNCERTAIN
+FAILED
+```
+
+#### SUCCESS
+
+`SUCCESS` means all are true:
+
+-  immutable raw learner audio exists;
+-  local STT produced a transcript candidate;
+-  a human verifier listened to that exact audio artifact;
+-  the human approved an exact transcript as sufficiently faithful for lexical
+   and semantic assessment;
+-  the approved transcript digest is frozen;
+-  verifier provenance is frozen.
+
+Only a SUCCESS transcript may enter D19 or semantic assessment.
+
+If D19 finds the Unit absent from a SUCCESS transcript:
+
+```
+outcome = OMITTED
+reason_code = target_absent
+```
+
+#### UNCERTAIN
+
+`UNCERTAIN` means audio is available but trustworthy transcription or reliable
+
+target presence/absence cannot be established.
+
+Examples:
+
+-  unclear audio;
+-  ambiguous target realization;
+-  STT/human disagreement;
+-  verifier cannot approve the candidate transcript.
+
+Required outcome:
+
+```
+outcome = ABSTAIN
+reason_code = transcription_uncertain
+```
+
+D19 must not infer target absence.
+
+#### FAILED
+
+`FAILED` means no usable transcript can be produced because of an artifact or
+
+technical failure.
+
+Applicable audit-only reasons are:
+
+```
+transcription_failed
+audio_unusable
+infrastructure_failure
+```
+
+Required outcome is ABSTAIN.
+
+D19 must not infer target absence.
+
+### Confidence and multiple decodes
+
+None of the following alone can establish lexical absence:
+
+-  one STT output;
+-  a model confidence threshold;
+-  agreement between multiple automatic decodes;
+-  absence of the target token in an unverified transcript.
+
+STT confidence may be retained only in a referenced diagnostic artifact; it
+
+does not become lifecycle truth.
+
+### Stored transcript
+
+For SUCCESS:
+
+```
+SPEAK.transcript = exact human-approved transcript
+```
+
+For UNCERTAIN or FAILED:
+
+```
+SPEAK.transcript = ""
+```
+
+No unverified transcript is promoted to the top-level accepted transcript
+
+field.
+
+### SPEAK.passed
+
+For every T12 SPEAK event:
+
+```
+passed == (outcome == "PASS")
+```
+
+`SPEAK.passed` means the final accepted semantic speaking outcome is PASS.
+
+It does not mean:
+
+-  STT executed;
+-  transcription succeeded;
+-  target presence alone;
+-  readable audio alone;
+-  pronunciation quality.
+
+Transcription status is represented separately.
+
+SPEAK remains lifecycle-inert under D35. A speaking result affects lifecycle
+
+only through a companion qualifying JUDGE.
+
+### Evidence order
+
+For a normal S attempt:
+
+```
+immutable raw audio
+    ->
+local STT
+    ->
+human transcript verification
+    ->
+D19 presence gate
+    ->
+semantic assessment when target present
+    ->
+human approval of exact semantic proposal
+    ->
+T12 SPEAK/JUDGE producer planning
+```
+
+For an S attempt where no immutable raw audio was ever captured, T12 emits
+
+neither SPEAK nor JUDGE. Its durable D55 reservation remains and consumes
+
+novelty.
+
+**Reason:** Transcript absence is not proof of learner omission unless the
+
+transcript itself is trustworthy. This prevents STT error from becoming
+
+learner failure and narrows v1 to evidence it can honestly support.
+
+**Out of scope:** pronunciation scoring, prosody, accent grading, automatic
+
+confidence-to-outcome thresholds, and paid cloud speech APIs.
+
+## D57 — T12 assessment producer, closed payloads, idempotency, and crash recovery
+
+**Date:** 2026-08-23
+
+**Status:** Accepted
+
+**Blocks:** T11, T12
+
+The v1 assessment producer namespace is exactly:
+
+```
+producer = "t12-assessment"
+producer_version = 1
+```
+
+Producer identity is distinct from assessor identity.
+
+`model_id` / `model_version` identify the authority responsible for the stored
+
+outcome under the historical generic JUDGE/SPEAK contract. They do not replace
+
+the T12 producer namespace.
+
+A human-mediated semantic bridge must record the model identity exactly as
+
+available. If the UI does not expose a stable underlying build identifier, the
+
+producer must record a frozen truthful "version unavailable from UI" sentinel
+
+defined by contract rather than inventing a model version.
+
+### Generic EventLog compatibility
+
+Generic `EVENT_SCHEMA_VERSION` remains unchanged.
+
+Generic historical JUDGE and SPEAK events remain readable.
+
+The generic EventLog continues validating only its existing unconditional
+
+structural contract.
+
+T12 producer-specific validation owns all rules in this decision.
+
+No EventLog schema-version bump is required merely because T12 adds closed
+
+producer fields.
+
+T12 v1 is the only normal producer permitted to create new lifecycle-bearing
+
+JUDGE records. Application code must not bypass the T12 producer and append a
+
+new D35-bearing JUDGE directly through `EventLog.log()`.
+
+### Outcome slot identity
+
+T12 EventLog slot identity is exactly:
+
+```
+producer
+producer_version
+event_type
+attempt_id
+```
+
+where event type is:
+
+```
+JUDGE
+SPEAK
+```
+
+Changing Unit, channel, stimulus, response artifact, outcome, provenance, or
+
+other semantic content under the same slot is a conflict, not a new slot.
+
+Duplicate historical slots fail closed even when payloads are identical.
+
+### Common JUDGE payload
+
+Every T12 JUDGE contains:
+
+```
+channel
+passed
+model_id
+model_version
+producer
+producer_version
+attempt_id
+presented_stimulus_ref
+outcome
+authority_kind
+provenance
+```
+
+`authority_kind` is exactly one of:
+
+```
+semantic_model
+deterministic_gate
+policy
+human_reviewer
+```
+
+`response_artifact_ref` is additionally required whenever an immutable learner
+
+response exists.
+
+It is prohibited, rather than stored as null or empty, for pre-capture cases
+
+such as:
+
+```
+no_response
+invalid_artifact
+pre-capture infrastructure_failure
+```
+
+Outcome-specific JUDGE closure is:
+
+#### PASS
+
+Additional required:
+
+```
+response_artifact_ref
+assessment_id
+stimulus_ref
+novel
+```
+
+Prohibited:
+
+```
+failure_code
+reason_code
+```
+
+#### FAIL
+
+Additional required:
+
+```
+response_artifact_ref
+assessment_id
+stimulus_ref
+novel
+failure_code
+```
+
+Prohibited:
+
+```
+reason_code
+```
+
+#### OMITTED
+
+Additional required:
+
+```
+response_artifact_ref
+reason_code = target_absent
+```
+
+Prohibited:
+
+```
+assessment_id
+stimulus_ref
+novel
+failure_code
+```
+
+#### ABSTAIN
+
+Additional required:
+
+```
+reason_code
+```
+
+`response_artifact_ref` is present iff an immutable response exists.
+
+Prohibited:
+
+```
+assessment_id
+stimulus_ref
+novel
+failure_code
+```
+
+For PASS/FAIL:
+
+```
+assessment_id == attempt_id
+stimulus_ref == presented_stimulus_ref
+passed == (outcome == PASS)
+```
+
+OMITTED and ABSTAIN contain zero D35 fields.
+
+Unknown top-level fields are forbidden.
+
+### Common SPEAK payload
+
+Every T12 SPEAK contains exactly the common fields:
+
+```
+audio_path
+transcript
+passed
+model_id
+model_version
+channel
+producer
+producer_version
+attempt_id
+presented_stimulus_ref
+response_audio_ref
+outcome
+authority_kind
+provenance
+```
+
+and:
+
+```
+channel == S
+passed == (outcome == PASS)
+```
+
+Outcome additions are:
+
+```
+PASS:
+    no failure/reason field
+
+FAIL:
+    failure_code
+
+OMITTED:
+    reason_code = target_absent
+
+ABSTAIN:
+    reason_code
+```
+
+No SPEAK payload may contain:
+
+```
+assessment_id
+stimulus_ref
+novel
+```
+
+Unknown top-level fields are forbidden.
+
+### Companion consistency
+
+For one S attempt, SPEAK and JUDGE must agree exactly on:
+
+-  producer;
+-  producer version;
+-  attempt ID;
+-  Event envelope Unit key;
+-  channel;
+-  presented stimulus reference;
+-  raw response-audio identity;
+-  outcome;
+- `passed`;
+-  applicable failure or reason code.
+
+A lifecycle-relevant S JUDGE without the corresponding exact SPEAK evidence is
+
+invalid producer history.
+
+### Closed provenance
+
+`provenance` is a closed object.
+
+Its only allowed stage keys are:
+
+```
+presence_gate
+transcription
+semantic_judge
+human_review
+policy
+```
+
+No unknown stage key is allowed.
+
+Fields from a stage that was not invoked must not be invented.
+
+#### presence\_gate
+
+Exact fields:
+
+```
+gate_id
+gate_version
+target_present
+```
+
+`target_present` is an actual Boolean.
+
+#### semantic\_judge
+
+T11 v1 uses the ChatGPT Plus semantic bridge and therefore this stage contains
+
+exactly:
+
+```
+protocol_id
+protocol_version
+assessor_id
+assessor_version
+rubric_id
+rubric_version
+prompt_id
+prompt_version
+request_digest
+response_digest
+```
+
+`request_digest` identifies the exact deterministic request artifact.
+
+`response_digest` identifies the exact imported structured semantic proposal.
+
+These fields do not enter `assessment_id`.
+
+#### human\_review
+
+Exact fields:
+
+```
+reviewer_id
+reviewer_version
+decision
+```
+
+with:
+
+```
+decision = APPROVE | REJECT
+```
+
+APPROVE accepts the exact semantic proposal.
+
+REJECT produces ABSTAIN and does not edit the proposal.
+
+#### policy
+
+Exact fields:
+
+```
+policy_id
+policy_version
+```
+
+#### transcription
+
+`transcription` is a closed union.
+
+SUCCESS:
+
+```
+status = SUCCESS
+stt_model_id
+stt_model_version
+decoder_version
+stt_output_ref
+approved_transcript_ref
+verifier_id
+verifier_version
+```
+
+UNCERTAIN:
+
+```
+status = UNCERTAIN
+stt_model_id
+stt_model_version
+decoder_version
+stt_output_ref
+verifier_id
+verifier_version
+uncertainty_code
+```
+
+FAILED before STT invocation:
+
+```
+status = FAILED
+failure_code
+```
+
+FAILED after STT invocation:
+
+```
+status = FAILED
+stt_model_id
+stt_model_version
+decoder_version
+failure_code
+```
+
+### Required provenance combinations
+
+R/L PASS or FAIL:
+
+```
+semantic_judge
+human_review
+```
+
+W PASS or FAIL:
+
+```
+presence_gate
+semantic_judge
+human_review
+```
+
+S PASS or FAIL:
+
+```
+transcription
+presence_gate
+semantic_judge
+human_review
+```
+
+W OMITTED:
+
+```
+presence_gate
+```
+
+S OMITTED:
+
+```
+transcription
+presence_gate
+```
+
+S transcription ABSTAIN:
+
+```
+transcription
+policy
+```
+
+Semantic-uncertainty ABSTAIN:
+
+```
+all successfully invoked prerequisites
+semantic_judge
+policy
+```
+
+Reviewer-rejected ABSTAIN:
+
+```
+all successfully invoked prerequisites
+semantic_judge
+human_review
+policy
+```
+
+Other audit-only ABSTAIN outcomes contain only the stages actually needed to
+
+establish the reason plus `policy`.
+
+### Complete preflight
+
+Before the first EventLog append in a producer run, T12 must:
+
+1.  read and fully validate the complete D55 exposure ledger;
+2.  read the complete EventLog;
+3.  validate every historical `t12-assessment` JUDGE/SPEAK payload;
+4.  validate every T12 event-to-exposure-ledger correspondence;
+5.  detect every duplicate slot;
+6.  detect every conflicting slot;
+7.  validate every planned producer payload;
+8.  classify every planned slot as missing, exact, or conflicting.
+
+Nothing is appended unless the entire preflight succeeds.
+
+### Text-channel rerun
+
+For non-speech JUDGE:
+
+```
+missing slot
+    -> append
+
+one exact slot
+    -> skip
+
+same slot with different payload
+    -> conflict
+
+duplicate historical slot
+    -> fail closed even if identical
+```
+
+Rejudging the same attempt with a changed result conflicts.
+
+T12 v1 performs no overwrite or automatic supersession.
+
+### Speech partial-history state machine
+
+For one S attempt:
+
+```
+neither SPEAK nor JUDGE:
+    append SPEAK
+    fsync through EventLog
+    then append JUDGE
+
+exact SPEAK + missing JUDGE:
+    legal crash-resume state
+    append only JUDGE
+
+missing SPEAK + existing JUDGE:
+    forbidden producer corruption
+    append nothing
+
+both exact:
+    exact rerun
+    append zero
+
+SPEAK same slot, differing payload:
+    conflict
+    append zero
+
+JUDGE same slot, differing payload:
+    conflict
+    append zero
+
+duplicate SPEAK slots:
+    fail closed even if identical
+
+duplicate JUDGE slots:
+    fail closed even if identical
+```
+
+A JUDGE-append failure after a durable SPEAK leaves the sole legal incomplete S
+
+history.
+
+No automatic retry occurs in the same failed operation. A later explicit run
+
+performs complete preflight and resumes by appending only the missing exact
+
+JUDGE.
+
+The reverse partial state is never auto-repaired.
+
+### No lifecycle mutation
+
+T12 emits evidence only.
+
+It never:
+
+-  writes `state_*`;
+-  emits STATE;
+-  calls Anki lifecycle mutation;
+-  suspends or unsuspends cards;
+-  invokes T9 state materialization.
+
+**Reason:** D35 makes JUDGE load-bearing lifecycle evidence. Producer identity,
+
+payload closure, exposure correspondence, and idempotent crash recovery must be
+
+validated before that evidence enters the append-only history.
+
+**Out of scope:** producer supersession, event deletion, concurrent writers,
+
+automatic retry loops, EventLog schema v2, and direct paid-model APIs.
+
+## D58 — T11/T12 invariant probes and lifecycle enablement gate
+
+**Date:** 2026-08-23
+
+**Status:** Accepted
+
+**Blocks:** T11 closure, T12 assessment producer
+
+T11/T12 is not lifecycle-enabled merely because code compiles or unit tests
+
+cover schema validation.
+
+Before real lifecycle-bearing assessment production, the complete invariant
+
+probe suite must pass.
+
+The probes are not an estimate of general language-assessment accuracy. They
+
+are a protocol-validity and fail-silent safety gate.
+
+### Mandatory semantic anchors
+
+At minimum, the probe set must include:
+
+```
+R:
+    correct contextual paraphrase omitting target -> PASS
+    explicit wrong target meaning -> FAIL/wrong_meaning
+    off-topic but interpretable response -> ABSTAIN
+
+L:
+    correct contextual interpretation without target repetition -> PASS
+    explicit wrong interpretation -> FAIL/wrong_interpretation
+
+W:
+    correct target use -> PASS
+    target absent -> OMITTED
+    semantic misuse -> FAIL/semantic_misuse
+    collocational misuse -> FAIL/collocation_misuse
+
+S:
+    verified transcript + correct use -> PASS
+    verified transcript + genuine misuse -> corresponding FAIL
+    unverified STT omission -> ABSTAIN
+    human-verified target absence -> OMITTED
+```
+
+No semantic anchor may silently invert the construct:
+
+-  correct evidence must not become FAIL;
+-  genuine closed-code lexical failure must not become PASS;
+-  omission must not become FAIL;
+-  uncertainty must not become FAIL.
+
+A human reviewer rejection remains ABSTAIN and therefore cannot hide an unsafe
+
+PASS/FAIL as accepted evidence.
+
+A channel is not lifecycle-enabled until its mandatory anchors are accepted
+
+with the required exact outcomes.
+
+### Identity and novelty probes
+
+Mandatory probes include:
+
+-  same cognitive L script rendered by different voices -> same stimulus ref;
+-  trivial formatting differences excluded by D54 -> same cognitive identity;
+-  genuinely different cognitive stimulus -> different stimulus ref;
+-  same raw learner audio under different STT transcripts -> same attempt /
+   assessment identity;
+-  same attempt rejudged -> same assessment ID;
+-  prior OMITTED stimulus -> later same stimulus is non-novel;
+-  prior ABSTAIN stimulus -> later same stimulus is non-novel;
+-  interrupted reserved attempt -> later same stimulus is non-novel.
+
+### Exposure crash probes
+
+Mandatory probes include:
+
+```
+crash before reservation durability:
+    stimulus not authorized for display
+
+crash after reservation but before display:
+    reservation remains
+    novelty consumed
+
+crash after display but before outcome:
+    reservation remains
+    novelty consumed
+
+restart with reservation but no captured response:
+    existing attempt not redisplayed
+
+restart with immutable captured response:
+    same attempt may resume without redisplay
+```
+
+### Producer-history probes
+
+Mandatory probes include:
+
+-  exact text-JUDGE rerun appends zero;
+-  same text-JUDGE slot with changed payload conflicts;
+-  duplicate identical historical JUDGE slot fails closed;
+-  arbitrary producer payload extra field is rejected;
+-  partial D35 field set is rejected;
+-  lifecycle-bearing JUDGE without compatible exposure receipt is rejected;
+-  legal SPEAK-only partial history resumes with only missing JUDGE;
+-  JUDGE-only S history fails closed;
+-  duplicate identical SPEAK slot fails closed;
+-  changed retranscription under same attempt conflicts if it changes the
+   stored producer payload;
+-  changed rejudgment under same attempt conflicts;
+-  exact SPEAK+JUDGE rerun appends zero.
+
+### Speech evidence probes
+
+Mandatory probes include:
+
+-  raw STT transcript without human verification cannot establish omission;
+-  STT confidence threshold cannot establish omission;
+-  UNCERTAIN transcription -> ABSTAIN;
+-  FAILED transcription -> ABSTAIN;
+-  human-approved SUCCESS transcript may enter D19;
+-  human-confirmed target absence -> OMITTED;
+-  SPEAK `passed` always equals semantic PASS, not transcription success.
+
+### Acceptance rule
+
+Every safety, identity, idempotency, crash-recovery, payload-closure, and
+
+novelty invariant above must pass 100%.
+
+One violation is NO-GO.
+
+No aggregate score may hide:
+
+-  false novel evidence;
+-  duplicate independent evidence;
+-  omission recorded as FAIL;
+-  uncertainty recorded as FAIL;
+-  cross-channel evidence;
+-  malformed producer history;
+-  JUDGE-only speech lifecycle evidence.
+
+The semantic anchors are deliberately small adversarial probes. Passing them
+
+does not prove general assessment validity, accuracy, agreement with an
+
+examiner, or population-level calibration.
+
+After lifecycle enablement, real assessment quality must remain reviewable and
+
+future calibration may narrow or supersede the semantic rubric through an
+
+explicit decision. Existing append-only evidence is never silently regraded.
+
+If a semantic classifier or metric fails its invariant direction, it is removed
+
+from lifecycle use rather than compensated for with an arbitrary numeric
+
+threshold.
+
+**Reason:** T11/T12 sits directly upstream of D35 lifecycle evidence. The
+
+primary acceptance criterion is absence of unsafe fail-silent behavior, not a
+
+small-sample aggregate accuracy score.
+
+**Out of scope:** statistical validation claims from the probe set, automated
+
+rubric optimization, model fine-tuning, and retroactive regrading.
