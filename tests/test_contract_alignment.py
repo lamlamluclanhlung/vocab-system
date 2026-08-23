@@ -6,6 +6,8 @@ from dataclasses import fields
 from vocab.contracts import (
     CARD_TEMPLATE_NAMES,
     CHANNEL_BY_TEMPLATE_NAME,
+    EVENT_SCHEMA_VERSION,
+    EVENT_TYPES,
     EVENT_REQUIRED_FIELDS,
     NOTE_FIELDS,
     STATE_FIELDS,
@@ -17,6 +19,7 @@ from vocab.contracts import (
     ANKI_SORT_FIELD,
     NOVEL_CONTEXT_FIELDS,
     TARGET_FLAG_VALUE,
+    T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS,
     EVENT_PAYLOAD_REQUIRED_FIELDS,
     SOURCE_REF_KINDS,
     STABLE_MIN_AGE_DAYS,
@@ -310,6 +313,23 @@ def test_event_payload_minimums_are_frozen() -> None:
     assert (
         STATE_EVENT_REQUIRED_PAYLOAD_FIELDS
         == EVENT_PAYLOAD_REQUIRED_FIELDS["STATE"]
+    )
+
+
+def test_t10_encounter_requirements_extend_generic_v1_without_changing_it() -> None:
+    generic_fields = EVENT_PAYLOAD_REQUIRED_FIELDS["ENCOUNTER"]
+    assert generic_fields == ("count", "source", "month")
+    assert T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS[:3] == generic_fields
+    assert set(generic_fields) < set(T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS)
+    assert "registry_snapshot_digest" not in T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+    assert EVENT_SCHEMA_VERSION == 1
+    assert EVENT_TYPES == (
+        "REVIEW",
+        "JUDGE",
+        "FORGE",
+        "STATE",
+        "SPEAK",
+        "ENCOUNTER",
     )
 
 

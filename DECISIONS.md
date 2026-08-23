@@ -2239,3 +2239,319 @@ new PREPARE, however, T9.3 checks the planned transition IDs against existing
 journal transactions. Reuse of an aborted or otherwise existing transition ID
 fails closed, preventing PREPARE to ABORT to PREPARE and PREPARE to ABORT to
 COMMIT histories for the same transition identity.
+
+## D44 — T10 registry snapshot
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T10
+
+Anki VocabularyUnit notes are the only vocabulary registry. T10 does not add
+SQLite, PostgreSQL, a JSON registry, or any duplicate source of truth. One scan
+reads the Anki registry exactly once before counting and builds an immutable
+in-memory snapshot. Each entry contains exactly `unit_key`, `lemma`, and
+`unit_type`, ordered by `unit_key` using deterministic lexical string ordering.
+
+Every valid VocabularyUnit is scanned regardless of lifecycle state or enabled
+channel set. T10 is Unit-scoped, never channel-scoped. Before any corpus count
+or EventLog append, every entry must have a valid unique Unit key, non-empty
+valid lemma, valid existing `UNIT_TYPE_VALUES` member, and a lexical shape that
+satisfies the exported D19 matcher contract. T10 reuses `normalize_tokens()`
+and `contains_unit()`; it does not create a second Unit-shape implementation.
+Any malformed entry or duplicate Unit key fails the entire scan before any
+ENCOUNTER emission.
+
+Anki may change after snapshot capture. T10 neither locks nor rereads Anki
+during that scan and describes the frozen lexical values observed at snapshot
+time. T10 never writes Anki.
+
+`lemma` remains mutable under existing project rules. Each future T10 event
+therefore persists the exact `lemma` and `unit_type` used for that observation.
+A global registry-snapshot digest is neither event identity nor a mandatory
+cross-Unit equality gate: adding an unrelated Unit later must not invalidate
+historical observations or prevent that new Unit receiving a missing event for
+an unchanged old corpus. If an existing stable Unit key later has changed
+lexical provenance and its existing encounter slot is revisited, its unchanged
+encounter ID and changed payload conflict fail closed.
+
+Registry locking, another registry database, automatic lexical repair,
+channel-specific counts, and sense disambiguation are out of scope.
+
+## D45 — T10 corpus snapshot
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T10
+
+The v0 corpus artifact is exactly:
+
+```text
+<corpus_root>/<YYYY-MM>/*.txt
+```
+
+The caller explicitly supplies `corpus_root`, logical `source`, and `month`.
+Month must match `YYYY-MM` with a numeric month from `01` through `12`. Source
+is a stable logical source slug, not an absolute or machine-specific path and
+not a transient run identifier.
+
+T10 v0 accepts plaintext `.txt` only, with case-insensitive extension
+comparison. Markdown is deferred because raw Markdown can expose code names,
+URLs, link destinations, and front matter as false lexical evidence. No partial
+Markdown parser is included.
+
+The month directory must exist; a missing directory fails closed while an
+existing empty directory is a valid zero-occurrence corpus. Its input is flat:
+every direct child must be a regular supported text file. Symlinks, nested
+directories, and unsupported direct-child regular files are rejected rather
+than ignored. Files are ordered by canonical relative path, and absolute
+machine paths never enter identity.
+
+Each file is read exactly once into bytes for a scan. Its SHA-256 identity uses
+those exact raw bytes without normalization, so LF/CRLF and BOM/no-BOM are
+distinct artifacts. The same captured bytes are decoded as UTF-8; a UTF-8 BOM
+is accepted and removed from lexical text. Invalid UTF-8 fails the entire scan.
+No event may be emitted until every file has been discovered, read, hashed,
+decoded, and validated.
+
+The v0 corpus is prose. A case-insensitive URL-like span beginning `http://`,
+`https://`, or `www.` makes the corpus invalid. T10 does not parse or strip
+URLs. Corpus identity uses only frozen artifact evidence, never current time.
+Corpus data is local-only by default and the repository ignores exactly the
+`corpus/` directory.
+
+Markdown, HTML, PDF, DOCX, recursive input, URL extraction, non-UTF-8
+encodings, caching/incremental reads, and filesystem locking are out of scope.
+
+## D46 — T10 occurrence counting
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T10
+
+D46 extends D19 with counting and document boundaries; it does not alter D19
+matching semantics.
+
+### Text blocks
+
+Text is split into independent blocks before D19 token matching. A boundary is
+one or more sentence terminators (`.`, `!`, `?`, `…`), a blank-line paragraph
+boundary, or a file boundary. One ordinary newline within a paragraph is only
+whitespace. Commas, colons, semicolons, parentheses, and hyphens do not by
+themselves end a block. Chunk and frame matches cannot cross a block boundary.
+The deliberately simple rule may under-count around abbreviations and decimals
+such as `Dr.`, `e.g.`, or `3.14`; smart segmentation is out of scope.
+
+### Canonical non-overlapping count
+
+Each block is normalized and tokenized with D19. Counting is deterministic,
+leftmost, non-overlapping, and canonical. Starting at the leftmost unconsumed
+token `s`, compute the canonical D19 alignment beginning exactly at `s`. If it
+does not match, advance by one token. If it ends at `e`, count once and resume
+at `e + 1`. A later start overlapping an already consumed occurrence is not
+counted; a later non-overlapping occurrence is counted.
+
+For `word`, the target must be exactly one normalized lexical token and a match
+at `s` consumes only `s`.
+
+For `chunk`, the target has at least two tokens, preserves order, and allows at
+most `CHUNK_MAX_INSERTED_TOKENS` non-target tokens in total. At a fixed start,
+the first token must match and later target tokens use their earliest available
+positions exactly as the current D19 greedy `_contains_chunk` behavior. The
+first successful greedy alignment is canonical; alternate subsequences are not
+enumerated.
+
+For `frame`, the existing one-slot D19 shape and bounds remain authoritative.
+Fixed before-tokens match exactly, then slot sizes are tried from
+`FRAME_SLOT_MIN_TOKENS` through `FRAME_SLOT_MAX_TOKENS`; the first slot length
+whose fixed after-tokens match is canonical. Multiple satisfying slot lengths
+at one start do not create multiple occurrences.
+
+For every valid single block, positive T10 count is equivalent to
+`contains_unit(block, lemma, unit_type)` under D19. This equivalence is
+mandatory test coverage in the implementation stage.
+
+Frozen examples include:
+
+- `art` in `art art partial art` counts 3;
+- `art` in `state-of-the-art` counts 1;
+- `pose a threat to` counts once with zero, one, or two total inserted tokens,
+  but zero times with three;
+- `pose a pose a threat to` counts 1;
+- `pose a threat to and pose a threat to` counts 2;
+- `He did pose. A threat to public health emerged.` counts 0 for that chunk;
+- `it is ___ that` counts once for slot lengths 1 through 6 and zero for 7;
+- `it is that it is really that` counts 1 for that frame.
+
+Stemming, extra lemmatization, fuzzy matching, multiple-slot frames, smart
+segmentation, semantic disambiguation, and semantics-changing optimization are
+out of scope.
+
+## D47 — T10 ENCOUNTER semantics
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T10
+
+A T10 ENCOUNTER means only deterministic surface-form exposure for one Unit in
+one frozen `(source, month)` corpus snapshot. It does not mean the correct
+sense, understanding, correct use, learner production, mastery, failure, or
+relapse. T10 emits neither STATE nor JUDGE, never directly changes lifecycle
+state, and ENCOUNTER alone remains non-lifecycle evidence.
+
+`count` is the total D46 non-overlapping occurrence count across every file and
+block. It is an actual integer greater than or equal to zero; Boolean is not an
+integer count. It is not a file, line, or paragraph count. T10 emits zero counts
+to distinguish scanned-and-absent from never-scanned.
+
+`month` denotes the corpus period independently of Event `ts` and `day`, so a
+historical month may be scanned later. `source` names the logical evidence
+source. Different evidence classes, such as `reading` and `own-writing`, use
+different source IDs when that distinction matters.
+
+Counts are lexical, not sense-specific. Stable Unit keys for different senses
+but equivalent matcher inputs may receive identical counts; downstream users
+must not interpret or sum those as independent sense evidence.
+
+The generic v1 ENCOUNTER minimum remains exactly:
+
+```text
+count, source, month
+```
+
+T10 producer payloads require exactly, in order:
+
+```text
+count
+source
+month
+producer
+scan_version
+encounter_id
+lemma
+unit_type
+corpus_snapshot_digest
+corpus_file_count
+```
+
+The producer constants are `T10_ENCOUNTER_PRODUCER_ID = "t10-corpus"` and
+`CORPUS_SCAN_VERSION = 1`. Producer validation requires that exact producer;
+an actual integer scan version equal to the frozen version; full lowercase
+64-hex encounter and corpus digests; non-empty exact snapshot lemma; an
+existing `UNIT_TYPE_VALUES` member; and an actual non-negative integer file
+count. Historical generic ENCOUNTER events without producer `t10-corpus`
+remain generic readable v1 events and are not retroactively invalidated.
+
+Lifecycle judgments, sense attribution, correctness assessment, and file-level
+ENCOUNTER records are out of scope.
+
+## D48 — T10 encounter identity and idempotency
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T10
+
+T10 has one deterministic event identity. There is no scan ID and no registry
+snapshot digest identity. Canonical JSON is UTF-8 encoding of:
+
+```python
+json.dumps(
+    value,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+    allow_nan=False,
+)
+```
+
+SHA-256 values are full lowercase hexadecimal digests.
+
+`encounter_id` is exactly SHA-256 of canonical JSON containing:
+
+```text
+producer: T10_ENCOUNTER_PRODUCER_ID
+scan_version: CORPUS_SCAN_VERSION
+source
+month
+unit_key
+```
+
+It identifies one producer/version/source/month/stable-Unit slot. Count,
+lemma, unit type, corpus digest, wall-clock time, Event `ts`, and Event `day`
+are observation provenance and are excluded from identity.
+
+Each file identity is SHA-256 of its exact captured raw bytes. The corpus
+snapshot digest is exactly SHA-256 of canonical JSON containing
+`scan_version` and a `files` list of `{path, sha256}` objects in canonical
+relative-path order. Absolute root, current time, source, month, and registry
+contents are excluded.
+
+Before appending, T10 reads ENCOUNTER history. Only events whose producer is
+`t10-corpus` belong to its namespace. For each planned encounter:
+
+1. a missing encounter ID is eligible for append;
+2. one existing event with an exactly equal complete T10 semantic payload is
+   already durable and skipped;
+3. the same ID with any differing semantic field is a conflict and the run
+   appends nothing;
+4. duplicate historical T10 IDs fail closed even when their payloads match.
+
+Before the first new append, every existing event for the same producer,
+version, source, and month must have the current corpus snapshot digest. Any
+difference fails before append. Corpus content for a started source/month is
+therefore immutable.
+
+Registry evolution is distinct: a newly added Unit key may receive its missing
+event for an unchanged historical corpus. Changed lemma or unit type for an
+existing Unit key retains the encounter ID but conflicts through payload
+provenance. Removing a Unit never deletes or rewrites historical ENCOUNTERs.
+
+Changed corpus bytes do not cause an automatic rescan, source revision,
+supersession, overwrite, or deletion. T10 fails closed. Automatic revisions,
+supersession, EventLog mutation, PREPARE/COMMIT journaling, and a registry
+database are out of scope.
+
+## D49 — T10 execution and failure boundary
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T10
+
+The later T10 implementation has four conceptual phases:
+
+```text
+SNAPSHOT
+    I/O: read Anki once, read each corpus file once, validate all inputs,
+    and compute corpus artifact identity
+
+COUNT
+    PURE: no I/O, EventLog, Anki, clock, or randomness
+
+EMIT PREFLIGHT
+    read EventLog, verify T10 history and source/month corpus immutability,
+    and classify every plan as missing, already durable, or conflict
+
+EMIT
+    append only missing ENCOUNTER events in unit_key order
+```
+
+No append occurs until the complete registry snapshot, corpus snapshot, all
+counts, and complete emit preflight succeed. COUNT must support dry-run/preview
+without emission. A malformed registry, corpus, T10 history, or producer
+payload fails closed through a typed T10 error in the implementation stage.
+Anki, filesystem, EventLog-read, and EventLog-append infrastructure failures
+raise.
+
+If appending fails after some ENCOUNTERs were fsynced, T10 does not roll back,
+delete, or auto-retry. A later run recomputes the same encounter IDs, skips
+exact durable matches, and appends only missing events. No T9-style
+PREPARE/COMMIT is needed because T10 writes only one append-only system and
+EventLog already fsyncs each deterministic event.
+
+Event order is ascending `unit_key`; file order is ascending canonical relative
+path. T10 never writes Anki, suspends or unsuspends cards, changes `state_*`,
+emits STATE or JUDGE, deletes or edits EventLog records, calls an LLM or cloud
+API, or creates another registry/database. Semantic equivalence outranks
+optimization; simple O(number of Units × corpus size) behavior is acceptable.
+
+Concurrency, scheduling, automatic retry, corpus caching/indexing, incremental
+scans, and supersession are out of scope.

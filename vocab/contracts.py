@@ -460,6 +460,54 @@ T9_STATE_PHASES: Final[tuple[str, ...]] = (
     T9_STATE_PHASE_ABORT,
 )
 
+
+# ============================================================
+# 5A. T10 CORPUS / ENCOUNTER PRODUCER CONTRACT
+# ============================================================
+
+CORPUS_SCAN_VERSION: Final[int] = 1
+CORPUS_MONTH_PATTERN: Final[str] = r"^\d{4}-(?:0[1-9]|1[0-2])$"
+CORPUS_SOURCE_PATTERN: Final[str] = rf"^{SLUG_PATTERN}$"
+
+CORPUS_EXTENSIONS: Final[tuple[str, ...]] = (
+    ".txt",
+)
+CORPUS_DIRECT_CHILDREN_ONLY: Final[bool] = True
+CORPUS_ALLOW_SYMLINKS: Final[bool] = False
+CORPUS_ALLOW_UTF8_BOM: Final[bool] = True
+CORPUS_RAW_BYTES_DEFINE_FILE_IDENTITY: Final[bool] = True
+
+CORPUS_SENTENCE_TERMINATORS: Final[tuple[str, ...]] = (
+    ".",
+    "!",
+    "?",
+    "…",
+)
+CORPUS_BLANK_LINE_IS_BLOCK_BOUNDARY: Final[bool] = True
+CORPUS_SINGLE_NEWLINE_IS_BLOCK_BOUNDARY: Final[bool] = False
+
+CORPUS_REJECT_URL_PREFIXES: Final[tuple[str, ...]] = (
+    "http://",
+    "https://",
+    "www.",
+)
+
+T10_ENCOUNTER_PRODUCER_ID: Final[str] = "t10-corpus"
+T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "count",
+    "source",
+    "month",
+    "producer",
+    "scan_version",
+    "encounter_id",
+    "lemma",
+    "unit_type",
+    "corpus_snapshot_digest",
+    "corpus_file_count",
+)
+T10_ENCOUNTER_EMIT_ZERO_COUNTS: Final[bool] = True
+
+
 STATE_TRIGGER_FIRST_REVIEW: Final[str] = "FIRST_REVIEW"
 STATE_TRIGGER_STABILITY_GATE: Final[str] = "STABILITY_GATE"
 STATE_TRIGGER_REVIEW_LAPSE: Final[str] = "REVIEW_LAPSE"
