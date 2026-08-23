@@ -400,6 +400,7 @@ def new_fixture(
 
 def dormancy_fixture(
     *,
+    channels: tuple[str, ...] = ("R", "L"),
     states: dict[str, str] | None = None,
     queues: dict[str, int] | None = None,
 ) -> tuple[
@@ -410,15 +411,23 @@ def dormancy_fixture(
     list[tuple[object, ...]],
 ]:
     selected_states = (
-        {"R": "MASTERED", "L": "MASTERED"}
+        {channel: "MASTERED" for channel in channels}
         if states is None
         else states
     )
     operations: list[tuple[object, ...]] = []
     events: list[Event] = []
     mastered_episodes: dict[str, str] = {}
-    final_times = {"R": NOW - 35 * timedelta(days=1), "L": NOW - 30 * timedelta(days=1)}
-    for channel in ("R", "L"):
+    final_times = {
+        "R": NOW - 35 * timedelta(days=1),
+        "L": NOW - 30 * timedelta(days=1),
+        "W": NOW - 32 * timedelta(days=1),
+        "S": NOW - 31 * timedelta(days=1),
+    }
+    selected_channels = tuple(
+        channel for channel in CHANNELS if channel in selected_states
+    )
+    for channel in selected_channels:
         channel_events, episode_id = committed_chain(
             channel,
             (
@@ -447,6 +456,49 @@ def dormancy_fixture(
     return anki, event_log, plans, events, operations
 
 
+def conflicted_dormancy_fixture(
+    channels: tuple[str, ...] = ("R", "L"),
+) -> tuple[
+    FakeAnki,
+    FakeEventLog,
+    tuple[PlannedTransition, ...],
+    list[tuple[object, ...]],
+]:
+    _source_anki, _source_log, plans, chain_events, _source_operations = (
+        dormancy_fixture(channels=channels)
+    )
+    states = {
+        channel: ("DORMANT" if index == 0 else "MASTERED")
+        for index, channel in enumerate(channels)
+    }
+    operations: list[tuple[object, ...]] = []
+    anki = FakeAnki(make_unit(states), operations=operations)
+    event_log = FakeEventLog(list(chain_events), operations=operations)
+    add_plan_events(
+        event_log,
+        plans,
+        {channel: ("PREPARE",) for channel in channels},
+    )
+    return anki, event_log, plans, operations
+
+
+def partial_abort_failure_fixture(
+    channels: tuple[str, ...] = ("R", "L"),
+    *,
+    fail_attempt: int = 2,
+) -> tuple[
+    FakeAnki,
+    FakeEventLog,
+    tuple[PlannedTransition, ...],
+    list[tuple[object, ...]],
+]:
+    anki, event_log, plans, operations = conflicted_dormancy_fixture(channels)
+    event_log.fail_log_attempts = {fail_attempt}
+    with pytest.raises(ReconcileMaterializationError, match="ABORT"):
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+    return anki, event_log, plans, operations
+
+
 def add_plan_events(
     event_log: FakeEventLog,
     plans: tuple[PlannedTransition, ...],
@@ -469,6 +521,21 @@ def successful_phases(event_log: FakeEventLog) -> tuple[str, ...]:
         str(event.payload["phase"])
         for event in event_log.events
         if event.event == "STATE" and "phase" in event.payload
+    )
+
+
+def group_phase_channels(
+    event_log: FakeEventLog,
+    plans: tuple[PlannedTransition, ...],
+    phase: str,
+) -> tuple[str, ...]:
+    transition_ids = {plan.transition_id for plan in plans}
+    return tuple(
+        str(event.payload["channel"])
+        for event in event_log.events
+        if event.event == "STATE"
+        and event.payload.get("transition_id") in transition_ids
+        and event.payload.get("phase") == phase
     )
 
 
@@ -803,6 +870,155 @@ def test_mixed_dormancy_states_abort_pending_members_and_fail_closed() -> None:
         plan.transition_id for plan in plans
     )
     assert not any(item[0] == "update_note_fields" for item in operations)
+
+
+def test_partial_abort_write_failure_preserves_completed_member() -> None:
+    _anki, event_log, plans, operations = partial_abort_failure_fixture()
+
+    assert mutation_operations(operations) == []
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R",)
+    assert group_phase_channels(event_log, plans, "PREPARE") == ("R", "L")
+
+
+def test_next_run_completes_only_missing_partial_abort() -> None:
+    anki, event_log, plans, operations = partial_abort_failure_fixture()
+    event_log.fail_log_attempts.clear()
+    operations.clear()
+
+    with pytest.raises(ReconcileRecoveryConflictError) as exc_info:
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+
+    assert exc_info.value.aborted_transition_ids == (plans[1].transition_id,)
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R", "L")
+    assert [
+        item for item in operations if item[0] == "event_log"
+    ] == [("event_log", "ABORT", "L")]
+    assert not any(
+        item[0] in {"verified_note_type_snapshot", "get_revlog"}
+        for item in operations
+    )
+    assert mutation_operations(operations) == []
+
+
+def test_complete_aborted_group_cannot_reuse_transition_identity() -> None:
+    anki, event_log, plans, _events, operations = dormancy_fixture()
+    add_plan_events(
+        event_log,
+        plans,
+        {"R": ("PREPARE",), "L": ("PREPARE",)},
+    )
+    with pytest.raises(ReconcileRecoveryConflictError):
+        reconcile_unit(
+            NOTE_ID,
+            anki=anki,
+            event_log=event_log,
+            now=NOW - timedelta(seconds=1),
+        )
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R", "L")
+    observe_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+    operations.clear()
+    event_count = len(event_log.events)
+
+    with pytest.raises(ReconcileRecoveryConflictError, match="second PREPARE"):
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+
+    assert len(event_log.events) == event_count
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R", "L")
+    assert mutation_operations(operations) == []
+
+
+def test_four_member_partial_abort_recovery_finishes_in_channel_order() -> None:
+    channels = ("R", "L", "W", "S")
+    anki, event_log, plans, operations = partial_abort_failure_fixture(
+        channels,
+        fail_attempt=3,
+    )
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R", "L")
+    event_log.fail_log_attempts.clear()
+    operations.clear()
+
+    with pytest.raises(ReconcileRecoveryConflictError) as exc_info:
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+
+    assert exc_info.value.aborted_transition_ids == (
+        plans[2].transition_id,
+        plans[3].transition_id,
+    )
+    assert group_phase_channels(event_log, plans, "ABORT") == channels
+    assert [
+        item for item in operations if item[0] == "event_log"
+    ] == [
+        ("event_log", "ABORT", "W"),
+        ("event_log", "ABORT", "S"),
+    ]
+    assert mutation_operations(operations) == []
+
+
+def test_mixed_abort_and_commit_group_requires_manual_intervention() -> None:
+    _source_anki, _source_log, plans, chain_events, _source_operations = (
+        dormancy_fixture()
+    )
+    operations: list[tuple[object, ...]] = []
+    anki = FakeAnki(
+        make_unit({"R": "MASTERED", "L": "DORMANT"}),
+        operations=operations,
+    )
+    event_log = FakeEventLog(list(chain_events), operations=operations)
+    add_plan_events(
+        event_log,
+        plans,
+        {"R": ("PREPARE", "ABORT"), "L": ("PREPARE", "COMMIT")},
+    )
+    observe_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+    operations.clear()
+    event_count = len(event_log.events)
+
+    with pytest.raises(ReconcileRecoveryConflictError, match="manual intervention"):
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+
+    assert len(event_log.events) == event_count
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R",)
+    assert group_phase_channels(event_log, plans, "COMMIT") == ("L",)
+    assert mutation_operations(operations) == []
+
+
+def test_committed_member_with_source_states_does_not_abort_pending_member() -> None:
+    anki, event_log, plans, _events, operations = dormancy_fixture()
+    add_plan_events(
+        event_log,
+        plans,
+        {"R": ("PREPARE", "COMMIT"), "L": ("PREPARE",)},
+    )
+    event_count = len(event_log.events)
+
+    with pytest.raises(ReconcileRecoveryConflictError, match="manual intervention"):
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+
+    assert len(event_log.events) == event_count
+    assert group_phase_channels(event_log, plans, "COMMIT") == ("R",)
+    assert group_phase_channels(event_log, plans, "ABORT") == ()
+    assert mutation_operations(operations) == []
+
+
+def test_partial_abort_completion_failure_remains_retryable() -> None:
+    anki, event_log, plans, operations = partial_abort_failure_fixture()
+    event_log.fail_log_attempts = {3}
+    operations.clear()
+
+    with pytest.raises(ReconcileMaterializationError, match="ABORT"):
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R",)
+    assert mutation_operations(operations) == []
+    event_log.fail_log_attempts.clear()
+    operations.clear()
+
+    with pytest.raises(ReconcileRecoveryConflictError) as exc_info:
+        reconcile_unit(NOTE_ID, anki=anki, event_log=event_log, now=NOW)
+
+    assert exc_info.value.aborted_transition_ids == (plans[1].transition_id,)
+    assert group_phase_channels(event_log, plans, "ABORT") == ("R", "L")
+    assert mutation_operations(operations) == []
 
 
 def test_wrong_dormancy_group_identity_fails_before_anki_mutation() -> None:

@@ -371,10 +371,16 @@ def reconcile_unit(
     """Recover first, otherwise observe, decide, and durably materialize."""
     now_utc = _decision_now(now)
     unit, card_ids, _has_leech_tag = _load_note(note_id, anki)
+    transactions = _read_recovery_transactions(
+        unit.unit_key,
+        event_log,
+        now_utc,
+    )
     recovered = _recover_pending_operation(
         note_id,
         unit,
         card_ids,
+        transactions,
         anki=anki,
         event_log=event_log,
         now_utc=now_utc,
@@ -393,6 +399,7 @@ def reconcile_unit(
         note_id,
         progress,
         decision,
+        transactions,
         anki=anki,
         event_log=event_log,
     )
@@ -1145,11 +1152,13 @@ def _materialize_decision(
     note_id: int,
     progress: UnitProgress,
     decision: ReconcileDecision,
+    journal_transactions: Mapping[str, Mapping[str, object]],
     *,
     anki: AnkiConnectClient,
     event_log: _EventLogJournal,
 ) -> ReconcileRunResult:
     plans = _validate_materialization_decision(progress, decision)
+    _reject_reused_transition_ids(plans, journal_transactions)
     if not plans:
         return ReconcileRunResult(
             unit_key=progress.unit_key,
@@ -1192,6 +1201,22 @@ def _materialize_decision(
         ),
         leech_rescue_channels=decision.leech_rescue_channels,
     )
+
+
+def _reject_reused_transition_ids(
+    plans: Sequence[PlannedTransition],
+    journal_transactions: Mapping[str, Mapping[str, object]],
+) -> None:
+    reused = tuple(
+        plan.transition_id
+        for plan in plans
+        if plan.transition_id in journal_transactions
+    )
+    if reused:
+        raise ReconcileRecoveryConflictError(
+            "planned transition identity already has journal history; "
+            f"a second PREPARE is forbidden for {reused}"
+        )
 
 
 def _materialize_ungrouped_plan(
@@ -1392,16 +1417,13 @@ def _recover_pending_operation(
     note_id: int,
     unit: VocabUnit,
     card_ids: tuple[int, ...],
+    transactions: Mapping[str, Mapping[str, object]],
     *,
     anki: AnkiConnectClient,
     event_log: _EventLogJournal,
     now_utc: datetime,
 ) -> ReconcileRunResult | None:
-    transactions = _read_recovery_transactions(
-        unit.unit_key,
-        event_log,
-        now_utc,
-    )
+    _reject_mixed_terminal_dormancy_groups(unit, transactions)
     pending = {
         transition_id: transaction
         for transition_id, transaction in transactions.items()
@@ -1464,10 +1486,26 @@ def _recover_pending_operation(
         group_id,
         group_transactions,
     )
-    active_channels = tuple(unit.active_channel_states())
-    if tuple(plan.channel for plan in plans) != active_channels:
-        raise ReconcileRecoveryError(
-            "pending dormancy members do not match every active channel"
+    _validate_recovered_group_channels(unit, plans)
+    terminal_phases = {
+        transaction["terminal_phase"]
+        for transaction in transactions_by_channel.values()
+    }
+    if T9_STATE_PHASE_ABORT in terminal_phases:
+        pending_plans = tuple(
+            plan
+            for plan in plans
+            if plan.channel in transactions_by_channel
+            and transactions_by_channel[plan.channel]["terminal_phase"] is None
+        )
+        aborted = _abort_prepared_plans(
+            unit.unit_key,
+            pending_plans,
+            event_log,
+        )
+        raise ReconcileRecoveryConflictError(
+            "partially aborted dormancy group reached terminal ABORT state",
+            aborted_transition_ids=aborted,
         )
     cards_by_channel = _load_recovery_cards(
         note_id,
@@ -1485,6 +1523,50 @@ def _recover_pending_operation(
         event_log=event_log,
         now_utc=now_utc,
     )
+
+
+def _reject_mixed_terminal_dormancy_groups(
+    unit: VocabUnit,
+    transactions: Mapping[str, Mapping[str, object]],
+) -> None:
+    grouped: dict[str, dict[str, Mapping[str, object]]] = {}
+    for transition_id, transaction in transactions.items():
+        prepare = cast(Mapping[str, Any], transaction["prepare"])
+        group_id = prepare["transition_group_id"]
+        if group_id is not None:
+            grouped.setdefault(cast(str, group_id), {})[transition_id] = transaction
+
+    for group_id, group_transactions in grouped.items():
+        terminal_phases = {
+            transaction["terminal_phase"]
+            for transaction in group_transactions.values()
+        }
+        if not {
+            T9_STATE_PHASE_COMMIT,
+            T9_STATE_PHASE_ABORT,
+        }.issubset(terminal_phases):
+            continue
+        plans, _transactions_by_channel = _reconstruct_dormancy_group(
+            unit.unit_key,
+            group_id,
+            group_transactions,
+        )
+        _validate_recovered_group_channels(unit, plans)
+        raise ReconcileRecoveryConflictError(
+            "dormancy group contains COMMIT and ABORT terminals; "
+            "manual intervention is required"
+        )
+
+
+def _validate_recovered_group_channels(
+    unit: VocabUnit,
+    plans: Sequence[PlannedTransition],
+) -> None:
+    active_channels = tuple(unit.active_channel_states())
+    if tuple(plan.channel for plan in plans) != active_channels:
+        raise ReconcileRecoveryError(
+            "pending dormancy members do not match every active channel"
+        )
 
 
 def _read_recovery_transactions(
@@ -1745,9 +1827,13 @@ def _reconstruct_dormancy_group(
                 f"pending dormancy member identity mismatch for {channel}"
             )
         terminal_phase = transaction["terminal_phase"]
-        if terminal_phase not in (None, T9_STATE_PHASE_COMMIT):
+        if terminal_phase not in (
+            None,
+            T9_STATE_PHASE_COMMIT,
+            T9_STATE_PHASE_ABORT,
+        ):
             raise ReconcileRecoveryError(
-                "pending dormancy group contains an aborted member"
+                "pending dormancy group contains an unknown terminal"
             )
         transactions_by_channel[channel] = transaction
     return plans, transactions_by_channel
@@ -1776,20 +1862,16 @@ def _recover_dormancy_group(
     }
     current_states = unit.active_channel_states()
     states = tuple(current_states.get(plan.channel) for plan in plans)
+    has_committed_member = any(
+        transaction["terminal_phase"] == T9_STATE_PHASE_COMMIT
+        for transaction in transactions_by_channel.values()
+    )
 
     if all(state == STATE_MASTERED for state in states):
-        if any(
-            transaction["terminal_phase"] == T9_STATE_PHASE_COMMIT
-            for transaction in transactions_by_channel.values()
-        ):
-            aborted = _abort_prepared_plans(
-                unit.unit_key,
-                pending_plans,
-                event_log,
-            )
+        if has_committed_member:
             raise ReconcileRecoveryConflictError(
-                "committed dormancy member conflicts with persisted source state",
-                aborted_transition_ids=aborted,
+                "committed dormancy member conflicts with persisted source state; "
+                "manual intervention is required"
             )
         progress = observe_unit(
             note_id,
@@ -1907,11 +1989,12 @@ def _recover_dormancy_group(
             recovered_transition_ids=tuple(committed_now),
         )
 
-    aborted = _abort_prepared_plans(
-        unit.unit_key,
-        pending_plans,
-        event_log,
-    )
+    if has_committed_member:
+        raise ReconcileRecoveryConflictError(
+            "committed dormancy member conflicts with mixed persisted states; "
+            "manual intervention is required"
+        )
+    aborted = _abort_prepared_plans(unit.unit_key, pending_plans, event_log)
     raise ReconcileRecoveryConflictError(
         "dormancy member states are mixed or outside source/target",
         aborted_transition_ids=aborted,

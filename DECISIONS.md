@@ -2204,3 +2204,38 @@ the requested active channel in RELAPSE. An already-active card returns
 `False`. Otherwise exactly that card is unsuspended and exact card readback
 must prove it is no longer suspended before returning `True`. This emits no
 STATE event; RELAPSE to LEARNING still requires a later lifecycle review.
+
+## D43 — Idempotent partial-ABORT group recovery
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T9.3 closure
+
+A verified dormancy group is logically terminally aborted once any member has
+a valid ABORT terminal and no member has a COMMIT terminal. If an ABORT append
+fails after earlier members were terminally aborted, the next recovery run
+preserves those terminals and appends ABORT only for remaining pending
+prepared members, in `CHANNELS` order. It performs no Anki mutation, never
+duplicates an ABORT, never invents a missing PREPARE, and reports a recovery
+conflict after all prepared members are terminally aborted.
+
+An additional ABORT append failure is propagated. Already durable ABORTs stay
+valid and later recovery retries only members whose PREPARE remains pending.
+A partially aborted group is never allowed to resume state materialization,
+suspension, or COMMIT.
+
+A group containing both COMMIT and ABORT terminals is a permanent recovery
+conflict requiring manual intervention. Automatic recovery performs no Anki
+mutation and appends no further terminal for that mixed group; it never tries
+to overwrite persisted state to make the terminals agree.
+
+When a COMMIT member already conflicts with source or mixed persisted states,
+automatic recovery likewise leaves pending members untouched and requires
+manual intervention instead of manufacturing a new COMMIT/ABORT mixture.
+
+After a group is completely aborted, its terminal history remains valid D39
+journal history and does not itself block unrelated reconciliation. Before a
+new PREPARE, however, T9.3 checks the planned transition IDs against existing
+journal transactions. Reuse of an aborted or otherwise existing transition ID
+fails closed, preventing PREPARE to ABORT to PREPARE and PREPARE to ABORT to
+COMMIT histories for the same transition identity.
