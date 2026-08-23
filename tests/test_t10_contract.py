@@ -27,6 +27,7 @@ from vocab.contracts import (
     FRAME_SLOT_MIN_TOKENS,
     LEXICAL_TOKEN_PATTERN,
     SLUG_PATTERN,
+    T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS,
     T10_ENCOUNTER_EMIT_ZERO_COUNTS,
     T10_ENCOUNTER_PRODUCER_ID,
     T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS,
@@ -96,6 +97,20 @@ def test_t10_encounter_producer_contract_is_exact() -> None:
         "corpus_file_count",
     )
     assert T10_ENCOUNTER_EMIT_ZERO_COUNTS is True
+
+
+def test_t10_encounter_allowed_payload_fields_are_the_required_tuple() -> None:
+    assert (
+        T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS
+        == T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+    )
+    assert (
+        T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS
+        is T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+    )
+    assert all(
+        isinstance(field, str) for field in T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS
+    )
 
 
 def test_generic_encounter_contract_and_schema_version_are_unchanged() -> None:

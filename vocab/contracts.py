@@ -505,6 +505,9 @@ T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
     "corpus_snapshot_digest",
     "corpus_file_count",
 )
+T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+)
 T10_ENCOUNTER_EMIT_ZERO_COUNTS: Final[bool] = True
 
 

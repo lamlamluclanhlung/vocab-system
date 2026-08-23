@@ -2555,3 +2555,71 @@ optimization; simple O(number of Units × corpus size) behavior is acceptable.
 
 Concurrency, scheduling, automatic retry, corpus caching/indexing, incremental
 scans, and supersession are out of scope.
+
+## D50 — T10 corpus contract hardening
+
+**Date:** 2026-08-23
+**Status:** Accepted
+**Blocks:** T10
+
+For the flat v0 corpus, a canonical relative path is exactly the direct-child
+filename string returned by the Python filesystem directory entry. It is not
+an absolute path and does not include the corpus root, `.` or `..`, or any path
+separator. T10 performs no Unicode, separator, dot-segment, or case
+normalization. It preserves the filename's exact case. Canonical file order is
+ordinary Python lexical order over those exact filename strings, and that exact
+string enters each corpus-digest file object's `path`. Duplicate exact
+canonical filenames fail closed. Cross-platform path portability is out of
+scope.
+
+URL rejection happens over the full decoded plaintext before tokenization,
+splitting, or any unit matching. T10 computes exactly
+`casefolded_text = decoded_text.casefold()` and rejects a corpus file when any
+literal member of `CORPUS_REJECT_URL_PREFIXES` is a substring of
+`casefolded_text`. It does not use a URL parser, regex or token boundary,
+whitespace stripping, or a clickability heuristic.
+
+The T10 producer payload keyset is closed. The allowed fields constant is an
+alias of the required fields tuple:
+
+```python
+T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+)
+```
+
+A `t10-corpus` ENCOUNTER payload has exactly that keyset: every field is
+required and no additional field is allowed. This producer-specific closure
+does not change the generic non-T10 v1 ENCOUNTER contract, whose required
+payload tuple remains exactly `("count", "source", "month")`, or
+`EVENT_SCHEMA_VERSION`, which remains 1.
+
+During emit preflight, T10 fully validates every historical event in the
+`t10-corpus` producer namespace. It recomputes every historical
+`encounter_id` from the envelope `event.unit_key` and the payload's exact
+`producer`, `scan_version`, `source`, and `month` through the D48 canonical-JSON
+and SHA-256 formula. Any mismatch fails closed before any append. T10 performs
+the same recomputation for every planned event instead of trusting a supplied
+identifier. Generic ENCOUNTER events outside the T10 producer namespace are
+unaffected.
+
+`corpus_file_count` is exactly `len(frozen_corpus_snapshot.files)`, including
+zero for an empty snapshot. Events derived from the same frozen snapshot carry
+the same corpus snapshot digest and the same file count. The value must be an
+actual integer greater than or equal to zero. Within historical T10 events for
+one producer, scan version, source, and month, equal corpus snapshot digests
+with differing file counts are a conflict and fail before append.
+
+The D19 matcher remains the single semantic authority for unit matching. A
+future implementation may refactor its shared pure matching primitive to
+expose the canonical match end needed by both `contains_unit` and T10's
+non-overlapping count. T10 must consume that shared primitive rather than copy
+the matching logic into `vocab/corpus.py`. Such a refactor must preserve the
+existing public behavior, pass the full validator suite, and leave all frozen
+D19 constants unchanged. This design-hardening task does not modify
+`vocab/validators.py`.
+
+Corpus scanning implementation, runtime corpus tests, recursive directories,
+symlinks, portability normalization, URL parsing, matcher refactoring,
+validator changes, EventLog schema changes, lifecycle behavior, scheduling,
+retries, caching, incremental scans, and supersession remain out of scope.

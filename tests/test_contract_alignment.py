@@ -19,6 +19,7 @@ from vocab.contracts import (
     ANKI_SORT_FIELD,
     NOVEL_CONTEXT_FIELDS,
     TARGET_FLAG_VALUE,
+    T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS,
     T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS,
     EVENT_PAYLOAD_REQUIRED_FIELDS,
     SOURCE_REF_KINDS,
@@ -321,6 +322,9 @@ def test_t10_encounter_requirements_extend_generic_v1_without_changing_it() -> N
     assert generic_fields == ("count", "source", "month")
     assert T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS[:3] == generic_fields
     assert set(generic_fields) < set(T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS)
+    assert set(T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS) == set(
+        T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+    )
     assert "registry_snapshot_digest" not in T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
     assert EVENT_SCHEMA_VERSION == 1
     assert EVENT_TYPES == (
