@@ -7,25 +7,41 @@ from copy import deepcopy
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
 import vocab.corpus as corpus_module
-from vocab.contracts import ANKI_NOTE_TYPE_NAME, CORPUS_SCAN_VERSION, NOTE_FIELDS
+from vocab.contracts import (
+    ANKI_NOTE_TYPE_NAME,
+    CORPUS_SCAN_VERSION,
+    EVENT_SCHEMA_VERSION,
+    NOTE_FIELDS,
+    T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS,
+    T10_ENCOUNTER_PRODUCER_ID,
+)
 from vocab.corpus import (
     CorpusCount,
     CorpusCountError,
+    CorpusEmissionError,
+    CorpusEmitReport,
+    CorpusEncounterError,
     CorpusFileSnapshot,
+    CorpusHistoryError,
     CorpusRegistryError,
     CorpusScanResult,
     CorpusSnapshot,
     CorpusSnapshotError,
+    EncounterPlan,
     RegistryEntry,
+    build_encounter_plans,
     count_scan,
     count_unit_occurrences,
+    emit_scan,
     read_corpus_snapshot,
     read_registry_snapshot,
 )
+from vocab.models import Event
 
 
 def note_fields(**overrides: object) -> dict[str, dict[str, object]]:
@@ -152,6 +168,129 @@ def count_snapshot_blocks(
         for file in snapshot.files
         for block in file.blocks
     )
+
+
+def scan_result(
+    *counts: CorpusCount,
+    source: str = "reading",
+    month: str = "2026-08",
+    corpus_snapshot_digest: str | None = None,
+    corpus_file_count: int = 2,
+) -> CorpusScanResult:
+    digest = (
+        sha256(b"frozen corpus").hexdigest()
+        if corpus_snapshot_digest is None
+        else corpus_snapshot_digest
+    )
+    return CorpusScanResult(
+        source=source,
+        month=month,
+        corpus_snapshot_digest=digest,
+        corpus_file_count=corpus_file_count,
+        counts=tuple(counts),
+    )
+
+
+def word_count(name: str, count: int = 1) -> CorpusCount:
+    return CorpusCount(
+        unit_key=f"{name}::sense",
+        lemma=name,
+        unit_type="word",
+        count=count,
+    )
+
+
+def expected_encounter_id(
+    unit_key: str,
+    *,
+    source: str = "reading",
+    month: str = "2026-08",
+) -> str:
+    canonical = json.dumps(
+        {
+            "producer": T10_ENCOUNTER_PRODUCER_ID,
+            "scan_version": CORPUS_SCAN_VERSION,
+            "source": source,
+            "month": month,
+            "unit_key": unit_key,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(canonical).hexdigest()
+
+
+def event_from_plan(
+    plan: EncounterPlan,
+    *,
+    payload_updates: dict[str, object] | None = None,
+    event_updates: dict[str, object] | None = None,
+) -> Event:
+    payload = dict(plan.payload)
+    if payload_updates is not None:
+        payload.update(payload_updates)
+    values: dict[str, object] = {
+        "v": EVENT_SCHEMA_VERSION,
+        "ts": "2026-08-23T00:00:00+00:00",
+        "day": "2026-08-23",
+        "event": "ENCOUNTER",
+        "unit_key": plan.unit_key,
+        "payload": payload,
+    }
+    if event_updates is not None:
+        values.update(event_updates)
+    return Event(**values)  # type: ignore[arg-type]
+
+
+class FakeEventLog:
+    def __init__(
+        self,
+        events: list[Event] | None = None,
+        *,
+        read_result: object | None = None,
+        read_error: Exception | None = None,
+        fail_on_append: int | None = None,
+        return_transform: Callable[[Event], object] | None = None,
+    ) -> None:
+        self.events = [] if events is None else list(events)
+        self.read_result = read_result
+        self.read_error = read_error
+        self.fail_on_append = fail_on_append
+        self.return_transform = return_transform
+        self.read_calls = 0
+        self.log_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def read(self) -> object:
+        self.read_calls += 1
+        if self.read_error is not None:
+            raise self.read_error
+        if self.read_result is not None:
+            return self.read_result
+        return list(self.events)
+
+    def log(
+        self,
+        event: str,
+        unit_key: str,
+        payload: dict[str, object],
+    ) -> object:
+        self.log_calls.append((event, unit_key, dict(payload)))
+        if self.fail_on_append == len(self.log_calls):
+            raise OSError("injected append failure")
+        stored = Event(
+            v=EVENT_SCHEMA_VERSION,
+            ts="2026-08-23T00:00:00+00:00",
+            day="2026-08-23",
+            event=event,
+            unit_key=unit_key,
+            payload=dict(payload),
+        )
+        self.events.append(stored)
+        if self.return_transform is not None:
+            return self.return_transform(stored)
+        return stored
 
 
 def test_registry_snapshot_reads_once_and_returns_unit_key_order() -> None:
@@ -706,11 +845,18 @@ def test_corpus_module_has_no_copied_matcher_or_persistence_architecture() -> No
     assert "vocab.events" not in imported_modules
     assert "events" not in imported_modules
     assert imported_modules.isdisjoint(
-        {"random", "time", "datetime", "requests", "urllib"}
+        {
+            "random",
+            "time",
+            "datetime",
+            "requests",
+            "urllib",
+            "sqlite3",
+            "reconcile",
+            "vocab.reconcile",
+        }
     )
     for forbidden in (
-        "EventLog",
-        "event_log.log",
         "update_note_fields(",
         "add_notes(",
         "suspend(",
@@ -915,3 +1061,682 @@ def test_count_scan_rejects_malformed_corpus_digest(digest: object) -> None:
 
     with pytest.raises(CorpusCountError, match="invalid SHA-256"):
         count_scan((), corpus)
+
+
+def test_encounter_id_matches_frozen_known_vector() -> None:
+    result = scan_result(
+        CorpusCount("art::creative-work", "art", "word", 3)
+    )
+
+    plan = build_encounter_plans(result)[0]
+
+    assert plan.payload["encounter_id"] == (
+        "5fcb9721e6cd7c3c75aea0b80bb7e345"
+        "90356ac2ef2a4ea7923978ee8e6f2bb2"
+    )
+
+
+def test_encounter_id_is_deterministic_across_repeated_plan_builds() -> None:
+    result = scan_result(word_count("art", 3))
+
+    assert build_encounter_plans(result) == build_encounter_plans(result)
+
+
+@pytest.mark.parametrize(
+    "changed_result",
+    [
+        scan_result(word_count("art", 99)),
+        scan_result(CorpusCount("art::sense", "music", "word", 1)),
+        scan_result(
+            CorpusCount("art::sense", "modern art", "chunk", 1)
+        ),
+        scan_result(
+            word_count("art"),
+            corpus_snapshot_digest=sha256(b"another corpus").hexdigest(),
+        ),
+        scan_result(word_count("art"), corpus_file_count=99),
+    ],
+)
+def test_observation_provenance_does_not_affect_encounter_id(
+    changed_result: CorpusScanResult,
+) -> None:
+    baseline = build_encounter_plans(scan_result(word_count("art")))[0]
+    changed = build_encounter_plans(changed_result)[0]
+
+    assert changed.payload["encounter_id"] == baseline.payload["encounter_id"]
+
+
+@pytest.mark.parametrize(
+    "changed_result",
+    [
+        scan_result(word_count("music")),
+        scan_result(word_count("art"), source="own-writing"),
+        scan_result(word_count("art"), month="2026-07"),
+    ],
+)
+def test_encounter_identity_fields_change_encounter_id(
+    changed_result: CorpusScanResult,
+) -> None:
+    baseline = build_encounter_plans(scan_result(word_count("art")))[0]
+    changed = build_encounter_plans(changed_result)[0]
+
+    assert changed.payload["encounter_id"] != baseline.payload["encounter_id"]
+
+
+def test_build_encounter_plans_preserves_order_and_exact_payload() -> None:
+    result = scan_result(
+        word_count("art", 0),
+        CorpusCount(
+            "pose-a-threat-to::sense",
+            "pose a threat to",
+            "chunk",
+            4,
+        ),
+        corpus_file_count=7,
+    )
+
+    plans = build_encounter_plans(result)
+
+    assert tuple(plan.unit_key for plan in plans) == (
+        "art::sense",
+        "pose-a-threat-to::sense",
+    )
+    assert tuple(plans[0].payload) == T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS
+    assert set(plans[0].payload) == set(T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS)
+    assert plans[0].payload == {
+        "count": 0,
+        "source": result.source,
+        "month": result.month,
+        "producer": T10_ENCOUNTER_PRODUCER_ID,
+        "scan_version": CORPUS_SCAN_VERSION,
+        "encounter_id": expected_encounter_id("art::sense"),
+        "lemma": "art",
+        "unit_type": "word",
+        "corpus_snapshot_digest": result.corpus_snapshot_digest,
+        "corpus_file_count": 7,
+    }
+
+
+def test_empty_scan_result_builds_no_plans() -> None:
+    assert build_encounter_plans(scan_result()) == ()
+
+
+def test_encounter_plan_defensively_copies_and_freezes_payload() -> None:
+    original = {"count": 1}
+    plan = EncounterPlan("art::sense", original)
+
+    original["count"] = 2
+
+    assert plan.payload == {"count": 1}
+    with pytest.raises(TypeError, match="immutable"):
+        plan.payload["count"] = 3
+
+
+@pytest.mark.parametrize("bad_count", [True, -1])
+def test_build_encounter_plans_rejects_invalid_count(bad_count: object) -> None:
+    result = scan_result(
+        CorpusCount("art::sense", "art", "word", bad_count)  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(CorpusEncounterError, match="non-negative integer"):
+        build_encounter_plans(result)
+
+
+@pytest.mark.parametrize("bad_file_count", [True, -1])
+def test_build_encounter_plans_rejects_invalid_file_count(
+    bad_file_count: object,
+) -> None:
+    result = scan_result(
+        word_count("art"),
+        corpus_file_count=bad_file_count,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(CorpusEncounterError, match="corpus_file_count"):
+        build_encounter_plans(result)
+
+
+@pytest.mark.parametrize("digest", ["0" * 63, "A" * 64, "g" * 64])
+def test_build_encounter_plans_rejects_malformed_digest(digest: str) -> None:
+    with pytest.raises(CorpusEncounterError, match="digest"):
+        build_encounter_plans(
+            scan_result(word_count("art"), corpus_snapshot_digest=digest)
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "month"),
+    [("Reading", "2026-08"), ("reading", "2026-13")],
+)
+def test_build_encounter_plans_rejects_invalid_source_or_month(
+    source: str,
+    month: str,
+) -> None:
+    with pytest.raises(CorpusEncounterError):
+        build_encounter_plans(
+            scan_result(word_count("art"), source=source, month=month)
+        )
+
+
+def test_build_encounter_plans_rejects_duplicate_unit_key() -> None:
+    result = scan_result(word_count("art"), word_count("art", 2))
+
+    with pytest.raises(CorpusEncounterError, match="unique"):
+        build_encounter_plans(result)
+
+
+def test_build_encounter_plans_rejects_unsorted_counts() -> None:
+    result = scan_result(word_count("zero"), word_count("art"))
+
+    with pytest.raises(CorpusEncounterError, match="strictly ordered"):
+        build_encounter_plans(result)
+
+
+@pytest.mark.parametrize(
+    "count",
+    [
+        CorpusCount("INVALID", "art", "word", 1),
+        CorpusCount("art::sense", " ", "word", 1),
+        CorpusCount("art::sense", "art", "phrase", 1),
+        CorpusCount("art::sense", "two tokens", "word", 1),
+    ],
+)
+def test_build_encounter_plans_rejects_malformed_lexical_count(
+    count: CorpusCount,
+) -> None:
+    with pytest.raises(CorpusEncounterError):
+        build_encounter_plans(scan_result(count))
+
+
+def test_build_encounter_plans_requires_exact_result_and_count_types() -> None:
+    with pytest.raises(CorpusEncounterError, match="exact CorpusScanResult"):
+        build_encounter_plans(object())  # type: ignore[arg-type]
+
+    result = replace(scan_result(), counts=("bad",))  # type: ignore[arg-type]
+    with pytest.raises(CorpusEncounterError, match="exact CorpusCount"):
+        build_encounter_plans(result)
+
+
+def test_non_t10_history_is_ignored_by_empty_scan_preflight() -> None:
+    generic = Event(
+        v=EVENT_SCHEMA_VERSION,
+        ts="2026-08-23T00:00:00+00:00",
+        day="2026-08-23",
+        event="ENCOUNTER",
+        unit_key="art::sense",
+        payload={"count": 1, "source": "reading", "month": "2026-08"},
+    )
+    other_producer = replace(
+        generic,
+        payload={"producer": "other", "anything": object()},
+    )
+    state_with_t10_marker = replace(
+        generic,
+        event="STATE",
+        payload={"producer": T10_ENCOUNTER_PRODUCER_ID},
+    )
+    event_log = FakeEventLog([generic, other_producer, state_with_t10_marker])
+
+    report = emit_scan(scan_result(), event_log=event_log)  # type: ignore[arg-type]
+
+    assert report == CorpusEmitReport("reading", "2026-08", (), ())
+    assert event_log.read_calls == 1
+    assert event_log.log_calls == []
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_field",
+        "extra_field",
+        "scan_version_bool",
+        "wrong_scan_version",
+        "count_bool",
+        "count_negative",
+        "file_count_bool",
+        "file_count_negative",
+        "malformed_encounter_id",
+        "mismatched_encounter_id",
+        "malformed_corpus_digest",
+        "blank_lemma",
+        "invalid_unit_type",
+        "invalid_unit_shape",
+    ],
+)
+def test_historical_t10_payload_malformation_fails_closed(
+    malformation: str,
+) -> None:
+    result = scan_result(word_count("art"))
+    plan = build_encounter_plans(result)[0]
+    payload = dict(plan.payload)
+    if malformation == "missing_field":
+        del payload["count"]
+    elif malformation == "extra_field":
+        payload["extra"] = "bad"
+    elif malformation == "scan_version_bool":
+        payload["scan_version"] = True
+    elif malformation == "wrong_scan_version":
+        payload["scan_version"] = CORPUS_SCAN_VERSION + 1
+    elif malformation == "count_bool":
+        payload["count"] = True
+    elif malformation == "count_negative":
+        payload["count"] = -1
+    elif malformation == "file_count_bool":
+        payload["corpus_file_count"] = True
+    elif malformation == "file_count_negative":
+        payload["corpus_file_count"] = -1
+    elif malformation == "malformed_encounter_id":
+        payload["encounter_id"] = "bad"
+    elif malformation == "mismatched_encounter_id":
+        payload["encounter_id"] = "0" * 64
+    elif malformation == "malformed_corpus_digest":
+        payload["corpus_snapshot_digest"] = "bad"
+    elif malformation == "blank_lemma":
+        payload["lemma"] = " "
+    elif malformation == "invalid_unit_type":
+        payload["unit_type"] = "phrase"
+    elif malformation == "invalid_unit_shape":
+        payload["lemma"] = "two tokens"
+    event = event_from_plan(plan, event_updates={"payload": payload})
+    event_log = FakeEventLog([event])
+
+    with pytest.raises(CorpusHistoryError):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.read_calls == 1
+    assert event_log.log_calls == []
+
+
+def test_wrong_producer_encounter_is_outside_t10_namespace() -> None:
+    result = scan_result(word_count("art"))
+    plan = build_encounter_plans(result)[0]
+    event = event_from_plan(
+        plan,
+        payload_updates={"producer": "other", "count": True},
+    )
+    event_log = FakeEventLog([event])
+
+    report = emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert len(report.appended_encounter_ids) == 1
+    assert report.existing_encounter_ids == ()
+
+
+def test_historical_t10_event_rejects_malformed_unit_key() -> None:
+    result = scan_result(word_count("art"))
+    plan = build_encounter_plans(result)[0]
+    event = event_from_plan(plan, event_updates={"unit_key": "INVALID"})
+    event_log = FakeEventLog([event])
+
+    with pytest.raises(CorpusHistoryError, match="unit_key"):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+@pytest.mark.parametrize("version", [True, 2])
+def test_historical_t10_event_rejects_wrong_schema_version(version: object) -> None:
+    result = scan_result(word_count("art"))
+    plan = build_encounter_plans(result)[0]
+    event = event_from_plan(plan, event_updates={"v": version})
+    event_log = FakeEventLog([event])
+
+    with pytest.raises(CorpusHistoryError, match="schema version"):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_duplicate_historical_t10_encounter_id_fails_even_when_identical() -> None:
+    result = scan_result(word_count("art"))
+    plan = build_encounter_plans(result)[0]
+    event = event_from_plan(plan)
+    event_log = FakeEventLog([event, event])
+
+    with pytest.raises(CorpusHistoryError, match="globally unique"):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_emit_scan_with_no_history_appends_all_plans_once() -> None:
+    result = scan_result(word_count("art"), word_count("music"), word_count("zero", 0))
+    plans = build_encounter_plans(result)
+    event_log = FakeEventLog()
+
+    report = emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    expected_ids = tuple(plan.payload["encounter_id"] for plan in plans)
+    assert report == CorpusEmitReport(
+        source="reading",
+        month="2026-08",
+        appended_encounter_ids=expected_ids,
+        existing_encounter_ids=(),
+    )
+    assert event_log.read_calls == 1
+    assert [call[0] for call in event_log.log_calls] == ["ENCOUNTER"] * 3
+    assert [call[1] for call in event_log.log_calls] == [
+        "art::sense",
+        "music::sense",
+        "zero::sense",
+    ]
+    assert all(
+        tuple(payload) == T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS
+        for _event, _unit_key, payload in event_log.log_calls
+    )
+
+
+def test_exact_rerun_appends_zero_and_reports_all_existing() -> None:
+    result = scan_result(word_count("art"), word_count("music"))
+    event_log = FakeEventLog()
+    first = emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+    first_call_count = len(event_log.log_calls)
+
+    second = emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert first.appended_encounter_ids == second.existing_encounter_ids
+    assert second.appended_encounter_ids == ()
+    assert len(event_log.log_calls) == first_call_count
+    assert event_log.read_calls == 2
+
+
+def test_partial_history_skips_existing_and_appends_only_missing() -> None:
+    result = scan_result(word_count("art"), word_count("music"), word_count("zero"))
+    plans = build_encounter_plans(result)
+    event_log = FakeEventLog(
+        [event_from_plan(plans[2]), event_from_plan(plans[0])]
+    )
+
+    report = emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert report.existing_encounter_ids == (
+        plans[0].payload["encounter_id"],
+        plans[2].payload["encounter_id"],
+    )
+    assert report.appended_encounter_ids == (plans[1].payload["encounter_id"],)
+    assert [call[1] for call in event_log.log_calls] == ["music::sense"]
+
+
+@pytest.mark.parametrize(
+    "payload_updates",
+    [
+        {"count": 99},
+        {"lemma": "music"},
+        {"unit_type": "chunk"},
+    ],
+)
+def test_same_encounter_id_with_semantic_difference_fails_before_append(
+    payload_updates: dict[str, object],
+) -> None:
+    result = scan_result(word_count("art"))
+    plan = build_encounter_plans(result)[0]
+    event_log = FakeEventLog([event_from_plan(plan, payload_updates=payload_updates)])
+
+    with pytest.raises(CorpusHistoryError):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_current_source_month_corpus_digest_is_immutable() -> None:
+    old_result = scan_result(
+        word_count("art"),
+        corpus_snapshot_digest=sha256(b"old").hexdigest(),
+    )
+    current_result = replace(
+        old_result,
+        corpus_snapshot_digest=sha256(b"new").hexdigest(),
+    )
+    historical = event_from_plan(build_encounter_plans(old_result)[0])
+    event_log = FakeEventLog([historical])
+
+    with pytest.raises(CorpusHistoryError, match="digest is immutable"):
+        emit_scan(current_result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_same_digest_with_different_corpus_file_count_is_immutable() -> None:
+    old_result = scan_result(word_count("art"), corpus_file_count=2)
+    current_result = replace(old_result, corpus_file_count=3)
+    historical = event_from_plan(build_encounter_plans(old_result)[0])
+    event_log = FakeEventLog([historical])
+
+    with pytest.raises(CorpusHistoryError, match="file count is immutable"):
+        emit_scan(current_result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_unrelated_history_rejects_same_artifact_with_different_file_counts() -> None:
+    digest = sha256(b"same artifact").hexdigest()
+    first_result = scan_result(
+        word_count("art"),
+        source="other",
+        corpus_snapshot_digest=digest,
+        corpus_file_count=2,
+    )
+    second_result = scan_result(
+        word_count("music"),
+        source="other",
+        corpus_snapshot_digest=digest,
+        corpus_file_count=3,
+    )
+    history = [
+        event_from_plan(build_encounter_plans(first_result)[0]),
+        event_from_plan(build_encounter_plans(second_result)[0]),
+    ]
+    event_log = FakeEventLog(history)
+
+    with pytest.raises(CorpusHistoryError, match="one artifact"):
+        emit_scan(scan_result(), event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_removed_unit_history_still_enforces_corpus_immutability() -> None:
+    old_result = scan_result(
+        word_count("removed"),
+        corpus_snapshot_digest=sha256(b"old").hexdigest(),
+    )
+    current_result = scan_result(
+        corpus_snapshot_digest=sha256(b"new").hexdigest(),
+    )
+    historical = event_from_plan(build_encounter_plans(old_result)[0])
+    event_log = FakeEventLog([historical])
+
+    with pytest.raises(CorpusHistoryError, match="digest is immutable"):
+        emit_scan(current_result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_empty_current_plans_still_preflight_valid_matching_history() -> None:
+    old_result = scan_result(word_count("removed"))
+    current_result = scan_result()
+    event_log = FakeEventLog(
+        [event_from_plan(build_encounter_plans(old_result)[0])]
+    )
+
+    report = emit_scan(current_result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert report == CorpusEmitReport("reading", "2026-08", (), ())
+    assert event_log.read_calls == 1
+    assert event_log.log_calls == []
+
+
+def test_malformed_later_history_causes_zero_appends() -> None:
+    result = scan_result(word_count("art"))
+    unrelated_plan = build_encounter_plans(
+        scan_result(word_count("music"), source="other")
+    )[0]
+    malformed = event_from_plan(
+        unrelated_plan,
+        payload_updates={"count": True},
+    )
+    event_log = FakeEventLog(
+        [
+            Event(
+                v=EVENT_SCHEMA_VERSION,
+                ts="2026-08-23T00:00:00+00:00",
+                day="2026-08-23",
+                event="FORGE",
+                unit_key="art::sense",
+                payload={},
+            ),
+            malformed,
+        ]
+    )
+
+    with pytest.raises(CorpusHistoryError):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_later_plan_conflict_causes_zero_appends_for_all_plans() -> None:
+    result = scan_result(word_count("art"), word_count("music"))
+    plans = build_encounter_plans(result)
+    conflict = event_from_plan(plans[1], payload_updates={"count": 99})
+    event_log = FakeEventLog([conflict])
+
+    with pytest.raises(CorpusHistoryError, match="conflicts"):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_partial_append_failure_resumes_only_missing_events() -> None:
+    result = scan_result(
+        word_count("alpha"),
+        word_count("bravo"),
+        word_count("charlie"),
+        word_count("delta"),
+        word_count("echo"),
+    )
+    plans = build_encounter_plans(result)
+    failing_log = FakeEventLog(fail_on_append=3)
+
+    with pytest.raises(CorpusEmissionError) as raised:
+        emit_scan(result, event_log=failing_log)  # type: ignore[arg-type]
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert len(failing_log.events) == 2
+    assert [call[1] for call in failing_log.log_calls] == [
+        "alpha::sense",
+        "bravo::sense",
+        "charlie::sense",
+    ]
+
+    resumed_log = FakeEventLog(failing_log.events)
+    report = emit_scan(result, event_log=resumed_log)  # type: ignore[arg-type]
+
+    assert report.existing_encounter_ids == tuple(
+        plan.payload["encounter_id"] for plan in plans[:2]
+    )
+    assert report.appended_encounter_ids == tuple(
+        plan.payload["encounter_id"] for plan in plans[2:]
+    )
+    assert [call[1] for call in resumed_log.log_calls] == [
+        "charlie::sense",
+        "delta::sense",
+        "echo::sense",
+    ]
+    final_ids = [event.payload["encounter_id"] for event in resumed_log.events]
+    assert len(final_ids) == len(set(final_ids)) == 5
+
+
+@pytest.mark.parametrize(
+    "return_transform",
+    [
+        lambda _stored: object(),
+        lambda stored: replace(stored, event="STATE"),
+        lambda stored: replace(stored, unit_key="other::sense"),
+        lambda stored: replace(stored, payload={**stored.payload, "count": 99}),
+        lambda stored: replace(stored, v=EVENT_SCHEMA_VERSION + 1),
+    ],
+)
+def test_emit_scan_rejects_untrusted_log_return_and_stops_immediately(
+    return_transform: Callable[[Event], object],
+) -> None:
+    result = scan_result(word_count("art"), word_count("music"))
+    event_log = FakeEventLog(return_transform=return_transform)
+
+    with pytest.raises(CorpusEmissionError):
+        emit_scan(result, event_log=event_log)  # type: ignore[arg-type]
+
+    assert len(event_log.log_calls) == 1
+
+
+def test_event_log_read_failure_is_wrapped_with_cause_and_never_appends() -> None:
+    failure = OSError("read failed")
+    event_log = FakeEventLog(read_error=failure)
+
+    with pytest.raises(CorpusHistoryError) as raised:
+        emit_scan(scan_result(word_count("art")), event_log=event_log)  # type: ignore[arg-type]
+
+    assert raised.value.__cause__ is failure
+    assert event_log.read_calls == 1
+    assert event_log.log_calls == []
+
+
+def test_event_log_append_failure_is_wrapped_with_cause_and_stops() -> None:
+    event_log = FakeEventLog(fail_on_append=1)
+
+    with pytest.raises(CorpusEmissionError) as raised:
+        emit_scan(
+            scan_result(word_count("art"), word_count("music")),
+            event_log=event_log,  # type: ignore[arg-type]
+        )
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert len(event_log.log_calls) == 1
+    assert event_log.events == []
+
+
+@pytest.mark.parametrize("read_result", [(), {}, "bad"])
+def test_event_log_read_must_return_a_list(read_result: object) -> None:
+    event_log = FakeEventLog(read_result=read_result)
+
+    with pytest.raises(CorpusHistoryError, match="must be a list"):
+        emit_scan(scan_result(), event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.read_calls == 1
+    assert event_log.log_calls == []
+
+
+def test_event_log_read_list_must_contain_only_events() -> None:
+    event_log = FakeEventLog(read_result=[object()])
+
+    with pytest.raises(CorpusHistoryError, match="Event values only"):
+        emit_scan(scan_result(), event_log=event_log)  # type: ignore[arg-type]
+
+    assert event_log.log_calls == []
+
+
+def test_t10_emission_architecture_is_injected_encounter_only() -> None:
+    module_source = inspect.getsource(corpus_module)
+    emit_source = inspect.getsource(emit_scan)
+    preflight_source = inspect.getsource(corpus_module._preflight_emission)
+    tree = ast.parse(module_source)
+    log_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "log"
+    ]
+
+    assert len(log_calls) == 1
+    assert isinstance(log_calls[0].args[0], ast.Constant)
+    assert log_calls[0].args[0].value == "ENCOUNTER"
+    assert preflight_source.count("event_log.read()") == 1
+    assert "event_log.log" not in preflight_source
+    assert "read_registry_snapshot" not in emit_source
+    assert "read_corpus_snapshot" not in emit_source
+    assert "count_scan" not in emit_source
+    assert "STATE" not in emit_source
+    assert "JUDGE" not in emit_source
+    assert "PREPARE" not in module_source
+    assert "COMMIT" not in module_source
+    assert "sqlite" not in module_source.casefold()
+    assert "reconcile" not in module_source.casefold()
