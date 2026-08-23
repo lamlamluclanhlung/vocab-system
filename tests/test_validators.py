@@ -9,6 +9,7 @@ from vocab.models import VocabUnit
 from vocab.validators import (
     contains_unit,
     normalize_tokens,
+    unit_match_spans,
     validate_forge_unit,
     validate_context_bank,
 )
@@ -29,6 +30,19 @@ def test_normalize_tokens_is_deterministic(text, expected) -> None:
 def test_word_matches_complete_token_only() -> None:
     assert contains_unit("This is art.", "art", "word") is True
     assert contains_unit("This is partial.", "art", "word") is False
+
+
+def test_word_match_spans_expose_every_complete_token() -> None:
+    assert unit_match_spans("art art partial art", "art", "word") == (
+        (0, 0),
+        (1, 1),
+        (3, 3),
+    )
+
+
+def test_word_match_spans_preserve_substring_and_hyphen_boundaries() -> None:
+    assert unit_match_spans("partial", "art", "word") == ()
+    assert unit_match_spans("state-of-the-art", "art", "word") == ((3, 3),)
 
 
 def test_word_unit_must_be_exactly_one_token() -> None:
@@ -58,6 +72,27 @@ def test_chunk_allows_at_most_two_inserted_tokens_in_total() -> None:
     ) is False
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("pose a threat to", ((0, 3),)),
+        ("pose a serious threat to", ((0, 4),)),
+        ("pose a very serious threat to", ((0, 5),)),
+        ("pose a very immediate serious threat to", ()),
+    ],
+)
+def test_chunk_match_spans_preserve_insertion_boundary(text, expected) -> None:
+    assert unit_match_spans(text, "pose a threat to", "chunk") == expected
+
+
+def test_chunk_match_spans_expose_overlapping_canonical_starts() -> None:
+    assert unit_match_spans(
+        "pose a pose a threat to",
+        "pose a threat to",
+        "chunk",
+    ) == ((0, 5), (2, 5))
+
+
 def test_chunk_preserves_target_token_order() -> None:
     assert (
         contains_unit(
@@ -83,6 +118,22 @@ def test_frame_matches_one_to_six_slot_tokens() -> None:
         unit,
         "frame",
     ) is True
+
+
+def test_frame_match_span_uses_shortest_canonical_slot_per_start() -> None:
+    assert unit_match_spans(
+        "it is x that that",
+        "it is ___ that",
+        "frame",
+    ) == ((0, 3),)
+
+
+def test_frame_match_spans_expose_overlapping_canonical_starts() -> None:
+    assert unit_match_spans(
+        "it is that it is really that",
+        "it is ___ that",
+        "frame",
+    ) == ((0, 6), (3, 6))
 
 
 def test_frame_rejects_empty_slot() -> None:
@@ -116,6 +167,42 @@ def test_invalid_v0_frame_shape_is_rejected(unit) -> None:
             unit,
             "frame",
         )
+
+
+@pytest.mark.parametrize(
+    ("unit", "unit_type"),
+    [
+        ("two tokens", "word"),
+        ("single", "chunk"),
+        ("it is that", "frame"),
+    ],
+)
+def test_invalid_unit_shape_raises_before_scanning_empty_text(
+    unit,
+    unit_type,
+) -> None:
+    with pytest.raises(ValueError):
+        unit_match_spans("", unit, unit_type)
+
+
+@pytest.mark.parametrize(
+    ("text", "unit", "unit_type"),
+    [
+        ("This is art.", "art", "word"),
+        ("This is partial.", "art", "word"),
+        ("They don't agree.", "don’t", "word"),
+        ("state-of-the-art", "art", "word"),
+        ("pose a serious threat to health", "pose a threat to", "chunk"),
+        ("pose three extra words a threat to", "pose a threat to", "chunk"),
+        ("it is widely believed that", "it is ___ that", "frame"),
+        ("it is that", "it is ___ that", "frame"),
+    ],
+)
+def test_contains_unit_equals_boolean_match_spans(text, unit, unit_type) -> None:
+    assert contains_unit(text, unit, unit_type) == bool(
+        unit_match_spans(text, unit, unit_type)
+    )
+
 
 def valid_forge_unit(**overrides) -> VocabUnit:
     values = {
