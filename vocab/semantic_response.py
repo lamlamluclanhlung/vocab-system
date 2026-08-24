@@ -20,9 +20,9 @@ from .contracts import (
 )
 from .models import T11AssessmentResult
 from .semantic_request import (
-    SemanticRequestError,
     import_semantic_request,
     semantic_request_digest,
+    serialize_semantic_request,
 )
 from .validators import validate_t11_assessment_result
 
@@ -132,11 +132,9 @@ def import_semantic_response(
     ):
         raise SemanticResponseError("request_digest is invalid")
 
-    supplied_request_digest = semantic_request_digest(request)
-    validated_request = import_semantic_request(canonical_json_bytes(request))
+    validated_request_bytes = serialize_semantic_request(request)
+    validated_request = import_semantic_request(validated_request_bytes)
     expected_request_digest = semantic_request_digest(validated_request)
-    if supplied_request_digest != expected_request_digest:
-        raise SemanticRequestError("request changed during validation")
     if bound_request_digest != expected_request_digest:
         raise SemanticResponseError("request_digest does not bind the supplied request")
 

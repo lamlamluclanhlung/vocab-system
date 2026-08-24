@@ -7,6 +7,7 @@ import copy
 import inspect
 import json
 from dataclasses import FrozenInstanceError, fields
+from types import MappingProxyType
 
 import pytest
 
@@ -420,6 +421,55 @@ def test_valid_looking_digest_for_another_request_fails_binding() -> None:
 
     with pytest.raises(SemanticResponseError, match="bind"):
         import_proposal(proposal, request=request)
+
+
+def test_read_only_top_level_mapping_uses_t11_request_authorities() -> None:
+    base_request = make_request()
+    proxy_request = MappingProxyType(base_request)
+    proposal = make_proposal(base_request)
+    plain = import_proposal(proposal, request=base_request)
+
+    imported = import_semantic_response(
+        transport_bytes(proposal),
+        request=proxy_request,
+        assessor_id="GPT-5.6",
+        assessor_version=ASSESSOR_VERSION_UNAVAILABLE_FROM_UI,
+    )
+
+    assert imported.request_digest == semantic_request_digest(base_request)
+    assert imported.request_digest == GOLDEN_REQUEST_DIGEST
+    assert imported.response_digest == GOLDEN_RESPONSE_DIGEST
+    assert imported.assessment_result == plain.assessment_result
+    assert imported.semantic_judge_facts == plain.semantic_judge_facts
+    assert imported.proposal == plain.proposal
+
+
+def test_nested_read_only_mappings_have_identical_request_and_response_identity() -> None:
+    base_request = make_request()
+    nested_request = {
+        key: MappingProxyType(value) if isinstance(value, dict) else value
+        for key, value in base_request.items()
+    }
+    proxy_request = MappingProxyType(nested_request)
+    proposal = make_proposal(base_request)
+    plain = import_proposal(proposal, request=base_request)
+
+    imported = import_semantic_response(
+        transport_bytes(proposal),
+        request=proxy_request,
+        assessor_id="GPT-5.6",
+        assessor_version=ASSESSOR_VERSION_UNAVAILABLE_FROM_UI,
+    )
+
+    assert semantic_request_digest(proxy_request) == semantic_request_digest(
+        base_request
+    )
+    assert imported.request_digest == plain.request_digest
+    assert imported.response_digest == plain.response_digest
+    assert imported.response_digest == GOLDEN_RESPONSE_DIGEST
+    assert imported.assessment_result == plain.assessment_result
+    assert imported.semantic_judge_facts == plain.semantic_judge_facts
+    assert imported.proposal == plain.proposal
 
 
 def test_invalid_supplied_request_propagates_semantic_request_error() -> None:
