@@ -12,11 +12,11 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 from typing import Any, Protocol, cast
 
 from .anki import AnkiConnectClient, AnkiConnectError
 from .anki_template import verify_model_snapshot
+from .artifact_json import canonical_sha256 as _canonical_sha256
 from .contracts import (
     ANKI_LEECH_THRESHOLD,
     ANKI_LEECH_TAG,
@@ -165,17 +165,6 @@ def _lapse_window() -> timedelta:
     return timedelta(
         seconds=STABLE_ZERO_LAPSE_WINDOW_DAYS * LIFECYCLE_SECONDS_PER_DAY
     )
-
-
-def _canonical_sha256(identity: Mapping[str, Any]) -> str:
-    canonical = json.dumps(
-        identity,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return sha256(canonical).hexdigest()
 
 
 def _transition_id(
@@ -2793,13 +2782,7 @@ def _initial_new_episode_id(unit_key: str, channel: str) -> str:
         "channel": channel,
         "unit_key": unit_key,
     }
-    canonical = json.dumps(
-        identity,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return INITIAL_NEW_EPISODE_PREFIX + sha256(canonical).hexdigest()
+    return INITIAL_NEW_EPISODE_PREFIX + _canonical_sha256(identity)
 
 
 def _channel_progress(

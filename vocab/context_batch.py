@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 
 from .anki import AnkiConnectClient
+from .artifact_json import (
+    ArtifactJSONError,
+    canonical_json_bytes,
+    canonical_sha256 as _canonical_sha256,
+    strict_json_loads as _artifact_strict_json_loads,
+)
 from .context import ContextPreview, parse_context_bank
 from .contracts import (
     ANKI_NOTE_TYPE_NAME,
@@ -106,17 +110,6 @@ class ContextImportResult:
 ContextConfirmation = Callable[[ContextPreview], bool]
 
 
-def canonical_json_bytes(value: object) -> bytes:
-    """Return the canonical UTF-8 JSON representation used by T8.1."""
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
-
 def request_id_for_unit(unit: VocabUnit) -> str:
     """Hash the exact persisted lexical/source identity for one Unit."""
     if not isinstance(unit, VocabUnit):
@@ -124,7 +117,7 @@ def request_id_for_unit(unit: VocabUnit) -> str:
     snapshot = {field_name: getattr(unit, field_name) for field_name in _REQUEST_ID_FIELDS}
     if any(not isinstance(value, str) for value in snapshot.values()):
         raise ContextBatchNoteError("request identity fields must be strings")
-    return hashlib.sha256(canonical_json_bytes(snapshot)).hexdigest()
+    return _canonical_sha256(snapshot)
 
 
 def batch_id_for_pairs(pairs: Sequence[Mapping[str, str]]) -> str:
@@ -141,7 +134,7 @@ def batch_id_for_pairs(pairs: Sequence[Mapping[str, str]]) -> str:
             raise ContextBatchTransportError("batch identity values must be strings")
         normalized.append({"unit_key": unit_key, "request_id": request_id})
     normalized.sort(key=lambda pair: pair["unit_key"])
-    return hashlib.sha256(canonical_json_bytes(normalized)).hexdigest()
+    return _canonical_sha256(normalized)
 
 
 def export_context_batch(
@@ -405,31 +398,7 @@ def _unit_and_id_from_note(raw_note: object) -> tuple[int, VocabUnit]:
 
 
 def _strict_json_loads(raw: bytes) -> object:
-    if not isinstance(raw, bytes):
-        raise TypeError("artifact body must be bytes")
     try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ContextBatchTransportError("artifact must be valid UTF-8") from None
-
-    def reject_constant(value: str) -> object:
-        raise ContextBatchTransportError(f"non-standard JSON constant: {value}")
-
-    def exact_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ContextBatchTransportError(f"duplicate JSON key: {key}")
-            result[key] = value
-        return result
-
-    try:
-        return json.loads(
-            text,
-            parse_constant=reject_constant,
-            object_pairs_hook=exact_object,
-        )
-    except ContextBatchTransportError:
-        raise
-    except json.JSONDecodeError:
-        raise ContextBatchTransportError("artifact must be valid JSON") from None
+        return _artifact_strict_json_loads(raw)
+    except ArtifactJSONError as exc:
+        raise ContextBatchTransportError(str(exc)) from None

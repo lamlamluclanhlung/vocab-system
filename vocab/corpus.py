@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,6 +10,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from . import validators
+from .artifact_json import (
+    canonical_json_bytes as _canonical_json_bytes,
+    canonical_sha256 as _canonical_sha256,
+)
 from .contracts import (
     ANKI_NOTE_TYPE_NAME,
     CORPUS_EXTENSIONS,
@@ -163,16 +166,6 @@ class _EventLogPort(Protocol):
     ) -> Event: ...
 
 
-def _canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
-
 def _corpus_digest(files: tuple[CorpusFileSnapshot, ...]) -> str:
     identity = {
         "scan_version": CORPUS_SCAN_VERSION,
@@ -184,7 +177,7 @@ def _corpus_digest(files: tuple[CorpusFileSnapshot, ...]) -> str:
             for file in files
         ],
     }
-    return sha256(_canonical_json_bytes(identity)).hexdigest()
+    return _canonical_sha256(identity)
 
 
 def _split_blocks(decoded_text: str) -> tuple[str, ...]:
@@ -226,7 +219,7 @@ def _encounter_id(
         "month": month,
         "unit_key": unit_key,
     }
-    return sha256(_canonical_json_bytes(identity)).hexdigest()
+    return _canonical_sha256(identity)
 
 
 def _validate_t10_payload(

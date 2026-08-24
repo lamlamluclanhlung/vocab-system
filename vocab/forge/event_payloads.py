@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from ..artifact_json import canonical_json_bytes, canonical_sha256
 from .request import (
     JSONScalar,
     PRODUCER_VERSION,
@@ -21,21 +20,6 @@ from .schema import FORGE_SCHEMA_VERSION
 
 _LOWER_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9._-]{8,128}")
-
-
-def canonical_json_bytes(value: object) -> bytes:
-    """Return the canonical standards-compliant UTF-8 JSON representation."""
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def canonical_sha256(value: object) -> str:
-    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
 def is_valid_attempt_id(value: object) -> bool:
