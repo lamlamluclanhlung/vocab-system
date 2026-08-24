@@ -8,6 +8,15 @@ from collections import Counter
 
 from .contracts import (
     APOSTROPHE_EQUIVALENTS,
+    ASSESSMENT_ABSTAIN_REASON_CODES,
+    ASSESSMENT_FAILURE_CODES_BY_CHANNEL,
+    ASSESSMENT_OMITTED_REASON_CODES,
+    ASSESSMENT_OUTCOME_ABSTAIN,
+    ASSESSMENT_OUTCOME_FAIL,
+    ASSESSMENT_OUTCOME_OMITTED,
+    ASSESSMENT_OUTCOME_PASS,
+    ASSESSMENT_OUTCOMES,
+    ASSESSMENT_PRODUCTIVE_PRESENCE_CHANNELS,
     CANONICAL_APOSTROPHE,
     CHANNELS,
     CHUNK_MAX_INSERTED_TOKENS,
@@ -31,12 +40,13 @@ from .contracts import (
     TARGET_FIELD_BY_CHANNEL,
     TARGET_FLAG_VALUE,
     TARGET_FLAG_VALUES,
+    T11_ASSESSMENT_RESULT_VIOLATION_CODES,
     TEXT_NORMALIZATION_FORM,
     UNIT_KEY_PATTERN,
     UNIT_KEY_SEPARATOR,
     UNIT_TYPE_VALUES,
 )
-from .models import VocabUnit
+from .models import T11AssessmentResult, VocabUnit
 
 
 _LEXICAL_TOKEN_RE = re.compile(LEXICAL_TOKEN_PATTERN)
@@ -362,4 +372,69 @@ def validate_context_bank(unit: VocabUnit) -> tuple[str, ...]:
 
     return tuple(
         code for code in CONTEXT_VIOLATION_CODES if code in discovered
+    )
+
+
+def validate_t11_assessment_result(
+    result: T11AssessmentResult,
+) -> tuple[str, ...]:
+    """Return ordered deterministic T11 assessment-result violations."""
+    discovered: set[str] = set()
+
+    if not _matches(_UNIT_KEY_RE, result.unit_key):
+        discovered.add("A_UNIT_KEY_INVALID")
+
+    channel_valid = result.channel in CHANNELS
+    outcome_valid = result.outcome in ASSESSMENT_OUTCOMES
+
+    if not channel_valid:
+        discovered.add("A_CHANNEL_INVALID")
+    if not outcome_valid:
+        discovered.add("A_OUTCOME_INVALID")
+
+    if outcome_valid:
+        if (
+            result.outcome == ASSESSMENT_OUTCOME_OMITTED
+            and channel_valid
+            and result.channel not in ASSESSMENT_PRODUCTIVE_PRESENCE_CHANNELS
+        ):
+            discovered.add("A_OMITTED_CHANNEL_INVALID")
+
+        if (
+            result.outcome != ASSESSMENT_OUTCOME_FAIL
+            and result.failure_code != ""
+        ):
+            discovered.add("A_FAILURE_CODE_FORBIDDEN")
+
+        if (
+            result.outcome == ASSESSMENT_OUTCOME_FAIL
+            and channel_valid
+            and result.failure_code
+            not in ASSESSMENT_FAILURE_CODES_BY_CHANNEL[result.channel]
+        ):
+            discovered.add("A_FAIL_FAILURE_CODE_INVALID")
+
+        if (
+            result.outcome
+            in (ASSESSMENT_OUTCOME_PASS, ASSESSMENT_OUTCOME_FAIL)
+            and result.reason_code != ""
+        ):
+            discovered.add("A_REASON_CODE_FORBIDDEN")
+
+        if (
+            result.outcome == ASSESSMENT_OUTCOME_OMITTED
+            and result.reason_code not in ASSESSMENT_OMITTED_REASON_CODES
+        ):
+            discovered.add("A_OMITTED_REASON_CODE_INVALID")
+
+        if (
+            result.outcome == ASSESSMENT_OUTCOME_ABSTAIN
+            and result.reason_code not in ASSESSMENT_ABSTAIN_REASON_CODES
+        ):
+            discovered.add("A_ABSTAIN_REASON_CODE_INVALID")
+
+    return tuple(
+        code
+        for code in T11_ASSESSMENT_RESULT_VIOLATION_CODES
+        if code in discovered
     )
