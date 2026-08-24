@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 
 
 class ArtifactJSONError(ValueError):
@@ -38,6 +39,12 @@ def strict_json_loads(raw: bytes) -> object:
     def reject_constant(value: str) -> object:
         raise ArtifactJSONError(f"non-standard JSON constant: {value}")
 
+    def finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ArtifactJSONError(f"non-finite JSON number: {value}")
+        return parsed
+
     def exact_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
         for key, value in pairs:
@@ -50,6 +57,7 @@ def strict_json_loads(raw: bytes) -> object:
         return json.loads(
             text,
             parse_constant=reject_constant,
+            parse_float=finite_float,
             object_pairs_hook=exact_object,
         )
     except ArtifactJSONError:

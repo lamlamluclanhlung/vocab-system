@@ -139,6 +139,20 @@ def test_strict_json_loads_rejects_non_standard_constants(
         strict_json_loads(b'{"value":' + constant + b"}")
 
 
+@pytest.mark.parametrize("number", [b"1e999", b"-1e999"])
+def test_strict_json_loads_rejects_float_overflow(number: bytes) -> None:
+    with pytest.raises(ArtifactJSONError):
+        strict_json_loads(b'{"value":' + number + b"}")
+
+
+def test_strict_json_loads_preserves_finite_float_semantics() -> None:
+    value = strict_json_loads(b'{"value":-12.5e2}')
+
+    assert value == {"value": -1250.0}
+    assert isinstance(value, dict)
+    assert type(value["value"]) is float
+
+
 @pytest.mark.parametrize("raw", ["{}", bytearray(b"{}"), memoryview(b"{}")])
 def test_strict_json_loads_non_bytes_raise_type_error(raw: object) -> None:
     with pytest.raises(TypeError):
@@ -152,6 +166,7 @@ def test_strict_json_loads_non_bytes_raise_type_error(raw: object) -> None:
         b"{",
         b'{"outer":{"key":1,"key":2}}',
         b'{"value":NaN}',
+        b'{"value":1e999}',
     ],
 )
 def test_context_batch_translates_shared_transport_errors(raw: bytes) -> None:
