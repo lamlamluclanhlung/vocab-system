@@ -511,6 +511,117 @@ T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
 T10_ENCOUNTER_EMIT_ZERO_COUNTS: Final[bool] = True
 
 
+# ============================================================
+# 5B. T11 / T12 ASSESSMENT CONTRACT
+# ============================================================
+
+ASSESSMENT_OUTCOME_PASS: Final[str] = "PASS"
+ASSESSMENT_OUTCOME_FAIL: Final[str] = "FAIL"
+ASSESSMENT_OUTCOME_OMITTED: Final[str] = "OMITTED"
+ASSESSMENT_OUTCOME_ABSTAIN: Final[str] = "ABSTAIN"
+
+ASSESSMENT_OUTCOMES: Final[tuple[str, ...]] = (
+    ASSESSMENT_OUTCOME_PASS,
+    ASSESSMENT_OUTCOME_FAIL,
+    ASSESSMENT_OUTCOME_OMITTED,
+    ASSESSMENT_OUTCOME_ABSTAIN,
+)
+
+ASSESSMENT_TASK_KIND_BY_CHANNEL: Final[dict[str, str]] = {
+    "R": "reading_comprehension",
+    "L": "listening_comprehension",
+    "W": "written_production",
+    "S": "spoken_production",
+}
+
+ASSESSMENT_PRODUCTIVE_PRESENCE_CHANNELS: Final[tuple[str, ...]] = (
+    "W",
+    "S",
+)
+
+ASSESSMENT_FAILURE_CODES_BY_CHANNEL: Final[
+    dict[str, tuple[str, ...]]
+] = {
+    "R": (
+        "wrong_meaning",
+    ),
+    "L": (
+        "wrong_interpretation",
+    ),
+    "W": (
+        "semantic_misuse",
+        "collocation_misuse",
+        "form_misuse",
+    ),
+    "S": (
+        "semantic_misuse",
+        "collocation_misuse",
+        "form_misuse",
+    ),
+}
+
+ASSESSMENT_OMITTED_REASON_CODES: Final[tuple[str, ...]] = (
+    "target_absent",
+)
+
+ASSESSMENT_ABSTAIN_REASON_CODES: Final[tuple[str, ...]] = (
+    "off_topic",
+    "refusal",
+    "explicit_skip",
+    "no_response",
+    "insufficient_lexical_evidence",
+    "response_unintelligible",
+    "audio_unusable",
+    "transcription_uncertain",
+    "transcription_failed",
+    "semantic_uncertainty",
+    "reviewer_rejected",
+    "invalid_artifact",
+    "infrastructure_failure",
+)
+
+TRANSCRIPTION_STATUSES: Final[tuple[str, ...]] = (
+    "SUCCESS",
+    "UNCERTAIN",
+    "FAILED",
+)
+
+HUMAN_REVIEW_DECISIONS: Final[tuple[str, ...]] = (
+    "APPROVE",
+    "REJECT",
+)
+
+ASSESSMENT_AUTHORITY_KINDS: Final[tuple[str, ...]] = (
+    "semantic_model",
+    "deterministic_gate",
+    "policy",
+    "human_reviewer",
+)
+
+ASSESSMENT_PROVENANCE_STAGES: Final[tuple[str, ...]] = (
+    "presence_gate",
+    "transcription",
+    "semantic_judge",
+    "human_review",
+    "policy",
+)
+
+T12_ASSESSMENT_PRODUCER_ID: Final[str] = "t12-assessment"
+T12_ASSESSMENT_PRODUCER_VERSION: Final[int] = 1
+
+ASSESSMENT_STIMULUS_REF_PATTERN: Final[str] = (
+    r"^stimulus:v1:[0-9a-f]{64}$"
+)
+ASSESSMENT_ATTEMPT_ID_PATTERN: Final[str] = (
+    r"^attempt:v1:[0-9a-f]{64}$"
+)
+ASSESSMENT_ARTIFACT_REF_PATTERN: Final[str] = (
+    r"^sha256:[0-9a-f]{64}$"
+)
+
+COGNITIVE_STIMULUS_NORMALIZATION_FORM: Final[str] = "NFKC"
+
+
 STATE_TRIGGER_FIRST_REVIEW: Final[str] = "FIRST_REVIEW"
 STATE_TRIGGER_STABILITY_GATE: Final[str] = "STABILITY_GATE"
 STATE_TRIGGER_REVIEW_LAPSE: Final[str] = "REVIEW_LAPSE"

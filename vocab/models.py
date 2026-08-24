@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .contracts import (
+    ASSESSMENT_OUTCOME_PASS,
     DERIVED_STATE_PRIORITY,
     STATE_UNKNOWN,
     STATES,
@@ -440,7 +441,27 @@ class EncounterResult:
 
 
 # ============================================================
-# 7. JUDGE RESULTS
+# 7. T11 ASSESSMENT RESULT
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class T11AssessmentResult:
+    """Pure result for the D51-D58 T11 assessment protocol."""
+
+    unit_key: str
+    channel: str
+    outcome: str
+    failure_code: str = ""
+    reason_code: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.outcome == ASSESSMENT_OUTCOME_PASS
+
+
+# ============================================================
+# 8. JUDGE RESULTS
 # ============================================================
 
 
