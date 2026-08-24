@@ -4500,3 +4500,749 @@ small-sample aggregate accuracy score.
 **Out of scope:** statistical validation claims from the probe set, automated
 
 rubric optimization, model fine-tuning, and retroactive regrading.
+
+## D59 — T11 human-mediated semantic assessment bridge artifacts
+
+**Date:** 2026-08-24  
+**Status:** Accepted  
+**Blocks:** T11.3a, T11.3b, T11.3c, T11.4, T12 semantic-assessment provenance  
+**Preserves:** D51–D58 unchanged
+
+D59 freezes the deterministic artifact protocol used by the T11 v1 human-mediated semantic bridge. It does not move session, attempt, cognitive-stimulus, response-artifact, novelty, EventLog, or lifecycle ownership from T12 into T11.
+
+T11 v1 continues to use the human-mediated flow frozen by D51:
+
+```text
+deterministic semantic request artifact
+    ->
+human submits through ChatGPT Plus
+    ->
+structured semantic proposal artifact
+    ->
+strict deterministic import
+    ->
+human APPROVE or REJECT of the exact proposal
+```
+
+Python performs no paid LLM API call and no browser/UI automation.
+
+### Layer separation
+
+The generic T11 result contract remains unchanged:
+
+```text
+T11AssessmentResult
+validate_t11_assessment_result(...)
+```
+
+`T11AssessmentResult` remains the final five-field result model:
+
+```text
+unit_key
+channel
+outcome
+failure_code
+reason_code
+```
+
+`semantic_rationale`, protocol/rubric/prompt text, assessor metadata, and review metadata never become fields on `T11AssessmentResult`.
+
+The semantic proposal is a separate immutable artifact. Its restricted outcome/reason vocabulary is enforced by the semantic-proposal importer and does not narrow the generic `ASSESSMENT_OUTCOMES` or `ASSESSMENT_ABSTAIN_REASON_CODES` contracts.
+
+### Artifact namespaces and schema versions
+
+The frozen artifact discriminator/version pairs are:
+
+```text
+semantic request:
+    artifact = vocab.t11.semantic-request
+    v = 1
+
+semantic proposal:
+    artifact = vocab.t11.semantic-response
+    v = 1
+
+human review:
+    artifact = vocab.t11.human-review
+    v = 1
+```
+
+Every artifact `v` is an actual integer. Boolean is not accepted as an integer version.
+
+### Protocol, rubric, and prompt labels
+
+The frozen labels are:
+
+```text
+protocol:
+    id = t11-semantic-assessment
+    version = 1
+
+rubric:
+    id = d52-d53-lexical-assessment
+    version = 1
+
+prompt:
+    id = t11-semantic-bridge
+    version = 1
+```
+
+The three `version` values above are positive actual integers. Boolean is not accepted.
+
+These ID/version pairs are descriptive version labels, not standalone content identities. D59 intentionally does not claim that one ID/version pair globally maps to one immutable historical text.
+
+Every semantic request embeds the exact protocol, rubric, and prompt text used for that request. Those texts are explicit human-owned inputs, not hidden registry lookups. They are digest-significant. If a text changes while its descriptive label remains the same, the request digest changes. No second registry and no EventLog scan is introduced merely to enforce a historical label-to-text mapping.
+
+### Canonical JSON
+
+Every D59 content digest uses the D54 canonical JSON formula exactly:
+
+```python
+json.dumps(
+    value,
+    ensure_ascii=False,
+    allow_nan=False,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
+```
+
+Canonical serialization emits UTF-8 without a BOM.
+
+Canonicalization changes JSON object-key ordering and insignificant transport whitespace only. String contents are preserved exactly. T11 does not trim, casefold, Unicode-normalize, or otherwise repair digest-significant artifact strings.
+
+D54 cognitive-stimulus text normalization remains separate and T12-owned. A T11 request digest is the identity of the exact semantic-assessment request artifact, not the T12 cognitive-stimulus identity.
+
+### Digest representation
+
+`request_digest` and `response_digest` are exactly full lowercase SHA-256 digests represented as:
+
+```text
+64 lowercase hexadecimal characters
+```
+
+They do not carry the `sha256:` prefix.
+
+The `sha256:` prefix remains reserved for contracts that explicitly define an artifact/reference grammar such as `*_ref`. D59 does not change any existing FORGE, T8, T9, T10, or T12 digest/reference format.
+
+### Semantic request — exact closed schema
+
+A semantic request is a top-level JSON object with exactly these keys:
+
+```text
+artifact
+v
+protocol
+rubric
+prompt
+unit
+task
+```
+
+No unknown or missing top-level field is allowed.
+
+`artifact` and `v` must equal the frozen semantic-request discriminator/version.
+
+#### Versioned instruction objects
+
+Each of `protocol`, `rubric`, and `prompt` is an object with exactly:
+
+```text
+id
+version
+text
+```
+
+For v1:
+
+- `id` is the exact frozen label for that object;
+- `version` is the exact frozen positive integer version;
+- `text` is a required non-whitespace string;
+- `text` is preserved verbatim and is digest-significant.
+
+No null or omitted representation is allowed.
+
+#### Unit object
+
+`unit` contains exactly:
+
+```text
+unit_key
+lemma
+unit_type
+definition_en
+```
+
+Rules:
+
+- `unit_key` reuses the existing `UNIT_KEY_PATTERN` authority;
+- `unit_type` reuses the existing `UNIT_TYPE_VALUES` authority;
+- `lemma` is a required non-whitespace string;
+- `definition_en` is a required non-whitespace string;
+- no field is trimmed, normalized, repaired, or invented during serialization/import.
+
+These Unit facts make the semantic request self-contained. The semantic bridge must not require hidden Anki or registry access to discover the target form or intended sense.
+
+#### Task union
+
+`task` is exactly one of four closed channel-specific objects.
+
+Reading:
+
+```text
+channel
+task_kind
+passage
+question
+learner_response
+```
+
+with exact semantic values:
+
+```text
+channel = R
+task_kind = reading_comprehension
+```
+
+Listening:
+
+```text
+channel
+task_kind
+spoken_script
+question
+learner_response
+```
+
+with:
+
+```text
+channel = L
+task_kind = listening_comprehension
+```
+
+Writing:
+
+```text
+channel
+task_kind
+production_prompt
+semantic_constraints
+learner_response
+```
+
+with:
+
+```text
+channel = W
+task_kind = written_production
+```
+
+Speaking:
+
+```text
+channel
+task_kind
+production_prompt
+semantic_constraints
+approved_transcript
+```
+
+with:
+
+```text
+channel = S
+task_kind = spoken_production
+```
+
+Every task string other than the closed `channel`/`task_kind` values is required to be a non-whitespace string and is preserved verbatim.
+
+`task_kind` is not an independently caller-controlled semantic decision. It is derived from the frozen `ASSESSMENT_TASK_KIND_BY_CHANNEL` mapping. A serializer emits the exact pair for the chosen task variant. A parser must reject a mismatched pair and must not repair one value from the other.
+
+For example:
+
+```text
+channel = R
+task_kind = spoken_production
+```
+
+is invalid and fails closed.
+
+#### Semantic constraints
+
+For W and S, `semantic_constraints` is a required `str` describing the semantic constraints of the learner production task, including the intended sense/context requirement that the learner's production must satisfy.
+
+It is part of the production stimulus. It is not:
+
+- the scoring rubric;
+- the closed D53 failure-code inventory;
+- reviewer instructions;
+- hidden assessor-only grading criteria.
+
+It must be non-whitespace, is preserved verbatim, and is digest-significant.
+
+#### Channel evidence boundary
+
+R semantic assessment consumes:
+
+```text
+passage
+question
+learner_response
+```
+
+L semantic assessment consumes:
+
+```text
+spoken_script
+question
+learner_response
+```
+
+The `spoken_script` is assessor-visible evidence of the content that was heard; ordinary learner-facing L presentation remains governed by D52 and does not reveal written stimulus text to the learner.
+
+W semantic assessment consumes:
+
+```text
+production_prompt
+semantic_constraints
+learner_response
+```
+
+A W semantic request may be constructed only after the D19 presence gate has already established target presence. D59 does not implement the gate and does not treat presence as semantic correctness.
+
+S semantic assessment consumes:
+
+```text
+production_prompt
+semantic_constraints
+approved_transcript
+```
+
+Only the exact D56 human-approved SUCCESS transcript may enter the S semantic request. Raw audio, audio paths, STT candidates, STT confidence, and transcription provenance do not enter the request.
+
+A semantic request is never constructed for W/S target absence; that path produces deterministic `OMITTED / target_absent` before semantic assessment under D52/D53/D56.
+
+Likewise, `refusal`, `explicit_skip`, and `no_response` are resolved before semantic assessment and do not require a semantic request.
+
+### Request digest
+
+`request_digest` is:
+
+```text
+SHA256(canonical_json_bytes(the complete validated semantic-request object))
+```
+
+represented as full lowercase bare 64-hex.
+
+The request object contains no `request_digest` field, so the digest is not self-referential.
+
+Every field of the closed semantic-request schema is digest-significant.
+
+Changing exact protocol/rubric/prompt text, Unit facts, task content, learner evidence, discriminator, or version changes the request digest.
+
+### Semantic proposal — exact closed schema
+
+The structured semantic proposal returned through the human-mediated ChatGPT Plus workflow is a top-level JSON object containing exactly:
+
+```text
+artifact
+v
+request_digest
+outcome
+failure_code
+reason_code
+semantic_rationale
+```
+
+No unknown or missing field is allowed.
+
+`artifact` and `v` must equal the frozen semantic-response discriminator/version.
+
+`request_digest` must be a valid bare lowercase 64-hex digest and must equal the digest independently recomputed from the exact supplied semantic request.
+
+`outcome`, `failure_code`, `reason_code`, and `semantic_rationale` are semantic proposal fields. The semantic model does not supply T12 identity, novelty, lifecycle, producer, or EventLog fields.
+
+#### Proposal outcome subset
+
+A semantic proposal may emit only:
+
+```text
+PASS
+FAIL
+ABSTAIN
+```
+
+It may never emit `OMITTED`.
+
+`OMITTED / target_absent` is owned by the deterministic D19 presence-gate path for productive W/S tasks before semantic assessment.
+
+#### Failure and reason representation
+
+`failure_code` and `reason_code` are always present and are always strings.
+
+When a field does not apply, its exact value is:
+
+```text
+""
+```
+
+Null, omission, whitespace substitutes, and coercion are forbidden.
+
+Proposal combinations are:
+
+PASS:
+
+```text
+failure_code = ""
+reason_code = ""
+```
+
+FAIL:
+
+```text
+failure_code = one closed D53 code valid for the request-derived channel
+reason_code = ""
+```
+
+ABSTAIN:
+
+```text
+failure_code = ""
+reason_code = one semantic-assessor-owned ABSTAIN reason
+```
+
+The importer constructs the corresponding request-derived `T11AssessmentResult` and reuses `validate_t11_assessment_result()` rather than duplicating generic channel/outcome/failure/reason validation.
+
+#### Semantic-assessor-owned ABSTAIN reasons
+
+The semantic proposal may use exactly these ABSTAIN reasons:
+
+```text
+off_topic
+insufficient_lexical_evidence
+response_unintelligible
+semantic_uncertainty
+```
+
+It may not emit:
+
+```text
+refusal
+explicit_skip
+no_response
+audio_unusable
+transcription_uncertain
+transcription_failed
+reviewer_rejected
+invalid_artifact
+infrastructure_failure
+```
+
+Ownership remains:
+
+- `refusal`, `explicit_skip`, `no_response`: pre-semantic response/session handling;
+- audio/transcription reasons: D56 transcription path;
+- `reviewer_rejected`: human-review materialization;
+- `invalid_artifact`, `infrastructure_failure`: deterministic/policy layers.
+
+An out-of-subset reason is an invalid semantic proposal. The importer rejects it; it does not remap, repair, or reinterpret it.
+
+#### Semantic rationale
+
+`semantic_rationale` is required for every semantic proposal.
+
+It must be a non-whitespace string, is preserved verbatim, and is digest-significant.
+
+This field exists because D51 requires the human reviewer to APPROVE or REJECT the exact semantic proposal without rewriting its rationale or any other semantic field.
+
+T11 validates rationale presence and binding only. It does not deterministically judge rationale truth, quality, confidence, style, or persuasiveness.
+
+### Response digest
+
+`response_digest` is:
+
+```text
+SHA256(canonical_json_bytes(the complete validated semantic-proposal object))
+```
+
+represented as full lowercase bare 64-hex.
+
+The semantic proposal contains no `response_digest` field, so the digest is not self-referential.
+
+Equivalently, the complete response-digest projection contains exactly:
+
+```text
+artifact
+v
+request_digest
+outcome
+failure_code
+reason_code
+semantic_rationale
+```
+
+Assessor metadata is not part of `response_digest`.
+
+Therefore identical semantic proposal content from two different assessors has the same `response_digest` while carrying different assessor provenance. This is correct. T11 has no history authority and does not classify such cases as duplicates or conflicts. T12 producer-history rules remain authoritative for conflicts involving one persisted attempt.
+
+### Assessor metadata capture
+
+The semantic model is not trusted to self-certify its own UI model/build metadata inside the semantic proposal.
+
+Assessor metadata is captured separately by the human-mediated workflow and supplied explicitly to strict import:
+
+```text
+assessor_id
+assessor_version
+```
+
+`assessor_id` means the exact model label visibly available in the ChatGPT UI for the semantic-assessment run.
+
+Rules:
+
+- type is `str`;
+- length is 1 through 128 Unicode code points;
+- value must equal `value.strip()`;
+- no Unicode code point with general category `Cc` is allowed;
+- otherwise the visible label is preserved verbatim;
+- it is not lowercased, slugified, normalized into a locally invented identifier, or replaced with `chatgpt-plus`;
+- it is not replaced with the human reviewer identity.
+
+If no model identity is visible at all, the run fails closed. T11 must not invent `assessor_id`.
+
+`assessor_version` means the exact stable underlying model/build version visibly available in the UI when such a version is exposed.
+
+It follows the same string hygiene rules as `assessor_id`.
+
+If the UI exposes model identity but no stable underlying build/version, the exact frozen sentinel is:
+
+```text
+version-unavailable-from-ui
+```
+
+This concretizes the D57 truthful-unavailable-version rule and is not the T12 producer version.
+
+Assessor metadata must be captured/validated before a human-mediated semantic run is accepted for later import so an otherwise valid manual batch is not silently given invented provenance after the fact.
+
+### Semantic-judge provenance facts
+
+T11 provides a pure derived semantic-judge provenance projection sufficient for later T12 producer construction.
+
+Its exact D57 facts and sole sources are:
+
+```text
+protocol_id       <- request.protocol.id
+protocol_version  <- request.protocol.version
+rubric_id         <- request.rubric.id
+rubric_version    <- request.rubric.version
+prompt_id         <- request.prompt.id
+prompt_version    <- request.prompt.version
+assessor_id       <- externally captured assessor metadata
+assessor_version  <- externally captured assessor metadata
+request_digest    <- independently recomputed request digest
+response_digest   <- independently recomputed response digest
+```
+
+These facts are derived from validated artifacts/metadata. They are not a second independently editable authority.
+
+T11 does not construct the final EventLog `provenance` dictionary and does not write EventLog.
+
+### Human review — exact closed schema
+
+A human review artifact is a top-level JSON object containing exactly:
+
+```text
+artifact
+v
+response_digest
+reviewer_id
+reviewer_version
+decision
+```
+
+No unknown or missing field is allowed.
+
+`artifact` and `v` must equal the frozen human-review discriminator/version.
+
+`response_digest` must be valid bare lowercase 64-hex and must equal the independently recomputed digest of the exact imported semantic proposal under review.
+
+`reviewer_id` is a stable local pseudonymous identifier and must match the existing `SLUG_PATTERN` grammar exactly. D59 does not create a near-duplicate actor grammar.
+
+`reviewer_version` is an actual positive integer. Boolean is not accepted. It versions the normative reviewer procedure/profile, beginning at `1`; it changes only when the normative APPROVE/REJECT review procedure changes. It is not a version number of the human being.
+
+`decision` is exactly:
+
+```text
+APPROVE
+REJECT
+```
+
+The review artifact carries no copied or editable semantic field. In particular it must not contain:
+
+```text
+outcome
+failure_code
+reason_code
+semantic_rationale
+unit_key
+channel
+```
+
+or any replacement proposal object.
+
+Changing any semantic proposal field changes `response_digest` and invalidates any review bound to the old digest.
+
+A review that references another response fails closed for both APPROVE and REJECT.
+
+### Review materialization boundary
+
+T11.3c validates the exact human-review artifact and binding only.
+
+T11.4 owns pure materialization of the reviewed result:
+
+```text
+APPROVE
+    -> retain the exact request-derived semantic proposal result
+
+REJECT
+    -> audit-only T11AssessmentResult:
+       outcome = ABSTAIN
+       failure_code = ""
+       reason_code = reviewer_rejected
+```
+
+REJECT never substitutes another semantic verdict and never edits the original proposal. The rejected proposal remains immutable audit evidence.
+
+This materialization performs no T12 session, novelty, producer-history, EventLog, or lifecycle work.
+
+### Strict deterministic import
+
+D59 request/proposal/review import is fail-closed.
+
+For artifact JSON inputs:
+
+- the transport input is bytes;
+- decoding is strict UTF-8;
+- canonical serializers never emit a UTF-8 BOM;
+- malformed JSON is rejected;
+- duplicate object keys are rejected recursively;
+- `NaN`, `Infinity`, and `-Infinity` are rejected;
+- top-level arrays/scalars are rejected;
+- exact closed keysets are required at every frozen object/union level;
+- unknown and missing fields are rejected;
+- null is rejected for every required v1 field;
+- primitive types are exact and are never coerced;
+- actual-integer checks reject Boolean;
+- closed strings are exact and case-sensitive;
+- non-whitespace checks may call `.strip()` only as a predicate; accepted content is never trimmed before storage or digesting;
+- invalid artifacts are not repaired, normalized, retried, or silently downgraded into learner failure.
+
+A request parser verifies the exact channel/task-kind pair and exact channel-specific task keyset.
+
+A proposal importer verifies exact request-digest binding, the restricted semantic outcome/reason subset, and the generic request-derived `T11AssessmentResult` via `validate_t11_assessment_result()`.
+
+A review importer verifies exact response-digest binding and exact review closure.
+
+Importer/parsing failure does not itself invent a semantic verdict. Policy/T12 may later represent a validated audit-only `invalid_artifact` outcome under D53/D57 where appropriate.
+
+### T12-owned fields prohibited from T11 semantic artifacts
+
+No D59 semantic request, semantic proposal, or human review artifact may contain or generate T12-owned runtime/history identity fields, including:
+
+```text
+session_id
+item_ordinal
+attempt_id
+assessment_id
+stimulus_ref
+presented_stimulus_ref
+stimulus_artifact_ref
+response_artifact_ref
+response_audio_ref
+novel
+producer
+producer_version
+reserved_at
+```
+
+They also do not contain EventLog envelope fields such as runtime `ts`, `day`, or final event payloads.
+
+For S they do not contain raw audio, audio paths, STT candidates, STT confidence, or transcription provenance. Only the D56-approved transcript enters the semantic request.
+
+T11 semantic artifacts consume stimulus/evidence content without acquiring T12 ownership of runtime identity or history.
+
+### Implementation sequencing
+
+D59 freezes semantic protocol semantics, not implementation filenames.
+
+Implementation remains split into small boundaries:
+
+```text
+T11.3a0
+    shared canonical JSON / strict JSON parsing extraction only
+    no T11 semantic constants or artifact semantics
+
+T11.3a
+    semantic request schema
+    deterministic serialization/import
+    request digest
+
+T11.3b
+    strict semantic-proposal import
+    external assessor metadata validation
+    response digest
+    derived semantic-judge facts
+
+T11.3c
+    exact human-review artifact and response binding
+
+T11.4
+    pure APPROVE/REJECT materialization
+```
+
+T11.3a0 is a behavior-preserving infrastructure refactor, not a semantic change. Existing historical callers must retain their observable serialization/hash/import behavior and exception compatibility. Domains with intentionally different identity rules are not mechanically collapsed into the shared primitive merely because they also use JSON/SHA-256.
+
+### Deferred T12 closure
+
+D59 does not resolve final T12 top-level `model_id` / `model_version` / `authority_kind` selection for every producer outcome. D57 already separates semantic-model provenance, human-review provenance, deterministic gates, and policy authority. Any remaining exact T12 mapping must be frozen before T12 producer implementation and must not be silently decided inside T11.
+
+### Reason
+
+The semantic verdict and historical provenance answer different questions.
+
+D59 makes each T11 semantic step independently inspectable and cryptographically bound:
+
+```text
+exact request content
+    -> request_digest
+exact semantic proposal
+    -> response_digest
+exact human decision
+    -> response_digest binding
+```
+
+The semantic model cannot claim novelty, lifecycle identity, session identity, or EventLog authority. The reviewer cannot silently rewrite the proposal. Changing request text or learner evidence changes request identity; changing semantic output changes response identity; changing assessor metadata changes provenance without falsely creating a different semantic proposal.
+
+This preserves D51–D58 while giving T11.3 deterministic, fail-closed artifact boundaries that can be implemented and tested without Anki, EventLog, exposure history, or lifecycle state.
+
+### Out of scope
+
+D59 does not define or implement:
+
+- paid OpenAI, Anthropic, Azure, or other LLM/speech APIs;
+- browser or ChatGPT UI automation;
+- session scheduling;
+- session manifests;
+- attempt/cognitive-stimulus/response-artifact construction;
+- exposure reservation or novelty;
+- EventLog emission;
+- T12 producer-history preflight/recovery;
+- T9 observation or lifecycle transitions;
+- Anki reads/writes;
+- local STT execution or transcript-verification workflow;
+- semantic confidence thresholds;
+- automatic supersession/rejudgment history;
+- precedence among multiple simultaneous W/S lexical-error categories;
+- pronunciation, accent, prosody, or generic language-proficiency scoring;
+- globally immutable protocol/rubric/prompt text registries.
