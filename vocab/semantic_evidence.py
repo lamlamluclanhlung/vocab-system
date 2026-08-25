@@ -32,6 +32,11 @@ from .semantic_response import (
     canonical_semantic_proposal_bytes,
     import_semantic_response,
 )
+from .transcription_evidence import (
+    TranscriptionEvidence,
+    _require_transcription_evidence,
+    _transcription_identity,
+)
 
 
 class SemanticEvidenceError(ValueError):
@@ -43,6 +48,7 @@ _STIMULUS_FIELDS_BY_CHANNEL = {
     "R": ("passage", "question"),
     "L": ("spoken_script", "question"),
     "W": ("production_prompt", "semantic_constraints"),
+    "S": ("production_prompt", "semantic_constraints"),
 }
 
 
@@ -66,6 +72,10 @@ class T11SemanticEvidenceBundle:
     _human_review_bytes: bytes = field(repr=False, compare=False)
     _unit_identity: tuple[object, ...] = field(repr=False, compare=False)
     _presence_identity: tuple[object, ...] | None = field(
+        repr=False,
+        compare=False,
+    )
+    _transcription_identity: bytes | None = field(
         repr=False,
         compare=False,
     )
@@ -102,6 +112,7 @@ class _SemanticMaterial:
     semantic_judge_bytes: bytes
     human_review_bytes: bytes
     presence_identity: tuple[object, ...] | None
+    transcription_identity: bytes | None
 
 
 def bind_t11_semantic_evidence(
@@ -114,6 +125,7 @@ def bind_t11_semantic_evidence(
     attempt: ValidatedAttemptEvidence,
     unit: ValidatedUnitEvidence,
     presence: PresenceGateEvidence | None = None,
+    transcription: TranscriptionEvidence | None = None,
 ) -> T11SemanticEvidenceBundle:
     """Reimport, rebind, review, and materialize one exact T11 artifact chain."""
     validated_attempt = _require_attempt_evidence(attempt)
@@ -127,6 +139,7 @@ def bind_t11_semantic_evidence(
         attempt=validated_attempt,
         unit=validated_unit,
         presence=presence,
+        transcription=transcription,
     )
 
     bundle = object.__new__(T11SemanticEvidenceBundle)
@@ -166,6 +179,11 @@ def bind_t11_semantic_evidence(
         "_presence_identity",
         material.presence_identity,
     )
+    object.__setattr__(
+        bundle,
+        "_transcription_identity",
+        material.transcription_identity,
+    )
     object.__setattr__(bundle, "_seal", _SEMANTIC_SEAL)
     return bundle
 
@@ -180,16 +198,26 @@ def _bind_and_materialize(
     attempt: ValidatedAttemptEvidence,
     unit: ValidatedUnitEvidence,
     presence: PresenceGateEvidence | None,
+    transcription: TranscriptionEvidence | None,
 ) -> _SemanticMaterial:
     _require_attempt_unit_binding(attempt, unit)
     if attempt.channel not in _STIMULUS_FIELDS_BY_CHANNEL:
-        raise SemanticEvidenceError("T12.2a semantic binding supports only R/L/W")
+        raise SemanticEvidenceError("semantic binding supports only R/L/W/S")
 
     presence_identity: tuple[object, ...] | None = None
+    transcription_identity: bytes | None = None
     if attempt.channel in ("R", "L"):
         if presence is not None:
             raise SemanticEvidenceError("R/L semantic paths do not accept a presence gate")
-    else:
+        if transcription is not None:
+            raise SemanticEvidenceError(
+                "R/L semantic paths do not accept transcription evidence"
+            )
+    elif attempt.channel == "W":
+        if transcription is not None:
+            raise SemanticEvidenceError(
+                "W semantic binding does not accept transcription evidence"
+            )
         if presence is None:
             raise SemanticEvidenceError(
                 "W semantic binding requires target-present presence evidence"
@@ -204,6 +232,37 @@ def _bind_and_materialize(
                 "target-absent W evidence forbids semantic artifacts"
             )
         presence_identity = _presence_binding(validated_presence)
+    else:
+        if transcription is None:
+            raise SemanticEvidenceError(
+                "S semantic binding requires SUCCESS transcription evidence"
+            )
+        validated_transcription = _require_transcription_evidence(
+            transcription,
+            attempt=attempt,
+        )
+        if validated_transcription.status != "SUCCESS":
+            raise SemanticEvidenceError(
+                "S semantic binding requires SUCCESS transcription evidence"
+            )
+        if presence is None:
+            raise SemanticEvidenceError(
+                "S semantic binding requires target-present presence evidence"
+            )
+        validated_presence = _require_presence_evidence(
+            presence,
+            attempt=attempt,
+            unit=unit,
+            transcription=validated_transcription,
+        )
+        if not validated_presence.target_present:
+            raise SemanticEvidenceError(
+                "target-absent S evidence forbids semantic artifacts"
+            )
+        presence_identity = _presence_binding(validated_presence)
+        transcription_identity = _transcription_identity(
+            validated_transcription
+        )
 
     request = import_semantic_request(request_raw)
     request_unit = cast(dict[str, object], request["unit"])
@@ -243,16 +302,26 @@ def _bind_and_materialize(
             "semantic request cognitive stimulus does not match the attempt"
         )
 
-    try:
-        captured_response = attempt.response_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        raise SemanticEvidenceError(
-            "captured text response must be strict UTF-8"
-        ) from None
-    if request_task["learner_response"] != captured_response:
-        raise SemanticEvidenceError(
-            "semantic request learner_response does not exactly match captured bytes"
-        )
+    if attempt.channel == "S":
+        if (
+            request_task["approved_transcript"]
+            != validated_transcription.approved_transcript_text
+        ):
+            raise SemanticEvidenceError(
+                "semantic request approved_transcript does not exactly match "
+                "the durable approved transcript"
+            )
+    else:
+        try:
+            captured_response = attempt.response_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise SemanticEvidenceError(
+                "captured text response must be strict UTF-8"
+            ) from None
+        if request_task["learner_response"] != captured_response:
+            raise SemanticEvidenceError(
+                "semantic request learner_response does not exactly match captured bytes"
+            )
 
     proposal = import_semantic_response(
         proposal_raw,
@@ -298,6 +367,7 @@ def _bind_and_materialize(
         semantic_judge_bytes=semantic_judge_bytes,
         human_review_bytes=human_review_bytes,
         presence_identity=presence_identity,
+        transcription_identity=transcription_identity,
     )
 
 
@@ -307,6 +377,7 @@ def _require_semantic_evidence(
     attempt: ValidatedAttemptEvidence,
     unit: ValidatedUnitEvidence,
     presence: PresenceGateEvidence | None,
+    transcription: TranscriptionEvidence | None = None,
 ) -> tuple[T11SemanticEvidenceBundle, _SemanticMaterial]:
     if type(value) is not T11SemanticEvidenceBundle:
         raise TypeError("semantic must be a T11SemanticEvidenceBundle")
@@ -330,6 +401,7 @@ def _require_semantic_evidence(
         attempt=attempt,
         unit=unit,
         presence=presence,
+        transcription=transcription,
     )
     expected_runtime = (
         attempt.attempt_id,
@@ -348,6 +420,7 @@ def _require_semantic_evidence(
         material.human_review_bytes,
         _unit_binding(unit),
         material.presence_identity,
+        material.transcription_identity,
     )
     actual_runtime = (
         value.attempt_id,
@@ -366,6 +439,7 @@ def _require_semantic_evidence(
         value._human_review_bytes,
         value._unit_identity,
         value._presence_identity,
+        value._transcription_identity,
     )
     if actual_runtime != expected_runtime:
         raise SemanticEvidenceError(
@@ -384,6 +458,7 @@ def _presence_binding(value: PresenceGateEvidence) -> tuple[object, ...]:
         value.gate_version,
         value.target_present,
         value._unit_identity,
+        value._transcription_identity,
     )
 
 
