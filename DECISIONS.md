@@ -5578,3 +5578,485 @@ Before lifecycle-bearing producer emission exists, T12 producer preflight must
 replace caller assertion with complete historical validation.
 
 Do not implement EventLog preflight in this hardening task.
+
+## D63 — Attempt-scoped assessment evidence and T11 semantic binding
+
+**Date:** 2026-08-25
+**Status:** Accepted
+
+T12.2 planning MUST NOT accept free-standing:
+
+    attempt_id
+    novel
+    response_artifact_ref
+    learner_response
+    T11AssessmentResult
+
+as independent semantic-planning authority.
+
+A sealed ValidatedAttemptEvidence is constructed from T12 durable authorities.
+
+It must independently validate:
+
+    complete exposure ledger
+    complete capture ledger
+    persisted session manifest
+    exact manifest item
+    derived attempt identity
+    stimulus artifact
+    capture receipt if present
+    captured response artifact if present
+    ledger-derived novelty
+
+For an assessment requiring captured learner evidence:
+
+    exactly one valid CaptureReceipt must exist.
+
+Captured text binding for R/L/W is:
+
+    exact response artifact bytes
+        -> strict UTF-8 decode
+        -> exact Python string
+
+The decoded string must equal the T11 semantic-request learner_response EXACTLY.
+
+No transformation is permitted at this binding boundary:
+
+    no strip
+    no Unicode normalization
+    no newline normalization
+    no whitespace collapsing
+    no case folding
+    no BOM removal
+
+Any mismatch fails closed.
+
+T11 stimulus binding uses D54 cognitive identity.
+
+For the supplied T11 request:
+
+R:
+    passage
+    question
+
+L:
+    spoken_script
+    question
+
+W:
+    production_prompt
+    semantic_constraints
+
+must be projected with the existing D54 cognitive-stimulus function.
+
+The independently recomputed stimulus_ref must equal:
+
+    ValidatedAttemptEvidence.presented_stimulus_ref
+
+Exact formatting equality with the manifest stimulus is NOT required when D54
+normalization deliberately declares the cognitive stimuli equivalent.
+
+Case/punctuation/content differences that alter D54 identity fail.
+
+### Validated Unit evidence
+
+T12.2 does NOT read Anki.
+
+It accepts only a sealed immutable ValidatedUnitEvidence produced from a
+VocabUnit that passes the existing applicable Unit validation boundary.
+
+The snapshot contains at least:
+
+    unit_key
+    lemma
+    unit_type
+    definition_en
+    enabled_channels
+
+It must detach from the mutable VocabUnit.
+
+For planning:
+
+    attempt.unit_key == unit.unit_key
+
+and:
+
+    attempt.channel must be enabled in that Unit
+
+For semantic paths, the T11 request Unit block must exactly equal:
+
+    unit_key
+    lemma
+    unit_type
+    definition_en
+
+from ValidatedUnitEvidence.
+
+T12.2 does not claim that this snapshot itself proves Anki provenance.
+The later T12 producer/orchestration layer must source it from the authoritative
+runtime Unit read.
+
+Do NOT create another Unit ledger.
+Do NOT change the T12 session-manifest schema.
+Do NOT add Unit metadata to D55 exposure records.
+
+### Attempt-bound T11 semantic bundle
+
+Implement one sealed immutable T11SemanticEvidenceBundle.
+
+The public binder should accept canonical/raw T11 artifacts and assessor
+metadata, then independently use existing T11 code to:
+
+    import semantic request
+    import semantic proposal bound to that request
+    import human review bound to that proposal
+    independently materialize final T11 result
+
+Do NOT trust a separately supplied T11AssessmentResult.
+
+The binder must then establish:
+
+    request unit_key == attempt unit_key
+    request channel == attempt channel
+    request task_kind == frozen channel task kind
+
+    request Unit block == ValidatedUnitEvidence
+
+    request cognitive stimulus ref == attempt presented_stimulus_ref
+
+    request learner_response == exact decoded captured response
+
+    materialized result unit_key == attempt unit_key
+    materialized result channel == attempt channel
+
+For W semantic paths:
+    a valid attempt-bound target-present PresenceGateEvidence is additionally
+    required.
+
+### Content-identical semantic artifact reuse
+
+T11 artifacts are semantic-content artifacts, not attempt-identity artifacts.
+
+Therefore two different attempts MAY use byte-identical:
+
+    semantic request
+    semantic proposal
+    human review
+
+only when EACH attempt independently proves:
+
+    its own durable reservation
+    its own durable capture receipt
+    its exact response binding
+    its stimulus binding
+    its Unit binding
+
+A T11SemanticEvidenceBundle that is already bound to attempt A must NEVER be
+accepted as the bound bundle for attempt B.
+
+The same underlying raw T11 artifact bytes may be independently rebound into a
+new bundle for B if every B-specific invariant passes.
+
+This rule does NOT require or claim that the semantic model or human reviewer
+ran twice.
+
+Independent learner evidence comes from independent attempts/captures.
+
+## D64 — Presence-gate authority and pure text JUDGE planning
+
+**Date:** 2026-08-25
+**Status:** Accepted
+
+T12.2 must not accept caller-supplied target_present Boolean as authority.
+
+Use the existing frozen D19 matcher:
+
+    contains_unit(text, lemma, unit_type)
+
+For W:
+
+    exact captured response
+        -> strict UTF-8 text
+        -> D19 contains_unit
+        -> sealed PresenceGateEvidence
+
+PresenceGateEvidence is attempt/source scoped and contains internally:
+
+    attempt_id
+    unit_key
+    channel
+    source_artifact_ref
+    gate_id
+    gate_version
+    target_present
+
+Required:
+
+    channel == W
+    source_artifact_ref == attempt response_artifact_ref
+    Unit identity == ValidatedUnitEvidence
+    gate_id == "d19-target-presence"
+    gate_version == 1
+
+Only these stage fields are emitted:
+
+    gate_id
+    gate_version
+    target_present
+
+If target_present == false:
+
+    final result:
+        OMITTED
+        failure_code = ""
+        reason_code = "target_absent"
+
+    semantic request/proposal/review evidence is forbidden.
+
+If target_present == true:
+    semantic evidence is required for semantic planning.
+
+### Semantic-review provenance clarification
+
+Every final result derived from a T11 semantic proposal has passed through exact
+human review under D59/T11.4.
+
+Therefore every semantic-derived final outcome includes:
+
+    semantic_judge
+    human_review
+
+Semantic APPROVE/PASS or APPROVE/FAIL:
+
+    semantic_judge
+    human_review
+
+Semantic APPROVE/ABSTAIN:
+
+    semantic_judge
+    human_review
+    policy
+
+Human REJECT:
+
+    semantic_judge
+    human_review
+    policy
+
+This explicitly resolves the earlier D57 semantic-uncertainty provenance example
+that omitted human_review.
+
+There is no final reviewed T11 semantic outcome without human_review provenance.
+
+### Pure T12.2a scope
+
+Supported paths are EXACTLY:
+
+R:
+    PASS
+    FAIL
+    semantic APPROVE/ABSTAIN
+    reviewer REJECT -> ABSTAIN/reviewer_rejected
+
+L:
+    PASS
+    FAIL
+    semantic APPROVE/ABSTAIN
+    reviewer REJECT -> ABSTAIN/reviewer_rejected
+
+W:
+    target absent -> OMITTED/target_absent
+    target present + PASS
+    target present + FAIL
+    target present + semantic APPROVE/ABSTAIN
+    target present + reviewer REJECT
+
+NOT SUPPORTED IN T12.2a:
+
+    S
+    no_response
+    explicit_skip
+    refusal
+    audio_unusable
+    transcription_uncertain
+    transcription_failed
+    invalid_artifact
+    infrastructure_failure
+
+Reject unsupported planner paths rather than inventing semantics.
+
+### Top-level authority
+
+PASS / FAIL:
+
+    authority_kind = "semantic_model"
+
+    model_id =
+        exact assessor_id from independently rebound T11 proposal
+
+    model_version =
+        exact assessor_version from independently rebound T11 proposal
+
+OMITTED:
+
+    authority_kind = "deterministic_gate"
+    model_id = "d19-target-presence"
+    model_version = "1"
+
+Semantic ABSTAIN and reviewer_rejected:
+
+    authority_kind = "policy"
+    model_id = "t12-assessment-policy"
+    model_version = "1"
+
+### Provenance
+
+semantic_judge must contain exactly the frozen D57 fields derived from the
+imported T11 proposal/request:
+
+    protocol_id
+    protocol_version
+    assessor_id
+    assessor_version
+    rubric_id
+    rubric_version
+    prompt_id
+    prompt_version
+    request_digest
+    response_digest
+
+human_review contains exactly:
+
+    reviewer_id
+    reviewer_version
+    decision
+
+presence_gate contains exactly:
+
+    gate_id
+    gate_version
+    target_present
+
+policy contains exactly:
+
+    policy_id = "t12-assessment-policy"
+    policy_version = 1
+
+No unknown stages.
+
+No unknown stage fields.
+
+Only invoked stages are included.
+
+### JUDGE payload closure
+
+Every planned T12 JUDGE common payload contains:
+
+    channel
+    passed
+    model_id
+    model_version
+    producer
+    producer_version
+    attempt_id
+    presented_stimulus_ref
+    outcome
+    authority_kind
+    provenance
+    response_artifact_ref
+
+All T12.2a paths require a valid immutable captured text response, including W
+OMITTED.
+
+PASS additionally contains exactly:
+
+    assessment_id
+    stimulus_ref
+    novel
+
+and prohibits:
+
+    failure_code
+    reason_code
+
+FAIL additionally contains exactly:
+
+    assessment_id
+    stimulus_ref
+    novel
+    failure_code
+
+and prohibits:
+
+    reason_code
+
+OMITTED additionally contains exactly:
+
+    reason_code = "target_absent"
+
+and prohibits:
+
+    assessment_id
+    stimulus_ref
+    novel
+    failure_code
+
+ABSTAIN additionally contains exactly:
+
+    reason_code
+
+and prohibits:
+
+    assessment_id
+    stimulus_ref
+    novel
+    failure_code
+
+PASS / FAIL invariant:
+
+    assessment_id == attempt_id
+
+    stimulus_ref == presented_stimulus_ref
+
+    novel == ledger-derived novelty from ValidatedAttemptEvidence
+
+    passed == (outcome == "PASS")
+
+OMITTED / ABSTAIN:
+    zero D35 fields
+
+Unknown payload fields are forbidden.
+
+### Pure output
+
+Create one immutable output type such as:
+
+    PlannedJudge
+
+It owns:
+
+    unit_key
+    immutable canonical JUDGE payload
+
+It is NOT an Event.
+
+It must NOT contain:
+
+    v
+    ts
+    day
+    EventLog path
+
+Prefer storing canonical payload bytes internally or another genuinely
+deep-immutable representation.
+
+A to_payload()/to_dict() helper may return a detached mutable copy.
+
+Mutating:
+
+    source dictionaries
+    T11 wrappers
+    VocabUnit
+    returned detached payload
+
+must not mutate the planned judge.
