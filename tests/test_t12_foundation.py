@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from vocab.assessment_identity import (
 from vocab.exposure import (
     DisplayPermit,
     ExposureLedgerError,
+    novelty_for_reserved_attempt,
     read_exposure_ledger,
     reserve_exposure,
 )
@@ -110,6 +112,7 @@ def initialized_runtime(
         no_historical_t12_state=True,
     )
     manifest, item, attempt_id = make_manifest_and_attempt(store)
+    persist_session_manifest(tmp_path / "sessions", manifest)
     return store, exposure_path, capture_path, manifest, item, attempt_id
 
 
@@ -120,20 +123,20 @@ def reserve(
     manifest: session_module.SessionManifest,
     item: dict[str, object],
     attempt_id: str,
+    *,
+    reserved_at: str = RESERVED_AT,
 ) -> DisplayPermit:
-    return reserve_exposure(
+    permit = reserve_exposure(
         exposure_path=exposure_path,
         capture_path=capture_path,
         artifact_store=store,
-        reserved_at=RESERVED_AT,
-        attempt_id=attempt_id,
+        session_root=exposure_path.parent / "sessions",
         session_id=manifest.session_id,
         item_ordinal=item["item_ordinal"],
-        unit_key=item["unit_key"],
-        channel=item["channel"],
-        presented_stimulus_ref=item["presented_stimulus_ref"],
-        stimulus_artifact_ref=item["stimulus_artifact_ref"],
+        reserved_at=reserved_at,
     )
+    assert permit.attempt_id == attempt_id
+    return permit
 
 
 def test_l_voice_and_rendered_artifact_do_not_change_cognitive_identity() -> None:
@@ -401,6 +404,132 @@ def test_initialization_creates_and_validates_both_empty_ledgers(tmp_path: Path)
     ) == ((), ())
 
 
+def test_self_consistent_fake_session_identity_cannot_authorize_reservation(
+    tmp_path: Path,
+) -> None:
+    store, exposure_path, capture_path, _, item, _ = initialized_runtime(tmp_path)
+    fake_session_id = "session:v1:" + "a" * 64
+    fake_attempt_id = assessment_attempt_id(
+        session_id=fake_session_id,
+        item_ordinal=item["item_ordinal"],
+        unit_key=item["unit_key"],
+        channel=item["channel"],
+        presented_stimulus_ref=item["presented_stimulus_ref"],
+    )
+    assert fake_attempt_id.startswith("attempt:v1:")
+    with pytest.raises(SessionManifestError, match="missing or unreadable"):
+        reserve_exposure(
+            exposure_path=exposure_path,
+            capture_path=capture_path,
+            artifact_store=store,
+            session_root=tmp_path / "sessions",
+            session_id=fake_session_id,
+            item_ordinal=item["item_ordinal"],
+            reserved_at=RESERVED_AT,
+        )
+    assert read_exposure_ledger(exposure_path) == ()
+
+
+def test_unpersisted_session_manifest_cannot_authorize_reservation(
+    tmp_path: Path,
+) -> None:
+    store, exposure_path, capture_path, _, item, _ = initialized_runtime(tmp_path)
+    unpersisted = create_session_manifest(created_at=CREATED_AT, items=[item])
+    with pytest.raises(SessionManifestError, match="missing or unreadable"):
+        reserve_exposure(
+            exposure_path=exposure_path,
+            capture_path=capture_path,
+            artifact_store=store,
+            session_root=tmp_path / "sessions",
+            session_id=unpersisted.session_id,
+            item_ordinal=item["item_ordinal"],
+            reserved_at=RESERVED_AT,
+        )
+    assert read_exposure_ledger(exposure_path) == ()
+
+
+def test_persisted_manifest_item_is_exact_reservation_authority(tmp_path: Path) -> None:
+    store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
+        tmp_path
+    )
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    reservation = read_exposure_ledger(exposure_path)[0]
+    assert permit.attempt_id == attempt_id
+    assert reservation.session_id == manifest.session_id
+    assert reservation.item_ordinal == item["item_ordinal"]
+    assert reservation.unit_key == item["unit_key"]
+    assert reservation.channel == item["channel"]
+    assert reservation.presented_stimulus_ref == item["presented_stimulus_ref"]
+    assert reservation.stimulus_artifact_ref == item["stimulus_artifact_ref"]
+    assert reservation.attempt_id == attempt_id
+
+
+def test_persisted_manifest_missing_ordinal_fails_before_append(tmp_path: Path) -> None:
+    store, exposure_path, capture_path, manifest, _, _ = initialized_runtime(tmp_path)
+    with pytest.raises(ExposureLedgerError, match="item_ordinal"):
+        reserve_exposure(
+            exposure_path=exposure_path,
+            capture_path=capture_path,
+            artifact_store=store,
+            session_root=tmp_path / "sessions",
+            session_id=manifest.session_id,
+            item_ordinal=999,
+            reserved_at=RESERVED_AT,
+        )
+    assert read_exposure_ledger(exposure_path) == ()
+
+
+def test_tampered_persisted_manifest_fails_before_exposure_append(tmp_path: Path) -> None:
+    store, exposure_path, capture_path, manifest, item, _ = initialized_runtime(tmp_path)
+    manifest_path = (
+        tmp_path
+        / "sessions"
+        / manifest.session_id.removeprefix("session:v1:")
+    )
+    manifest_path.write_bytes(b"{}")
+    with pytest.raises(SessionManifestError):
+        reserve_exposure(
+            exposure_path=exposure_path,
+            capture_path=capture_path,
+            artifact_store=store,
+            session_root=tmp_path / "sessions",
+            session_id=manifest.session_id,
+            item_ordinal=item["item_ordinal"],
+            reserved_at=RESERVED_AT,
+        )
+    assert read_exposure_ledger(exposure_path) == ()
+
+
+@pytest.mark.parametrize("corruption", ("missing", "changed"))
+def test_manifest_stimulus_artifact_must_verify_before_reservation(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    store, exposure_path, capture_path, manifest, item, _ = initialized_runtime(tmp_path)
+    artifact_path = store.root / item["stimulus_artifact_ref"].removeprefix("sha256:")
+    if corruption == "missing":
+        artifact_path.unlink()
+    else:
+        artifact_path.write_bytes(b"corrupt stimulus")
+    with pytest.raises(ArtifactStoreError):
+        reserve_exposure(
+            exposure_path=exposure_path,
+            capture_path=capture_path,
+            artifact_store=store,
+            session_root=tmp_path / "sessions",
+            session_id=manifest.session_id,
+            item_ordinal=item["item_ordinal"],
+            reserved_at=RESERVED_AT,
+        )
+    assert read_exposure_ledger(exposure_path) == ()
+
+
+def test_novelty_rejects_attempt_absent_from_physical_history(tmp_path: Path) -> None:
+    _, exposure_path, _, _, _, attempt_id = initialized_runtime(tmp_path)
+    with pytest.raises(ExposureLedgerError, match="durable current reservation"):
+        novelty_for_reserved_attempt(exposure_path, attempt_id)
+
+
 def test_reservation_is_durable_before_permit_and_permit_is_one_use(
     tmp_path: Path,
 ) -> None:
@@ -442,6 +571,15 @@ def test_restart_cannot_recreate_display_permit_from_reservation(tmp_path: Path)
     persisted = read_exposure_ledger(exposure_path)[0]
     with pytest.raises(TypeError):
         DisplayPermit(persisted.attempt_id, True)
+    with pytest.raises(TypeError):
+        capture_response(
+            exposure_path=exposure_path,
+            capture_path=capture_path,
+            artifact_store=store,
+            captured_at=CAPTURED_AT,
+            response_bytes=b"restart cannot freshly capture",
+        )
+    assert read_capture_ledger(capture_path) == ()
 
 
 @pytest.mark.parametrize("prior_final_style", ("OMITTED", "ABSTAIN", "interrupted"))
@@ -465,6 +603,7 @@ def test_any_prior_different_reserved_attempt_consumes_novelty(
     if prior_final_style != "interrupted":
         first_permit.consume()
     second_manifest = create_session_manifest(created_at=CREATED_AT, items=[item])
+    persist_session_manifest(exposure_path.parent / "sessions", second_manifest)
     second_attempt = assessment_attempt_id(
         session_id=second_manifest.session_id,
         item_ordinal=0,
@@ -482,6 +621,66 @@ def test_any_prior_different_reserved_attempt_consumes_novelty(
     )
     assert first_permit.novel is True
     assert second_permit.novel is False
+
+
+def test_physical_order_not_reserved_at_defines_novelty(tmp_path: Path) -> None:
+    store, exposure_path, capture_path, first_manifest, item, first_attempt = (
+        initialized_runtime(tmp_path)
+    )
+    first_permit = reserve(
+        store,
+        exposure_path,
+        capture_path,
+        first_manifest,
+        item,
+        first_attempt,
+        reserved_at="2026-08-25T03:00:00+00:00",
+    )
+    second_manifest = create_session_manifest(created_at=CREATED_AT, items=[item])
+    persist_session_manifest(exposure_path.parent / "sessions", second_manifest)
+    second_attempt = assessment_attempt_id(
+        session_id=second_manifest.session_id,
+        item_ordinal=0,
+        unit_key=UNIT_KEY,
+        channel="L",
+        presented_stimulus_ref=item["presented_stimulus_ref"],
+    )
+    second_permit = reserve(
+        store,
+        exposure_path,
+        capture_path,
+        second_manifest,
+        item,
+        second_attempt,
+        reserved_at="2026-08-25T00:00:00+00:00",
+    )
+    assert first_permit.novel is True
+    assert second_permit.novel is False
+    assert novelty_for_reserved_attempt(exposure_path, first_attempt) is True
+    assert novelty_for_reserved_attempt(exposure_path, second_attempt) is False
+
+
+def test_post_append_novelty_failure_issues_no_permit_but_keeps_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
+        tmp_path
+    )
+
+    def fail_novelty(*_args: object, **_kwargs: object) -> bool:
+        raise ExposureLedgerError("simulated post-append novelty failure")
+
+    monkeypatch.setattr(
+        exposure_module,
+        "novelty_for_reserved_attempt",
+        fail_novelty,
+    )
+    with pytest.raises(ExposureLedgerError, match="post-append"):
+        reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    history = read_exposure_ledger(exposure_path)
+    assert len(history) == 1
+    assert history[0].attempt_id == attempt_id
 
 
 def test_duplicate_reservation_slot_fails_even_if_identical(tmp_path: Path) -> None:
@@ -508,8 +707,11 @@ def test_two_attempts_with_same_response_share_bytes_but_not_capture_slot(
     store, exposure_path, capture_path, first_manifest, item, first_attempt = (
         initialized_runtime(tmp_path)
     )
-    reserve(store, exposure_path, capture_path, first_manifest, item, first_attempt)
+    first_permit = reserve(
+        store, exposure_path, capture_path, first_manifest, item, first_attempt
+    )
     second_manifest = create_session_manifest(created_at=CREATED_AT, items=[item])
+    persist_session_manifest(exposure_path.parent / "sessions", second_manifest)
     second_attempt = assessment_attempt_id(
         session_id=second_manifest.session_id,
         item_ordinal=0,
@@ -517,13 +719,20 @@ def test_two_attempts_with_same_response_share_bytes_but_not_capture_slot(
         channel="L",
         presented_stimulus_ref=item["presented_stimulus_ref"],
     )
-    reserve(store, exposure_path, capture_path, second_manifest, item, second_attempt)
+    second_permit = reserve(
+        store, exposure_path, capture_path, second_manifest, item, second_attempt
+    )
+    assert "attempt_id" not in inspect.signature(capture_response).parameters
+    with pytest.raises(AttributeError):
+        first_permit._attempt_id = second_attempt
+    first_permit.consume()
+    second_permit.consume()
     first_receipt = capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
         artifact_store=store,
         captured_at=CAPTURED_AT,
-        attempt_id=first_attempt,
+        display_permit=first_permit,
         response_bytes=b"same learner response",
     )
     second_receipt = capture_response(
@@ -531,10 +740,12 @@ def test_two_attempts_with_same_response_share_bytes_but_not_capture_slot(
         capture_path=capture_path,
         artifact_store=store,
         captured_at=CAPTURED_AT,
-        attempt_id=second_attempt,
+        display_permit=second_permit,
         response_bytes=b"same learner response",
     )
     assert first_receipt.response_artifact_ref == second_receipt.response_artifact_ref
+    assert first_receipt.attempt_id == first_attempt
+    assert second_receipt.attempt_id == second_attempt
     assert first_receipt.attempt_id != second_receipt.attempt_id
     assert len(read_capture_ledger(capture_path)) == 2
 
@@ -546,7 +757,8 @@ def test_crash_after_artifact_before_receipt_leaves_inert_orphan(
     store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
         tmp_path
     )
-    reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit.consume()
 
     def fail_append(*_args: object, **_kwargs: object) -> None:
         raise CaptureLedgerError("simulated crash before receipt")
@@ -558,7 +770,7 @@ def test_crash_after_artifact_before_receipt_leaves_inert_orphan(
             capture_path=capture_path,
             artifact_store=store,
             captured_at=CAPTURED_AT,
-            attempt_id=attempt_id,
+            display_permit=permit,
             response_bytes=b"orphaned exact response",
         )
     orphan_ref = "sha256:" + hashlib.sha256(b"orphaned exact response").hexdigest()
@@ -578,13 +790,14 @@ def test_valid_capture_is_resumable_without_creating_redisplay_authority(
     store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
         tmp_path
     )
-    reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit.consume()
     receipt = capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
         artifact_store=store,
         captured_at=CAPTURED_AT,
-        attempt_id=attempt_id,
+        display_permit=permit,
         response_bytes=b"captured response",
     )
     resumed = resume_captured_response(
@@ -614,20 +827,47 @@ def test_artifact_without_capture_receipt_is_not_captured(tmp_path: Path) -> Non
     ) is None
 
 
-def test_capture_without_prior_reservation_fails_before_artifact_write(
+def test_unconsumed_permit_fails_before_artifact_or_receipt_write(
     tmp_path: Path,
 ) -> None:
-    store, exposure_path, capture_path, _, _, attempt_id = initialized_runtime(tmp_path)
-    with pytest.raises(CaptureLedgerError, match="exactly one"):
+    store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
+        tmp_path
+    )
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    with pytest.raises(ExposureLedgerError, match="must be consumed"):
         capture_response(
             exposure_path=exposure_path,
             capture_path=capture_path,
             artifact_store=store,
             captured_at=CAPTURED_AT,
-            attempt_id=attempt_id,
+            display_permit=permit,
             response_bytes=b"must remain absent",
         )
+    assert read_capture_ledger(capture_path) == ()
     ref = "sha256:" + hashlib.sha256(b"must remain absent").hexdigest()
+    with pytest.raises(ArtifactStoreError):
+        store.read(ref)
+
+
+def test_fabricated_display_capability_is_rejected(tmp_path: Path) -> None:
+    store, exposure_path, capture_path, _, _, _ = initialized_runtime(tmp_path)
+    with pytest.raises(TypeError):
+        DisplayPermit("attempt:v1:" + "0" * 64, True)
+    fabricated = object.__new__(DisplayPermit)
+    object.__setattr__(fabricated, "_attempt_id", "attempt:v1:" + "0" * 64)
+    object.__setattr__(fabricated, "_consumed", True)
+    object.__setattr__(fabricated, "_novel", True)
+    with pytest.raises(TypeError, match="not issued"):
+        capture_response(
+            exposure_path=exposure_path,
+            capture_path=capture_path,
+            artifact_store=store,
+            captured_at=CAPTURED_AT,
+            display_permit=fabricated,
+            response_bytes=b"fabricated capability response",
+        )
+    assert read_capture_ledger(capture_path) == ()
+    ref = "sha256:" + hashlib.sha256(b"fabricated capability response").hexdigest()
     with pytest.raises(ArtifactStoreError):
         store.read(ref)
 
@@ -636,13 +876,14 @@ def test_second_capture_for_same_attempt_fails_closed(tmp_path: Path) -> None:
     store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
         tmp_path
     )
-    reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit.consume()
     capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
         artifact_store=store,
         captured_at=CAPTURED_AT,
-        attempt_id=attempt_id,
+        display_permit=permit,
         response_bytes=b"first",
     )
     with pytest.raises(CaptureLedgerError, match="already exists"):
@@ -651,7 +892,7 @@ def test_second_capture_for_same_attempt_fails_closed(tmp_path: Path) -> None:
             capture_path=capture_path,
             artifact_store=store,
             captured_at=CAPTURED_AT,
-            attempt_id=attempt_id,
+            display_permit=permit,
             response_bytes=b"second",
         )
 
@@ -664,13 +905,14 @@ def test_capture_receipt_with_missing_or_corrupt_artifact_fails_closed(
     store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
         tmp_path
     )
-    reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit.consume()
     receipt = capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
         artifact_store=store,
         captured_at=CAPTURED_AT,
-        attempt_id=attempt_id,
+        display_permit=permit,
         response_bytes=b"trusted captured bytes",
     )
     artifact_path = store.root / receipt.response_artifact_ref.removeprefix("sha256:")
@@ -693,7 +935,8 @@ def test_nonempty_exposure_with_missing_capture_ledger_fails_closed(
     store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
         tmp_path
     )
-    reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit.consume()
     capture_path.unlink()
     with pytest.raises(CaptureLedgerError, match="non-empty exposure"):
         initialize_t12_ledgers(
@@ -708,13 +951,14 @@ def test_capture_history_with_missing_exposure_ledger_fails_closed(tmp_path: Pat
     store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
         tmp_path
     )
-    reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit.consume()
     capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
         artifact_store=store,
         captured_at=CAPTURED_AT,
-        attempt_id=attempt_id,
+        display_permit=permit,
         response_bytes=b"captured",
     )
     exposure_path.unlink()
@@ -731,13 +975,14 @@ def test_duplicate_physical_capture_slot_fails_even_if_identical(tmp_path: Path)
     store, exposure_path, capture_path, manifest, item, attempt_id = initialized_runtime(
         tmp_path
     )
-    reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit = reserve(store, exposure_path, capture_path, manifest, item, attempt_id)
+    permit.consume()
     capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
         artifact_store=store,
         captured_at=CAPTURED_AT,
-        attempt_id=attempt_id,
+        display_permit=permit,
         response_bytes=b"captured",
     )
     physical_line = capture_path.read_bytes()
@@ -769,9 +1014,11 @@ def test_t12_foundation_has_no_anki_reconcile_t9_or_eventlog_dependency() -> Non
     for name in (
         "assessment_identity.py",
         "artifact_store.py",
+        "capture_ledger.py",
         "session.py",
         "exposure.py",
         "response_capture.py",
+        "t12_jsonl.py",
     ):
         tree = ast.parse((root / name).read_text(encoding="utf-8"))
         imported: set[str] = set()
@@ -781,3 +1028,26 @@ def test_t12_foundation_has_no_anki_reconcile_t9_or_eventlog_dependency() -> Non
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
         assert imported.isdisjoint(forbidden_roots)
+
+
+def test_exposure_and_capture_have_no_circular_private_helper_dependency() -> None:
+    root = Path(__file__).parents[1] / "vocab"
+    exposure_source = (root / "exposure.py").read_text(encoding="utf-8")
+    response_source = (root / "response_capture.py").read_text(encoding="utf-8")
+    response_tree = ast.parse(response_source)
+
+    assert "response_capture" not in exposure_source
+    exposure_imports = [
+        alias.name
+        for node in ast.walk(response_tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "exposure"
+        for alias in node.names
+    ]
+    assert exposure_imports
+    assert all(not name.startswith("_") for name in exposure_imports)
+    assert "_read_strict_canonical_jsonl" not in response_source
+    assert "_append_strict_canonical_record" not in response_source
+
+    jsonl_source = (root / "t12_jsonl.py").read_text(encoding="utf-8")
+    assert "ExposureReservation" not in jsonl_source
+    assert "CaptureReceipt" not in jsonl_source

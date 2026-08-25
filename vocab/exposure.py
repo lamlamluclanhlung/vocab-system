@@ -4,15 +4,11 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import TypeVar
 
-from .artifact_json import ArtifactJSONError, canonical_json_bytes, strict_json_loads
 from .artifact_store import ArtifactStore
 from .assessment_identity import assessment_attempt_id
+from .capture_ledger import read_capture_ledger, validate_capture_bindings
 from .contracts import (
     ASSESSMENT_ARTIFACT_REF_PATTERN,
     ASSESSMENT_ATTEMPT_ID_PATTERN,
@@ -22,7 +18,12 @@ from .contracts import (
     T12_ASSESSMENT_PRODUCER_VERSION,
     UNIT_KEY_PATTERN,
 )
-from .session import SESSION_ID_PATTERN
+from .session import SESSION_ID_PATTERN, load_session_manifest
+from .t12_jsonl import (
+    append_strict_canonical_record,
+    read_strict_canonical_jsonl,
+    validated_utc_timestamp,
+)
 
 
 EXPOSURE_LEDGER_VERSION = 1
@@ -90,20 +91,13 @@ class ExposureReservation:
 class DisplayPermit:
     """A one-use in-memory authorization issued only after durable readback."""
 
-    __slots__ = ("_attempt_id", "_consumed", "_novel")
+    __slots__ = ("_attempt_id", "_consumed", "_issuer", "_novel")
 
-    def __init__(
-        self,
-        attempt_id: str,
-        novel: bool,
-        *,
-        _issuer: object | None = None,
-    ) -> None:
-        if _issuer is not _PERMIT_ISSUER:
-            raise TypeError("DisplayPermit can only be issued by reserve_exposure")
-        self._attempt_id = attempt_id
-        self._novel = novel
-        self._consumed = False
+    def __new__(cls, *_args: object, **_kwargs: object) -> DisplayPermit:
+        raise TypeError("DisplayPermit can only be issued by reserve_exposure")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("DisplayPermit bindings are immutable")
 
     @property
     def attempt_id(self) -> str:
@@ -121,14 +115,29 @@ class DisplayPermit:
         """Consume this exact display authority once."""
         if self._consumed:
             raise ExposureLedgerError("DisplayPermit has already been consumed")
-        self._consumed = True
+        object.__setattr__(self, "_consumed", True)
+
+    def _validated_attempt_id_for_capture(self) -> str:
+        try:
+            issuer = object.__getattribute__(self, "_issuer")
+        except AttributeError:
+            raise TypeError(
+                "display_permit was not issued by reserve_exposure"
+            ) from None
+        if type(self) is not DisplayPermit or issuer is not _PERMIT_ISSUER:
+            raise TypeError("display_permit was not issued by reserve_exposure")
+        if not self._consumed:
+            raise ExposureLedgerError(
+                "DisplayPermit must be consumed before response capture"
+            )
+        return self._attempt_id
 
 
 def read_exposure_ledger(
     path: str | os.PathLike[str],
 ) -> tuple[ExposureReservation, ...]:
     """Read the complete strict canonical D55 history in physical order."""
-    records = _read_strict_canonical_jsonl(
+    records = read_strict_canonical_jsonl(
         path,
         decoder=_decode_exposure_record,
         error_type=ExposureLedgerError,
@@ -145,19 +154,26 @@ def read_exposure_ledger(
     return tuple(records)
 
 
-def exposure_is_novel(
-    history: Sequence[ExposureReservation],
-    current: ExposureReservation,
+def novelty_for_reserved_attempt(
+    exposure_path: str | os.PathLike[str],
+    attempt_id: object,
 ) -> bool:
-    """Apply D55 novelty using only earlier physical reservations."""
-    if not isinstance(current, ExposureReservation):
-        raise TypeError("current must be an ExposureReservation")
-    for earlier in history:
-        if not isinstance(earlier, ExposureReservation):
-            raise TypeError("history must contain ExposureReservation values")
+    """Compute D55 novelty only for one verified physical reservation."""
+    if type(attempt_id) is not str or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None:
+        raise ExposureLedgerError("attempt_id is invalid")
+    history = read_exposure_ledger(exposure_path)
+    matching_indexes = [
+        index for index, record in enumerate(history) if record.attempt_id == attempt_id
+    ]
+    if len(matching_indexes) != 1:
+        raise ExposureLedgerError(
+            "novelty requires exactly one durable current reservation"
+        )
+    current_index = matching_indexes[0]
+    current = history[current_index]
+    for earlier in history[:current_index]:
         if (
-            earlier.attempt_id != current.attempt_id
-            and earlier.unit_key == current.unit_key
+            earlier.unit_key == current.unit_key
             and earlier.channel == current.channel
             and earlier.presented_stimulus_ref == current.presented_stimulus_ref
         ):
@@ -170,27 +186,48 @@ def reserve_exposure(
     exposure_path: str | os.PathLike[str],
     capture_path: str | os.PathLike[str],
     artifact_store: ArtifactStore,
-    reserved_at: object,
-    attempt_id: object,
+    session_root: str | os.PathLike[str],
     session_id: object,
     item_ordinal: object,
-    unit_key: object,
-    channel: object,
-    presented_stimulus_ref: object,
-    stimulus_artifact_ref: object,
+    reserved_at: object,
 ) -> DisplayPermit:
-    """Durably reserve one exposure, then and only then issue a permit."""
+    """Reserve one exact persisted manifest item, then issue a permit."""
     if not isinstance(artifact_store, ArtifactStore):
         raise TypeError("artifact_store must be an ArtifactStore")
-    history = read_exposure_ledger(exposure_path)
-
-    # D60 requires both ledgers to remain a validated pair before exposure.
-    from .response_capture import validate_capture_ledger
-
-    validate_capture_ledger(
-        capture_path,
-        exposure_history=history,
+    history = _validate_paired_histories(
+        exposure_path=exposure_path,
+        capture_path=capture_path,
         artifact_store=artifact_store,
+    )
+    if type(item_ordinal) is not int or item_ordinal < 0:
+        raise ExposureLedgerError(
+            "item_ordinal must be an actual non-negative integer"
+        )
+    manifest = load_session_manifest(session_root, session_id)
+    manifest_data = manifest.to_dict()
+    items = manifest_data["items"]
+    if type(items) is not list:  # pragma: no cover - manifest import guarantees it
+        raise AssertionError("validated session manifest items are not an array")
+    matching_items = [
+        item
+        for item in items
+        if type(item) is dict and item.get("item_ordinal") == item_ordinal
+    ]
+    if len(matching_items) != 1:
+        raise ExposureLedgerError(
+            "session manifest does not contain exactly one requested item_ordinal"
+        )
+    item = matching_items[0]
+    unit_key = item["unit_key"]
+    channel = item["channel"]
+    presented_stimulus_ref = item["presented_stimulus_ref"]
+    stimulus_artifact_ref = item["stimulus_artifact_ref"]
+    attempt_id = assessment_attempt_id(
+        session_id=manifest.session_id,
+        item_ordinal=item_ordinal,
+        unit_key=unit_key,
+        channel=channel,
+        presented_stimulus_ref=presented_stimulus_ref,
     )
     record = _decode_exposure_record(
         {
@@ -199,7 +236,7 @@ def reserve_exposure(
             "producer_version": T12_ASSESSMENT_PRODUCER_VERSION,
             "reserved_at": reserved_at,
             "attempt_id": attempt_id,
-            "session_id": session_id,
+            "session_id": manifest.session_id,
             "item_ordinal": item_ordinal,
             "unit_key": unit_key,
             "channel": channel,
@@ -211,18 +248,47 @@ def reserve_exposure(
     if any(existing.attempt_id == record.attempt_id for existing in history):
         raise ExposureLedgerError("exposure slot is already reserved")
 
-    # A displayed artifact must itself be exact and available before reservation.
     artifact_store.read(record.stimulus_artifact_ref)
-    novel = exposure_is_novel(history, record)
     _append_exposure_record(exposure_path, record)
-    return DisplayPermit(record.attempt_id, novel, _issuer=_PERMIT_ISSUER)
+    _validate_paired_histories(
+        exposure_path=exposure_path,
+        capture_path=capture_path,
+        artifact_store=artifact_store,
+    )
+    novel = novelty_for_reserved_attempt(exposure_path, record.attempt_id)
+    return _issue_display_permit(record.attempt_id, novel)
+
+
+def _issue_display_permit(attempt_id: str, novel: bool) -> DisplayPermit:
+    permit = object.__new__(DisplayPermit)
+    object.__setattr__(permit, "_attempt_id", attempt_id)
+    object.__setattr__(permit, "_novel", novel)
+    object.__setattr__(permit, "_consumed", False)
+    object.__setattr__(permit, "_issuer", _PERMIT_ISSUER)
+    return permit
+
+
+def _validate_paired_histories(
+    *,
+    exposure_path: str | os.PathLike[str],
+    capture_path: str | os.PathLike[str],
+    artifact_store: ArtifactStore,
+) -> tuple[ExposureReservation, ...]:
+    exposures = read_exposure_ledger(exposure_path)
+    captures = read_capture_ledger(capture_path)
+    validate_capture_bindings(
+        captures,
+        exposure_attempt_ids=tuple(item.attempt_id for item in exposures),
+        artifact_store=artifact_store,
+    )
+    return exposures
 
 
 def _append_exposure_record(
     path: str | os.PathLike[str],
     record: ExposureReservation,
 ) -> None:
-    _append_strict_canonical_record(
+    append_strict_canonical_record(
         path,
         record,
         reader=read_exposure_ledger,
@@ -250,7 +316,7 @@ def _decode_exposure_record(
         or value["producer_version"] != T12_ASSESSMENT_PRODUCER_VERSION
     ):
         raise ExposureLedgerError(f"{location} has an invalid producer_version")
-    reserved_at = _validated_utc_timestamp(
+    reserved_at = validated_utc_timestamp(
         value["reserved_at"],
         "reserved_at",
         ExposureLedgerError,
@@ -304,94 +370,3 @@ def _decode_exposure_record(
         presented_stimulus_ref=stimulus_ref,
         stimulus_artifact_ref=artifact_ref,
     )
-
-
-_RecordT = TypeVar("_RecordT")
-
-
-def _read_strict_canonical_jsonl(
-    path: str | os.PathLike[str],
-    *,
-    decoder: Callable[..., _RecordT],
-    error_type: type[ValueError],
-    ledger_name: str,
-) -> list[_RecordT]:
-    ledger_path = _validated_ledger_path(path, ledger_name, error_type)
-    try:
-        raw = ledger_path.read_bytes()
-    except (OSError, FileNotFoundError, IsADirectoryError) as exc:
-        raise error_type(f"{ledger_name} is missing or unreadable") from exc
-    if raw and not raw.endswith(b"\n"):
-        raise error_type(f"{ledger_name} has a malformed final record")
-    records: list[_RecordT] = []
-    for line_number, physical_line in enumerate(raw.splitlines(keepends=True), 1):
-        body = physical_line[:-1]
-        if not body:
-            raise error_type(f"{ledger_name} record {line_number} is blank")
-        try:
-            value = strict_json_loads(body)
-        except (ArtifactJSONError, TypeError) as exc:
-            raise error_type(
-                f"{ledger_name} record {line_number} is invalid: {exc}"
-            ) from None
-        record = decoder(value, location=f"{ledger_name} record {line_number}")
-        expected_line = canonical_json_bytes(record.to_dict()) + b"\n"
-        if physical_line != expected_line:
-            raise error_type(
-                f"{ledger_name} record {line_number} is not canonical JSONL"
-            )
-        records.append(record)
-    return records
-
-
-def _append_strict_canonical_record(
-    path: str | os.PathLike[str],
-    record: _RecordT,
-    *,
-    reader: Callable[[str | os.PathLike[str]], Sequence[_RecordT]],
-    error_type: type[ValueError],
-    ledger_name: str,
-) -> None:
-    ledger_path = _validated_ledger_path(path, ledger_name, error_type)
-    line = canonical_json_bytes(record.to_dict()) + b"\n"  # type: ignore[attr-defined]
-    try:
-        with ledger_path.open("ab") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError as exc:
-        raise error_type(f"{ledger_name} append failed") from exc
-    history = reader(ledger_path)
-    if not history or history[-1] != record:
-        raise error_type(f"{ledger_name} exact append readback failed")
-
-
-def _validated_ledger_path(
-    path: str | os.PathLike[str],
-    ledger_name: str,
-    error_type: type[ValueError],
-) -> Path:
-    if path is None:
-        raise TypeError(f"{ledger_name} path must be explicit")
-    result = Path(path)
-    if not result.name:
-        raise error_type(f"{ledger_name} path must identify a file")
-    return result
-
-
-def _validated_utc_timestamp(
-    value: object,
-    name: str,
-    error_type: type[ValueError],
-) -> str:
-    if type(value) is not str or not value:
-        raise error_type(f"{name} must be a non-empty UTC timestamp")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise error_type(f"{name} must be valid ISO-8601") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise error_type(f"{name} must use explicit UTC +00:00")
-    if value != parsed.astimezone(timezone.utc).isoformat():
-        raise error_type(f"{name} must be normalized UTC with +00:00")
-    return value
