@@ -5246,3 +5246,227 @@ D59 does not define or implement:
 - precedence among multiple simultaneous W/S lexical-error categories;
 - pronunciation, accent, prosody, or generic language-proficiency scoring;
 - globally immutable protocol/rubric/prompt text registries.
+
+## D60 — Durable response capture receipts and immutable artifact-store boundary
+
+**Date:** 2026-08-25
+**Status:** Accepted
+
+T12 owns a second append-only ledger at an explicit runtime path:
+
+    t12-captures.jsonl
+
+The D55 exposure ledger remains unchanged and retains exactly one authority:
+
+    which attempt/stimulus exposures consumed novelty
+
+The capture ledger has exactly one authority:
+
+    which immutable learner-response artifact was durably captured
+    for which attempt
+
+EventLog remains authoritative for final outcomes.
+
+The immutable artifact store is authoritative only for exact bytes.
+
+No store duplicates another store's fact.
+
+Capture record v1 contains exactly:
+
+    v
+    producer
+    producer_version
+    captured_at
+    attempt_id
+    response_artifact_ref
+
+Rules:
+
+    v == 1
+
+    producer == "t12-assessment"
+
+    producer_version == 1
+
+    captured_at is normalized UTC ISO-8601 with explicit +00:00
+
+    captured_at is audit metadata only
+
+    attempt_id must satisfy the frozen attempt-id grammar
+
+    response_artifact_ref must satisfy the frozen sha256 artifact-ref grammar
+
+Capture-ledger slot identity is exactly:
+
+    producer
+    producer_version
+    attempt_id
+
+Duplicate physical capture slots fail closed even if identical.
+
+A valid capture requires:
+
+    exactly one compatible durable D55 exposure reservation
+    for the same attempt_id
+
+AND
+
+    the referenced immutable artifact exists
+
+AND
+
+    its exact bytes hash back to response_artifact_ref
+
+Capture sequence is exactly:
+
+    1. validate exposure history
+    2. validate capture history
+    3. establish exactly one matching reservation
+    4. durably persist immutable response bytes
+    5. flush/fsync artifact
+    6. exact artifact readback/hash verification
+    7. append capture receipt
+    8. flush/fsync
+    9. exact capture-record readback
+
+A response is resumable after restart IFF:
+
+    one valid capture receipt exists for the attempt
+    AND the referenced artifact verifies
+
+Artifact existence without a capture receipt NEVER establishes capture.
+
+Such an artifact is an inert orphan and may remain on disk.
+
+Capture receipt without a valid referenced artifact is corruption.
+
+Two different attempts MAY reference the same response_artifact_ref
+when learner response bytes are identical.
+
+Their attempt bindings remain independent because capture receipts are
+attempt-scoped.
+
+Before the first exposure reservation, exposure and capture ledgers are
+initialized together.
+
+If exposure history is non-empty while the capture-ledger file is unexpectedly
+missing, fail closed.
+
+If capture history exists while the exposure ledger is missing, fail closed.
+
+The immutable artifact store:
+
+    stores exact bytes by sha256 content identity
+    contains no attempt/session/unit/channel/outcome/novelty index
+    performs no directory-listing-based recovery
+    never acts as attempt→response authority
+
+## D61 — T12 final outcome authority mapping and producer operational closure
+
+**Date:** 2026-08-25
+**Status:** Accepted
+
+Top-level authority means:
+
+    the authority responsible for the final stored outcome
+
+Provenance means:
+
+    every stage actually invoked to establish that outcome
+
+For T12 producer v1 the mapping is frozen:
+
+Semantic PASS/FAIL, after exact human APPROVE:
+    authority_kind = "semantic_model"
+
+    model_id      = exact imported T11 assessor_id
+    model_version = exact imported T11 assessor_version
+
+This applies to:
+    R PASS/FAIL
+    L PASS/FAIL
+    W PASS/FAIL after target-present gate
+    S PASS/FAIL after verified transcription and target-present gate
+
+OMITTED:
+    authority_kind = "deterministic_gate"
+
+    model_id      = "d19-target-presence"
+    model_version = "1"
+
+Presence-gate provenance is:
+
+    gate_id      = "d19-target-presence"
+    gate_version = 1
+    target_present = false
+
+ALL ABSTAIN outcomes:
+    authority_kind = "policy"
+
+    model_id      = "t12-assessment-policy"
+    model_version = "1"
+
+Policy provenance is:
+
+    policy_id      = "t12-assessment-policy"
+    policy_version = 1
+
+This includes:
+    off_topic
+    refusal
+    explicit_skip
+    no_response
+    insufficient_lexical_evidence
+    response_unintelligible
+    audio_unusable
+    transcription_uncertain
+    transcription_failed
+    semantic_uncertainty
+    reviewer_rejected
+    invalid_artifact
+    infrastructure_failure
+
+The provenance object must still preserve every stage actually invoked.
+
+Examples:
+
+semantic uncertainty:
+    successfully invoked prerequisites
+    semantic_judge
+    policy
+
+reviewer rejected:
+    successfully invoked prerequisites
+    semantic_judge
+    human_review
+    policy
+
+transcription uncertainty:
+    transcription
+    policy
+
+The HUMAN_REVIEW authority_kind enum member remains legal at the generic
+contract level but is not selected as the top-level authority by the current
+T12 v1 planner.
+
+For SPEAK, top-level model_id/model_version/authority_kind use the same final
+outcome authority mapping as its companion JUDGE.
+
+audio_path is advisory/audit metadata only.
+
+response_audio_ref is the authoritative raw speech-response identity.
+
+Moving a file path must not create a new response or assessment identity.
+
+T12 complete EventLog preflight must use the existing EventLog decoder but must
+treat EventLogCorruptionWarning as an exception. A malformed final event record
+must therefore fail T12 preflight rather than be silently ignored.
+
+Do not create a second EventLog parser.
+
+Generic EventLog.log() remains generic for historical compatibility.
+
+Repository production code must not emit a new D35-bearing JUDGE except through
+the future T12 assessment producer. This will be guarded by an AST/static
+invariant test rather than by adding T12-specific authorization state to
+EventLog.
