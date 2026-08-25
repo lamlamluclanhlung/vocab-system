@@ -6060,3 +6060,473 @@ Mutating:
     returned detached payload
 
 must not mutate the planned judge.
+
+## D65 — Durable speech transcription dispositions
+
+**Date:** 2026-08-25
+**Status:** Accepted
+
+T12 owns one additional append-only ledger:
+
+    t12-transcriptions.jsonl
+
+Its ONE authority is:
+
+    which terminal transcription disposition has been durably established
+    for the exact raw-audio response of one S attempt.
+
+It is NOT:
+
+    EventLog
+    lifecycle state
+    novelty state
+    Unit state
+    semantic outcome history
+    an STT cache
+
+Transcription receipt slot identity is exactly:
+
+    producer
+    producer_version
+    attempt_id
+
+with:
+
+    producer = "t12-assessment"
+    producer_version = 1
+
+Duplicate physical slot:
+    fail closed even if identical.
+
+There is no automatic supersession, correction, rewrite, or second receipt
+for one attempt in v1.
+
+### Exact receipt schema
+
+Every receipt has exactly:
+
+    v
+    producer
+    producer_version
+    recorded_at
+    attempt_id
+    response_audio_ref
+    transcription
+
+Rules:
+
+    v == 1
+
+    producer == "t12-assessment"
+
+    producer_version == 1
+
+    recorded_at:
+        normalized UTC ISO-8601
+        explicit +00:00
+        audit metadata only
+
+    attempt_id:
+        frozen attempt:v1 grammar
+
+    response_audio_ref:
+        frozen sha256 artifact-ref grammar
+
+    transcription:
+        exact status-dependent closed union below
+
+No unknown fields.
+
+### SUCCESS union
+
+Exactly:
+
+    status
+    stt_model_id
+    stt_model_version
+    decoder_version
+    stt_output_ref
+    approved_transcript_ref
+    verifier_id
+    verifier_version
+
+with:
+
+    status == "SUCCESS"
+
+All string metadata:
+    non-empty strings
+
+stt_output_ref:
+    valid artifact ref
+
+approved_transcript_ref:
+    valid artifact ref
+
+verifier_id:
+    reuse SLUG_PATTERN
+
+verifier_version:
+    actual int >= 1
+    Boolean forbidden
+
+SUCCESS means:
+
+    valid raw audio already durably belongs to this attempt
+
+    a valid local STT candidate exists
+
+    human verifier listened to the exact raw audio of this attempt
+
+    human approved one exact transcript
+
+Only SUCCESS may enter D19 or T11 semantic assessment.
+
+### UNCERTAIN union
+
+Exactly:
+
+    status
+    stt_model_id
+    stt_model_version
+    decoder_version
+    stt_output_ref
+    verifier_id
+    verifier_version
+    uncertainty_code
+
+with:
+
+    status == "UNCERTAIN"
+
+uncertainty_code is exactly one of:
+
+    audio_unclear
+    transcript_ambiguous
+    stt_human_disagreement
+
+UNCERTAIN always means:
+
+    a valid STT candidate existed
+
+    a human verifier actually listened to the exact raw audio
+
+    the verifier could NOT approve one exact transcript
+
+UNCERTAIN may NEVER mean merely:
+
+    verification has not happened yet
+    workflow crashed
+    workflow was abandoned
+
+Required final assessment semantics later:
+
+    ABSTAIN / transcription_uncertain
+
+No D19.
+No semantic request.
+
+### FAILED unions
+
+Closed transcription failure codes are exactly:
+
+    transcription_failed
+    audio_unusable
+    infrastructure_failure
+
+Do NOT invent:
+
+    verification_not_performed
+    stt_invocation_failed
+    stt_output_invalid
+
+as durable D57 failure vocabulary.
+
+Fine-grained technical diagnostics are not lifecycle/audit authority.
+
+FAILED before STT invocation exactly:
+
+    status
+    failure_code
+
+FAILED after STT invocation exactly:
+
+    status
+    stt_model_id
+    stt_model_version
+    decoder_version
+    failure_code
+
+The D57 emitted provenance remains exactly these shapes.
+
+Terminal outcome semantics:
+
+    failure_code == "transcription_failed"
+        -> ABSTAIN / transcription_failed
+
+    failure_code == "audio_unusable"
+        -> ABSTAIN / audio_unusable
+
+    failure_code == "infrastructure_failure"
+        -> ABSTAIN / infrastructure_failure
+
+### Interruption is NOT FAILED
+
+A workflow interruption is not a transcription disposition.
+
+Examples:
+
+    process crash before STT
+    process crash after STT artifact but before final disposition
+    human verification not yet performed
+    crash while human verification is incomplete
+
+produce:
+
+    NO transcription receipt
+
+They do NOT automatically produce FAILED.
+
+After restart:
+    rerun STT / verification as necessary.
+
+Only an explicitly finalized terminal technical/artifact failure may create a
+FAILED receipt.
+
+This distinction is mandatory.
+
+### STT artifact identity
+
+For SUCCESS and UNCERTAIN:
+
+stt_output_ref is:
+
+    sha256:<SHA256 exact UTF-8 bytes of the valid STT candidate string>
+
+Candidate:
+
+    strict UTF-8
+    non-whitespace
+
+No:
+
+    Unicode normalization
+    whitespace normalization
+    strip
+    casefold
+    newline normalization
+
+Artifact creation does not add a UTF-8 BOM.
+
+If no valid candidate string exists:
+    the disposition cannot be SUCCESS/UNCERTAIN.
+
+A technical STT failure becomes FAILED.
+
+Do not store model/decoder metadata inside the STT text artifact.
+Those facts live in the receipt/provenance.
+
+### Approved transcript identity
+
+For SUCCESS:
+
+approved_transcript_ref is:
+
+    sha256:<SHA256 exact UTF-8 bytes of the exact human-approved transcript)>
+
+The approved transcript:
+
+    strict UTF-8
+    non-whitespace
+
+No:
+
+    Unicode normalization
+    strip
+    whitespace collapse
+    case folding
+    newline normalization
+
+Do not add a UTF-8 BOM.
+
+Do NOT create a rule that silently strips or rejects a trailing newline merely
+because it is trailing.
+
+If the approved exact string contains it, it remains digest-significant.
+
+Two different attempts/audio artifacts MAY have the same
+approved_transcript_ref when approved transcript bytes are identical.
+
+Artifact identity does not establish attempt binding.
+
+The transcription receipt establishes attempt/audio binding.
+
+### Durable binding
+
+A valid transcription receipt requires:
+
+    exactly one valid exposure reservation for attempt_id
+
+    exactly one valid capture receipt for attempt_id
+
+    capture corresponds to an S attempt
+
+    response_audio_ref ==
+        capture_receipt.response_artifact_ref
+
+    raw audio artifact verifies in ArtifactStore
+
+For SUCCESS:
+
+    stt_output_ref verifies
+
+    approved_transcript_ref verifies
+
+    both referenced artifacts decode strict UTF-8
+
+    both are non-whitespace
+
+For UNCERTAIN:
+
+    stt_output_ref verifies
+    decodes strict UTF-8
+    is non-whitespace
+
+For FAILED:
+
+    only refs actually present in the frozen D57 union are validated;
+    do not invent stt_output_ref for FAILED provenance.
+
+Receipt is appended only after all referenced artifacts required by its status
+are durable and verified.
+
+Append:
+
+    strict canonical JSONL
+    append
+    flush
+    fsync
+    exact readback
+
+Use existing t12_jsonl.py primitives.
+
+### Crash semantics
+
+Artifact persisted but no receipt:
+
+    orphan artifact
+    inert
+    cannot issue TranscriptionEvidence
+
+Crash before receipt:
+    no transcription authority exists
+    workflow may rerun
+
+Receipt durable:
+    restart may reconstruct exact TranscriptionEvidence
+    no human re-verification is required
+
+Do not add a second STT receipt/ledger.
+
+### No correction under one attempt
+
+One attempt has at most one durable transcription receipt in v1.
+
+If an already durable SUCCESS transcript is later discovered to be wrong:
+
+    do not edit it
+    do not overwrite it
+    do not append a second receipt
+    do not fabricate a new attempt identity around the same captured raw audio
+
+That attempt cannot be silently corrected in v1.
+
+A later usable observation requires a genuinely new learner presentation /
+attempt / response under normal D54 rules.
+
+Automatic supersession remains out of scope.
+
+## D66 — Speech planning, audio locator, and companion closure
+
+**Date:** 2026-08-25
+**Status:** Accepted
+
+audio_path is advisory only.
+
+For T12 v1 it is derived exactly as:
+
+    audio_path =
+        response_audio_ref.removeprefix("sha256:")
+
+Therefore audio_path is the exact 64-lowercase-hex relative basename used by
+the current ArtifactStore layout.
+
+It is:
+
+    not absolute
+    not caller supplied
+    not identity authority
+    independent of ArtifactStore root
+
+response_audio_ref remains authoritative raw-audio identity.
+
+The planner must independently recompute and validate audio_path.
+
+No production code may resolve response identity from audio_path.
+
+### Atomic S planning
+
+T12.2b produces one sealed immutable:
+
+    PlannedSpeechAssessment
+
+It owns both:
+
+    SPEAK payload
+    JUDGE payload
+
+There is no public API that produces an independent PlannedSpeak.
+
+There is no public API that produces a standalone speech PlannedJudge.
+
+The pair is one planning authority.
+
+The issuance snapshot covers BOTH canonical payloads plus the pair identity.
+
+Any runtime mutation of either half must fail closed.
+
+### Companion closure
+
+Within one PlannedSpeechAssessment, SPEAK and JUDGE must agree exactly on:
+
+    producer
+    producer_version
+    attempt_id
+    unit_key scope
+    channel
+    presented_stimulus_ref
+    raw response audio identity
+    outcome
+    passed
+    applicable failure/reason code
+
+Additionally D61/D65 require exact agreement on:
+
+    model_id
+    model_version
+    authority_kind
+    provenance
+
+SPEAK.response_audio_ref
+must equal
+JUDGE.response_artifact_ref
+must equal
+ValidatedAttemptEvidence.response_artifact_ref.
+
+channel == "S".
+
+SPEAK never contains D35.
+
+JUDGE PASS/FAIL contains complete D35.
+
+JUDGE OMITTED/ABSTAIN contains zero D35.
