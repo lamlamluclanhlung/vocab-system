@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -59,6 +60,8 @@ class AssessmentPlanningError(ValueError):
 
 
 _PLANNED_SEAL = object()
+_PLANNED_SNAPSHOT_DOMAIN = "vocab.t12.planned-judge"
+_PLANNED_SNAPSHOT_VERSION = 1
 _UNIT_KEY_RE = re.compile(UNIT_KEY_PATTERN)
 _ATTEMPT_ID_RE = re.compile(ASSESSMENT_ATTEMPT_ID_PATTERN)
 _STIMULUS_REF_RE = re.compile(ASSESSMENT_STIMULUS_REF_PATTERN)
@@ -112,6 +115,7 @@ class PlannedJudge:
 
     unit_key: str
     _canonical_payload_bytes: bytes = field(repr=False, compare=True)
+    _snapshot_bytes: bytes = field(repr=False, compare=False)
     _seal: object = field(repr=False, compare=False)
 
     def __new__(cls, *_args: object, **_kwargs: object) -> PlannedJudge:
@@ -120,14 +124,12 @@ class PlannedJudge:
     @property
     def canonical_payload_bytes(self) -> bytes:
         """Return the immutable canonical JSON representation of the payload."""
+        _require_planned_judge(self)
         return self._canonical_payload_bytes
 
     def to_payload(self) -> dict[str, object]:
         """Return a detached mutable payload copy."""
-        value = strict_json_loads(self._canonical_payload_bytes)
-        if type(value) is not dict:  # pragma: no cover - construction guarantees it
-            raise AssertionError("planned JUDGE payload is not an object")
-        return value
+        return _require_planned_judge(self)
 
     def to_dict(self) -> dict[str, object]:
         """Alias for the detached payload view."""
@@ -281,15 +283,82 @@ def _base_payload(
 
 def _issue_planned_judge(unit_key: str, payload: object) -> PlannedJudge:
     validated_payload = _validated_judge_payload(unit_key=unit_key, payload=payload)
+    canonical_payload_bytes = canonical_json_bytes(validated_payload)
     planned = object.__new__(PlannedJudge)
     object.__setattr__(planned, "unit_key", unit_key)
     object.__setattr__(
         planned,
         "_canonical_payload_bytes",
-        canonical_json_bytes(validated_payload),
+        canonical_payload_bytes,
+    )
+    object.__setattr__(
+        planned,
+        "_snapshot_bytes",
+        _planned_snapshot_bytes(
+            unit_key=unit_key,
+            canonical_payload_bytes=canonical_payload_bytes,
+        ),
     )
     object.__setattr__(planned, "_seal", _PLANNED_SEAL)
     return planned
+
+
+def _require_planned_judge(value: object) -> dict[str, object]:
+    if type(value) is not PlannedJudge:
+        raise TypeError("planned must be a PlannedJudge")
+    try:
+        seal = value._seal
+    except AttributeError:
+        raise TypeError("planned JUDGE was not issued by plan_text_judge") from None
+    if seal is not _PLANNED_SEAL:
+        raise TypeError("planned JUDGE was not issued by plan_text_judge")
+    if type(value._canonical_payload_bytes) is not bytes:
+        raise AssessmentPlanningError(
+            "planned JUDGE canonical payload bytes are invalid"
+        )
+    try:
+        decoded_payload = strict_json_loads(value._canonical_payload_bytes)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise AssessmentPlanningError(
+            "planned JUDGE canonical payload bytes are invalid"
+        ) from exc
+    if type(decoded_payload) is not dict:
+        raise AssessmentPlanningError("planned JUDGE payload is not an object")
+    validated_payload = _validated_judge_payload(
+        unit_key=value.unit_key,
+        payload=decoded_payload,
+    )
+    canonical_payload_bytes = canonical_json_bytes(validated_payload)
+    if canonical_payload_bytes != value._canonical_payload_bytes:
+        raise AssessmentPlanningError(
+            "planned JUDGE payload bytes are not exact canonical JSON"
+        )
+    if type(value._snapshot_bytes) is not bytes:
+        raise AssessmentPlanningError("planned JUDGE issuance snapshot is invalid")
+    current_snapshot = _planned_snapshot_bytes(
+        unit_key=value.unit_key,
+        canonical_payload_bytes=value._canonical_payload_bytes,
+    )
+    if current_snapshot != value._snapshot_bytes:
+        raise AssessmentPlanningError(
+            "planned JUDGE runtime fields disagree with its issuance snapshot"
+        )
+    return validated_payload
+
+
+def _planned_snapshot_bytes(
+    *,
+    unit_key: str,
+    canonical_payload_bytes: bytes,
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "domain": _PLANNED_SNAPSHOT_DOMAIN,
+            "v": _PLANNED_SNAPSHOT_VERSION,
+            "unit_key": unit_key,
+            "payload_sha256": hashlib.sha256(canonical_payload_bytes).hexdigest(),
+        }
+    )
 
 
 def _validated_judge_payload(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .artifact_json import canonical_json_bytes
 from .assessment_evidence import (
     ValidatedAttemptEvidence,
     ValidatedUnitEvidence,
@@ -24,6 +25,8 @@ class PresenceEvidenceError(ValueError):
 
 
 _PRESENCE_SEAL = object()
+_PRESENCE_SNAPSHOT_DOMAIN = "vocab.t12.presence-gate-evidence"
+_PRESENCE_SNAPSHOT_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -38,6 +41,7 @@ class PresenceGateEvidence:
     gate_version: int
     target_present: bool
     _unit_identity: tuple[object, ...] = field(repr=False, compare=False)
+    _snapshot_bytes: bytes = field(repr=False, compare=False)
     _seal: object = field(repr=False, compare=False)
 
     def __new__(cls, *_args: object, **_kwargs: object) -> PresenceGateEvidence:
@@ -65,20 +69,8 @@ def evaluate_presence_gate(
     _require_attempt_unit_binding(validated_attempt, validated_unit)
     if validated_attempt.channel != "W":
         raise PresenceEvidenceError("presence gating is supported only for W")
-    try:
-        captured_text = validated_attempt.response_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        raise PresenceEvidenceError(
-            "captured written response must be strict UTF-8"
-        ) from None
-    try:
-        target_present = contains_unit(
-            captured_text,
-            validated_unit.lemma,
-            validated_unit.unit_type,
-        )
-    except (TypeError, ValueError) as exc:
-        raise PresenceEvidenceError("D19 presence evaluation failed") from exc
+    target_present = _evaluate_target_presence(validated_attempt, validated_unit)
+    unit_identity = _unit_binding(validated_unit)
 
     evidence = object.__new__(PresenceGateEvidence)
     object.__setattr__(evidence, "attempt_id", validated_attempt.attempt_id)
@@ -92,7 +84,21 @@ def evaluate_presence_gate(
     object.__setattr__(evidence, "gate_id", PRESENCE_GATE_ID)
     object.__setattr__(evidence, "gate_version", PRESENCE_GATE_VERSION)
     object.__setattr__(evidence, "target_present", target_present)
-    object.__setattr__(evidence, "_unit_identity", _unit_binding(validated_unit))
+    object.__setattr__(evidence, "_unit_identity", unit_identity)
+    object.__setattr__(
+        evidence,
+        "_snapshot_bytes",
+        _presence_snapshot_bytes(
+            attempt_id=validated_attempt.attempt_id,
+            unit_key=validated_unit.unit_key,
+            channel="W",
+            source_artifact_ref=validated_attempt.response_artifact_ref,
+            gate_id=PRESENCE_GATE_ID,
+            gate_version=PRESENCE_GATE_VERSION,
+            target_present=target_present,
+            unit_identity=unit_identity,
+        ),
+    )
     object.__setattr__(evidence, "_seal", _PRESENCE_SEAL)
     return evidence
 
@@ -115,6 +121,13 @@ def _require_presence_evidence(
         ) from None
     if seal is not _PRESENCE_SEAL:
         raise TypeError("presence evidence was not issued by evaluate_presence_gate")
+    if value.channel != "W" or type(value.target_present) is not bool:
+        raise PresenceEvidenceError("presence evidence runtime fields are incoherent")
+    expected_target_present = _evaluate_target_presence(
+        validated_attempt,
+        validated_unit,
+    )
+    unit_identity = _unit_binding(validated_unit)
     expected_binding = (
         validated_attempt.attempt_id,
         validated_unit.unit_key,
@@ -122,7 +135,8 @@ def _require_presence_evidence(
         validated_attempt.response_artifact_ref,
         PRESENCE_GATE_ID,
         PRESENCE_GATE_VERSION,
-        _unit_binding(validated_unit),
+        expected_target_present,
+        unit_identity,
     )
     actual_binding = (
         value.attempt_id,
@@ -131,12 +145,70 @@ def _require_presence_evidence(
         value.source_artifact_ref,
         value.gate_id,
         value.gate_version,
+        value.target_present,
         value._unit_identity,
     )
     if actual_binding != expected_binding:
         raise PresenceEvidenceError(
             "presence evidence does not bind this attempt, source, and Unit"
         )
-    if value.channel != "W" or type(value.target_present) is not bool:
-        raise PresenceEvidenceError("presence evidence runtime fields are incoherent")
+    if type(value._snapshot_bytes) is not bytes:
+        raise PresenceEvidenceError("presence evidence issuance snapshot is invalid")
+    current_snapshot = _presence_snapshot_bytes(
+        attempt_id=value.attempt_id,
+        unit_key=value.unit_key,
+        channel=value.channel,
+        source_artifact_ref=value.source_artifact_ref,
+        gate_id=value.gate_id,
+        gate_version=value.gate_version,
+        target_present=value.target_present,
+        unit_identity=value._unit_identity,
+    )
+    if current_snapshot != value._snapshot_bytes:
+        raise PresenceEvidenceError(
+            "presence evidence runtime fields disagree with its issuance snapshot"
+        )
     return value
+
+
+def _evaluate_target_presence(
+    attempt: ValidatedAttemptEvidence,
+    unit: ValidatedUnitEvidence,
+) -> bool:
+    try:
+        captured_text = attempt.response_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise PresenceEvidenceError(
+            "captured written response must be strict UTF-8"
+        ) from None
+    try:
+        return contains_unit(captured_text, unit.lemma, unit.unit_type)
+    except (TypeError, ValueError) as exc:
+        raise PresenceEvidenceError("D19 presence evaluation failed") from exc
+
+
+def _presence_snapshot_bytes(
+    *,
+    attempt_id: str,
+    unit_key: str,
+    channel: str,
+    source_artifact_ref: str,
+    gate_id: str,
+    gate_version: int,
+    target_present: bool,
+    unit_identity: tuple[object, ...],
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "domain": _PRESENCE_SNAPSHOT_DOMAIN,
+            "v": _PRESENCE_SNAPSHOT_VERSION,
+            "attempt_id": attempt_id,
+            "unit_key": unit_key,
+            "channel": channel,
+            "source_artifact_ref": source_artifact_ref,
+            "gate_id": gate_id,
+            "gate_version": gate_version,
+            "target_present": target_present,
+            "unit_identity": unit_identity,
+        }
+    )

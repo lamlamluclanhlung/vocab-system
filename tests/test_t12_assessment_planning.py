@@ -721,6 +721,150 @@ def test_runtime_bundle_mutation_cannot_bypass_independent_materialization(
     assert runtime.response_bytes
 
 
+def test_non_novel_attempt_mutated_to_novel_is_rejected_before_planning(
+    tmp_path: Path,
+) -> None:
+    first = make_runtime(tmp_path)
+    second = append_attempt(first)
+    attempt = second.evidence()
+    unit = validate_unit_evidence(make_unit("R"))
+    bundle, _, _ = bind(attempt, unit)
+    assert attempt.novel is False
+
+    object.__setattr__(attempt, "novel", True)
+
+    with pytest.raises(AssessmentEvidenceError, match="issuance snapshot"):
+        plan_text_judge(attempt=attempt, unit=unit, semantic=bundle)
+
+
+def test_novel_attempt_mutated_to_non_novel_is_rejected_before_planning(
+    tmp_path: Path,
+) -> None:
+    attempt = make_runtime(tmp_path).evidence()
+    unit = validate_unit_evidence(make_unit("R"))
+    bundle, _, _ = bind(attempt, unit)
+    assert attempt.novel is True
+
+    object.__setattr__(attempt, "novel", False)
+
+    with pytest.raises(AssessmentEvidenceError, match="issuance snapshot"):
+        plan_text_judge(attempt=attempt, unit=unit, semantic=bundle)
+
+
+def test_attempt_response_bytes_only_mutation_rejects_semantic_binding(
+    tmp_path: Path,
+) -> None:
+    attempt = make_runtime(tmp_path).evidence()
+    unit = validate_unit_evidence(make_unit("R"))
+    artifacts = make_artifacts(attempt=attempt, unit=unit)
+    object.__setattr__(attempt, "response_bytes", b"caller-invented response")
+
+    with pytest.raises(AssessmentEvidenceError, match="response bytes"):
+        bind_t11_semantic_evidence(
+            request_raw=artifacts[0],
+            proposal_raw=artifacts[1],
+            review_raw=artifacts[2],
+            assessor_id=ASSESSOR_ID,
+            assessor_version=ASSESSOR_VERSION,
+            attempt=attempt,
+            unit=unit,
+        )
+
+
+def test_hash_consistent_response_and_ref_mutation_rejects_issuance_drift(
+    tmp_path: Path,
+) -> None:
+    attempt = make_runtime(tmp_path).evidence()
+    unit = validate_unit_evidence(make_unit("R"))
+    changed_bytes = b"caller-invented response"
+    changed_ref = "sha256:" + hashlib.sha256(changed_bytes).hexdigest()
+    object.__setattr__(attempt, "response_bytes", changed_bytes)
+    object.__setattr__(attempt, "response_artifact_ref", changed_ref)
+    artifacts = make_artifacts(attempt=attempt, unit=unit)
+
+    with pytest.raises(AssessmentEvidenceError, match="issuance snapshot"):
+        bind_t11_semantic_evidence(
+            request_raw=artifacts[0],
+            proposal_raw=artifacts[1],
+            review_raw=artifacts[2],
+            assessor_id=ASSESSOR_ID,
+            assessor_version=ASSESSOR_VERSION,
+            attempt=attempt,
+            unit=unit,
+        )
+
+
+def test_attempt_response_ref_only_mutation_rejects_semantic_binding(
+    tmp_path: Path,
+) -> None:
+    attempt = make_runtime(tmp_path).evidence()
+    unit = validate_unit_evidence(make_unit("R"))
+    artifacts = make_artifacts(attempt=attempt, unit=unit)
+    object.__setattr__(attempt, "response_artifact_ref", "sha256:" + "0" * 64)
+
+    with pytest.raises(AssessmentEvidenceError, match="response bytes"):
+        bind_t11_semantic_evidence(
+            request_raw=artifacts[0],
+            proposal_raw=artifacts[1],
+            review_raw=artifacts[2],
+            assessor_id=ASSESSOR_ID,
+            assessor_version=ASSESSOR_VERSION,
+            attempt=attempt,
+            unit=unit,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("attempt_id", "attempt:v1:" + "0" * 64),
+        ("session_id", "session:v1:" + "0" * 64),
+        ("item_ordinal", 1),
+        ("unit_key", "subtle::other-sense"),
+        ("channel", "L"),
+        ("task_kind", "listening_comprehension"),
+        ("presented_stimulus_ref", "stimulus:v1:" + "0" * 64),
+        ("stimulus_artifact_ref", "sha256:" + "0" * 64),
+    ],
+)
+def test_each_attempt_identity_field_mutation_is_rejected(
+    tmp_path: Path,
+    field_name: str,
+    replacement: object,
+) -> None:
+    attempt = make_runtime(tmp_path).evidence()
+    unit = validate_unit_evidence(make_unit("R"))
+    bundle, _, _ = bind(attempt, unit)
+    object.__setattr__(attempt, field_name, replacement)
+
+    with pytest.raises(AssessmentEvidenceError):
+        plan_text_judge(attempt=attempt, unit=unit, semantic=bundle)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("unit_key", "subtle::other-sense"),
+        ("lemma", "delicate"),
+        ("unit_type", "chunk"),
+        ("definition_en", "a changed definition"),
+        ("enabled_channels", ("R", "L")),
+    ],
+)
+def test_each_validated_unit_public_field_mutation_is_rejected(
+    tmp_path: Path,
+    field_name: str,
+    replacement: object,
+) -> None:
+    attempt = make_runtime(tmp_path).evidence()
+    unit = validate_unit_evidence(make_unit("R"))
+    bundle, _, _ = bind(attempt, unit)
+    object.__setattr__(unit, field_name, replacement)
+
+    with pytest.raises(AssessmentEvidenceError):
+        plan_text_judge(attempt=attempt, unit=unit, semantic=bundle)
+
+
 def test_w_presence_is_computed_internally_with_d19(tmp_path: Path) -> None:
     present = make_runtime(
         tmp_path / "present",
@@ -736,6 +880,41 @@ def test_w_presence_is_computed_internally_with_d19(tmp_path: Path) -> None:
     assert evaluate_presence_gate(attempt=present, unit=unit).target_present is True
     assert evaluate_presence_gate(attempt=absent, unit=unit).target_present is False
     assert "target_present" not in inspect.signature(evaluate_presence_gate).parameters
+
+
+def test_target_present_gate_mutated_false_cannot_emit_omitted(tmp_path: Path) -> None:
+    attempt = make_runtime(tmp_path, "W").evidence()
+    unit = validate_unit_evidence(make_unit("W"))
+    bundle, gate, _ = bind(attempt, unit)
+    assert gate.target_present is True
+
+    object.__setattr__(gate, "target_present", False)
+
+    with pytest.raises(PresenceEvidenceError, match="does not bind"):
+        plan_text_judge(
+            attempt=attempt,
+            unit=unit,
+            semantic=bundle,
+            presence=gate,
+        )
+
+
+def test_target_absent_gate_mutated_true_cannot_enter_semantic_path(
+    tmp_path: Path,
+) -> None:
+    attempt = make_runtime(
+        tmp_path,
+        "W",
+        response_bytes=b"The results were dramatically different.",
+    ).evidence()
+    unit = validate_unit_evidence(make_unit("W"))
+    gate = evaluate_presence_gate(attempt=attempt, unit=unit)
+    assert gate.target_present is False
+
+    object.__setattr__(gate, "target_present", True)
+
+    with pytest.raises(PresenceEvidenceError, match="does not bind"):
+        plan_text_judge(attempt=attempt, unit=unit, presence=gate)
 
 
 def test_presence_evidence_from_another_attempt_or_source_is_rejected(
@@ -984,6 +1163,46 @@ def test_mutating_returned_payload_copy_cannot_change_planned_judge(tmp_path: Pa
     assert not hasattr(judge, "v")
     assert not hasattr(judge, "ts")
     assert not hasattr(judge, "day")
+
+
+def test_planned_judge_unit_key_mutation_is_rejected_at_access_boundaries(
+    tmp_path: Path,
+) -> None:
+    judge, _, _, _, _ = planned(tmp_path)
+    object.__setattr__(judge, "unit_key", "subtle::other-sense")
+
+    with pytest.raises(AssessmentPlanningError, match="issuance snapshot"):
+        judge.to_payload()
+    with pytest.raises(AssessmentPlanningError, match="issuance snapshot"):
+        _ = judge.canonical_payload_bytes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["malformed", "changed_outcome", "changed_novel"],
+)
+def test_planned_judge_payload_bytes_mutation_is_rejected_at_access_boundaries(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    judge, _, _, _, _ = planned(tmp_path)
+    if mutation == "malformed":
+        changed_bytes = b"{"
+    else:
+        payload = judge.to_payload()
+        if mutation == "changed_outcome":
+            payload["outcome"] = "FAIL"
+            payload["passed"] = False
+            payload["failure_code"] = "wrong_meaning"
+        else:
+            payload["novel"] = False
+        changed_bytes = canonical_json_bytes(payload)
+    object.__setattr__(judge, "_canonical_payload_bytes", changed_bytes)
+
+    with pytest.raises(AssessmentPlanningError):
+        judge.to_payload()
+    with pytest.raises(AssessmentPlanningError):
+        _ = judge.canonical_payload_bytes
 
 
 def test_t12_2a_modules_do_not_import_events_reconcile_or_anki() -> None:
