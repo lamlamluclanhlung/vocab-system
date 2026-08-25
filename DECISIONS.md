@@ -5470,3 +5470,111 @@ Repository production code must not emit a new D35-bearing JUDGE except through
 the future T12 assessment producer. This will be guarded by an AST/static
 invariant test rather than by adding T12-specific authorization state to
 EventLog.
+
+## D62 — Persisted session authority, durable novelty, and fresh-capture capability
+
+**Date:** 2026-08-25
+**Status:** Accepted
+
+### A. Persisted session authority
+
+A T12 stimulus may receive display authority only if its reservation is derived
+from an exact item in an immutable persisted session manifest.
+
+A syntactically valid session_id plus a self-consistent attempt hash is NOT
+sufficient.
+
+The reservation boundary must independently load the persisted session manifest
+by session_id and select exactly one item_ordinal from it.
+
+The reservation fields:
+
+    session_id
+    item_ordinal
+    unit_key
+    channel
+    presented_stimulus_ref
+    stimulus_artifact_ref
+    attempt_id
+
+must be derived from that persisted manifest item.
+
+Caller-controlled duplicate semantic copies of those fields must not be accepted
+as independent reservation authority.
+
+The stimulus artifact referenced by that manifest item must verify in the
+immutable ArtifactStore before reservation.
+
+### B. Durable novelty
+
+novel is a property of verified durable exposure history.
+
+The system must not publish novelty for an unreserved hypothetical
+ExposureReservation.
+
+Required sequence:
+
+    validate complete paired histories
+    load exact persisted session item
+    derive exact attempt identity
+    validate stimulus artifact
+    append reservation
+    flush/fsync
+    exact readback
+    re-read validated complete exposure history
+    locate current reservation exactly once
+    compute novelty from physical records before current
+    issue DisplayPermit
+
+If any step after durable reservation fails:
+
+    no DisplayPermit is issued
+    durable reservation remains
+    novelty is conservatively consumed
+
+### C. Fresh capture capability
+
+A new CaptureReceipt may be created only from the exact in-memory DisplayPermit
+for that attempt after that permit has been consumed.
+
+Reservation existence by itself is not fresh-capture authority.
+
+capture_response must not accept a free-standing caller supplied attempt_id as
+capture authority.
+
+It derives attempt_id from the validated DisplayPermit.
+
+Requirements:
+
+    permit was issued by reserve_exposure
+    permit is consumed
+    permit is bound to exactly one attempt
+    matching durable exposure reservation exists exactly once
+    no capture receipt already exists
+    response artifact persistence/readback succeeds
+    capture receipt is then appended durably
+
+An unconsumed permit cannot capture.
+
+A fabricated permit cannot capture.
+
+A permit for another attempt cannot capture that response under a different
+attempt identity.
+
+After restart no DisplayPermit may be reconstructed.
+
+Existing D60 resume remains:
+
+    valid CaptureReceipt + verified artifact
+        -> resumable without redisplay
+
+### D. Initialization seam
+
+no_historical_t12_state remains a T12.1 bootstrap seam only.
+
+It is not final producer authority.
+
+Before lifecycle-bearing producer emission exists, T12 producer preflight must
+replace caller assertion with complete historical validation.
+
+Do not implement EventLog preflight in this hardening task.
