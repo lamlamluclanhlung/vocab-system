@@ -7125,3 +7125,483 @@ ignores an interior malformed record.
 
     crash before receipt
         -> no disposition authority exists; attempt is abandoned
+
+## D68 — T12.3 EventLog producer preflight, idempotent emission, and speech crash recovery
+
+**Date:** 2026-08-26
+**Status:** Accepted
+**Blocks:** T12.3
+
+D68 defines the single T12 EventLog producer boundary. It does not alter D35,
+D55, D56, D57, D58, D60, D61, D62, D63, D64, D65, D66, or D67.
+
+### 1. Producer module and public surface
+
+T12 owns exactly one EventLog producer module. Its complete public surface is:
+
+    emit_planned_judge(
+        *, event_log, exposure_path, capture_path, disposition_path,
+        artifact_store, planned: PlannedJudge,
+    ) -> tuple[Event, ...]
+
+    emit_planned_speech_assessment(
+        *, event_log, exposure_path, capture_path, disposition_path,
+        artifact_store, planned: PlannedSpeechAssessment,
+    ) -> tuple[Event, ...]
+
+Both accept only sealed planned objects. There is no generic emitter, no raw
+payload entry point, no standalone speech JUDGE emitter, and no caller-supplied
+attempt_id, ts, day, or clock.
+
+The return value is the tuple of newly appended events in physical order:
+
+    ()
+    (JUDGE,)
+    (SPEAK, JUDGE)
+
+Zero appends is only ever the exact-rerun success case. Conflict, duplicate, and
+corruption raise.
+
+### 2. Producer input authority
+
+At both public entry points, before any read, any preflight work, and any
+append:
+
+    type(event_log) is EventLog     exactly; subclasses are rejected
+    isinstance(artifact_store, ArtifactStore)
+    exposure_path, capture_path, disposition_path are explicit
+    EVENT_SCHEMA_VERSION == T12_PRODUCER_EVENT_SCHEMA_VERSION == 1
+
+An EventLog subclass may override read, log, or path and thereby defeat strict
+preflight or durability while every static call site remains approved.
+Exact-type acceptance closes that. This is a T12 producer input rule only:
+generic EventLog behavior is unchanged, and the structural Protocol ports used
+by the existing T7/T9/T10 consumers are unchanged.
+
+This is a deliberate, scoped departure from the repository structural-port
+pattern at exactly one boundary, because the concrete class durability
+semantics — fsync before return, trailing-record refusal on append, decoder
+identity, and the path used for the byte-level tail check — are normative for
+this producer rather than incidental. Producer tests therefore use a real
+EventLog on a real path, not a fake.
+
+ArtifactStore acceptance semantics are unchanged. No accepted decision
+independently requires narrowing them.
+
+### 3. Producer emission authority
+
+T12 v1 remains the only normal producer permitted to create new
+lifecycle-bearing JUDGE records.
+
+Per D61 this is enforced by AST/static invariant tests over production source,
+not by adding authorization state to EventLog.
+
+**3.1 Closed EventLog.log authority matrix.** Every EventLog.log call site in
+production source is frozen by the exact triple of path, scope, and event type.
+
+The complete approved matrix is exactly seven entries:
+
+    vocab/corpus.py              : emit_scan             -> "ENCOUNTER"
+    vocab/forge/pipeline.py      : _log_event            -> "FORGE"
+    vocab/forge/recovery.py      : repair_evidence       -> "FORGE"
+    vocab/forge/recovery.py      : abandon_intent        -> "FORGE"
+    vocab/reconcile.py           : _append_state_event   -> "STATE"
+    vocab/assessment_producer.py : _append_judge         -> "JUDGE"
+    vocab/assessment_producer.py : _append_speak         -> "SPEAK"
+
+At every approved authority call site the event argument must be the positional
+first argument, must be an exact ast.Constant string literal, and must equal the
+frozen value above.
+
+The invariant rejects, at an authority call site, regardless of runtime value:
+
+    a Name
+    an imported or module constant
+    an f-string
+    any other expression
+    the keyword form event=...
+    a missing event argument
+
+Indirection through a named constant is rejected deliberately, because the
+invariant exists so that changing the semantic event type must change or fail
+the static authority check.
+
+The matrix is exact in both directions:
+
+    unapproved triple                         -> failure
+    missing approved triple                   -> failure
+    approved triple occurring != exactly once -> failure
+
+An in-place change of an approved literal therefore fails both as an unapproved
+triple and as a missing approved triple.
+
+Each failure names:
+
+    path
+    scope
+    line
+    expected event type for that path and scope
+    actual event argument, rendered as its literal value or as its
+        non-literal expression form
+
+The scan is alias-aware and scope-aware, covering synchronous and asynchronous
+functions and module, class, and nested scopes, over all production source.
+
+**3.2 No rebinding or capture of log authority.** Within production source, any
+.log attribute access must be the direct callee of an approved call site.
+Capturing it into a variable, container, return value, argument, or partial is a
+violation, as is retrieving it by getattr with the constant name "log".
+
+**3.3 Closed EventLog-import allowlist.** The producer module is the only
+production module permitted to import the EventLog module. Today no production
+module imports it; all existing consumers are structurally typed against ports
+and the concrete class is constructed only by callers.
+
+**3.4 Producer module strictness.** The producer module contains no getattr of
+any form, accesses .log and .read only as direct call callees, imports no
+lifecycle, session-mutation, or Anki surface, and emits no STATE.
+
+Each test fails closed naming the offending path, scope, and line.
+
+The guarantee is scoped to repository production code. It is not a runtime
+capability check, and that limit is deliberate: it preserves generic EventLog
+readability and writability for historical consumers. A fully dynamic attribute
+retrieval in a module other than the producer is not statically detectable
+without points-to analysis, which is out of scope; that residual is bounded by
+3.3 and 3.4.
+
+### 4. Strict EventLog history read
+
+T12 preflight reuses the existing EventLog decoder. It does not create a second
+parser.
+
+Exactly one strict-read helper exists in the producer, and every EventLog read
+performed by T12 — preflight and post-SPEAK confirmation alike — uses it. No
+tolerant read is permitted at any T12 boundary.
+
+Before decoding, the helper requires the EventLog file to be empty or to end
+with exactly one newline. A final record that is not newline-terminated is a
+torn append and fails T12 preflight, even though the generic decoder returns it
+without warning.
+
+The helper then reads with EventLogCorruptionWarning converted to an exception,
+per D61.
+
+The complete closed rule set is:
+
+    valid newline-terminated final record   -> accepted
+    final record without newline            -> fail closed
+    malformed final JSON                    -> fail closed
+    invalid UTF-8 final record              -> fail closed
+    malformed interior record               -> fail closed
+    unsupported event version, any position -> fail closed
+    valid generic historical non-T12 event  -> readable, unvalidated, unmodified
+    malformed T12 producer payload inside a
+      structurally valid event              -> fail closed
+
+A malformed T12 payload is never reinterpreted as generic historical evidence.
+
+Generic EventLog.read() and EventLog.log() behavior is unchanged. Historical
+generic JUDGE and SPEAK events remain readable by their existing consumers.
+
+No malformed history is ever truncated, repaired, deduplicated, reordered, or
+deleted.
+
+### 5. T12 producer envelope version gate
+
+Every historical JUDGE or SPEAK event claiming the T12 producer identity must
+satisfy, before any producer-specific payload, correspondence, duplicate, or
+slot validation:
+
+    event.v == T12_PRODUCER_EVENT_SCHEMA_VERSION == 1
+    payload.producer_version == T12_ASSESSMENT_PRODUCER_VERSION
+
+Otherwise the producer fails closed.
+
+The generic EventLog decoder registry is explicitly extensible. A future generic
+decoder for schema v2 must not silently cause the T12 v1 producer to accept,
+compare, classify, or emit alongside v2 T12 history. This gate is producer-side
+and does not depend on which decoders happen to be registered.
+
+If the repository-wide event schema version is ever advanced, the producer fails
+closed at its entry gate rather than emitting records under a v1 producer
+identity at a different envelope version. Advancing T12 producer history to a
+new envelope version requires a new accepted decision.
+
+Generic non-T12 historical events continue to use ordinary EventLog
+compatibility and are not subject to this gate.
+
+After this explicit gate, v is excluded from slot identity and from the
+exactness comparison, because it is constant across the compared set by
+construction.
+
+### 6. Slot identity and exactness
+
+T12 EventLog slot identity remains exactly the D57 tuple:
+
+    producer
+    producer_version
+    event_type
+    attempt_id
+
+A historical record is exact for a planned slot iff all of:
+
+    historical.event      == planned event type
+    historical.unit_key   == planned unit_key
+    canonical_json_bytes(historical.payload)
+                          == planned canonical payload bytes
+
+v, ts, and day are excluded from both slot identity and the exactness
+comparison. v is excluded by section 5. ts and day are excluded because a rerun
+necessarily produces a new instant and must not falsely conflict.
+
+Canonical byte comparison is exact and order-independent. Any difference in
+unit_key, channel, presented_stimulus_ref, response artifact identity, outcome,
+passed, provenance, failure_code, reason_code, model_id, model_version,
+authority_kind, assessment_id, stimulus_ref, novel, audio_path, or transcript is
+a conflict under the same slot, never a new slot.
+
+### 7. Durable correspondence
+
+A producer run performs exactly one complete triple-history validation, through
+the single existing D55+D60+D67 triple-history authority, and retains that
+validated snapshot of exposures, captures, and dispositions in memory for the
+remainder of the run.
+
+No later producer step re-reads a ledger path. Every correspondence, novelty,
+and mutual-exclusion check in this section is evaluated against that one
+snapshot. In particular, novelty is computed by a pure function over the
+already-validated exposure history rather than by re-reading the exposure path,
+so that no producer decision can rest on a different snapshot than the one that
+was validated. A pure novelty helper over a validated exposure tuple is
+required, with the existing path-taking novelty function delegating to it so
+that exactly one novelty rule exists.
+
+**7.1 Common correspondence.** Every T12 JUDGE/SPEAK event — planned or
+historical — binds exactly one compatible exposure reservation in the validated
+snapshot:
+
+    exactly one reservation for attempt_id
+    event/planned unit_key    == reservation.unit_key
+    payload.channel           == reservation.channel
+    payload.presented_stimulus_ref
+                              == reservation.presented_stimulus_ref
+
+**7.2 Path binding.**
+
+    SPEAK, or JUDGE with channel S:
+        reservation.channel == S
+        exactly one capture receipt
+        response_audio_ref / response_artifact_ref
+            == capture.response_artifact_ref
+        zero disposition receipts
+
+    JUDGE, channel R/L/W, response_artifact_ref present:
+        exactly one capture receipt
+        response_artifact_ref == capture.response_artifact_ref
+        zero disposition receipts
+
+    JUDGE, channel R/L/W, response_artifact_ref absent:
+        outcome == ABSTAIN
+        reason_code in the closed D67 disposition set
+        zero capture receipts
+        exactly one disposition receipt
+        reason_code == disposition.disposition_code
+
+Any other shape is not a legal T12 producer record and fails closed.
+
+**7.3 D35 preservation.** For lifecycle-bearing PASS/FAIL JUDGE:
+
+    assessment_id == attempt_id
+    stimulus_ref  == presented_stimulus_ref
+    novel         == novelty computed purely from the validated exposure
+                     snapshot
+
+Novelty is never derived from EventLog history. Because the exposure ledger is
+append-only with stable physical order, a record novelty is deterministically
+recomputable, and a false-novel record fails preflight closed.
+
+**7.4 Planned-event correspondence.** Sections 7.1 through 7.3 apply to the
+planned events of the current run, evaluated against the same validated
+snapshot, before slot classification and before any append.
+
+For PlannedSpeechAssessment, the planned SPEAK and the planned JUDGE are
+validated against the same single exposure reservation and the same single
+capture receipt — exactly one S exposure, exactly one capture, zero
+dispositions, both response references equal to that capture artifact
+reference — and companion consistency is then validated over the planned pair.
+
+A sealed planned object is a pure value and carries no durable binding to the
+ledger paths from which it was derived. Without 7.4 a plan sealed against one
+durable history could be emitted against an unrelated runtime history while
+every other check passed. That combination is forbidden.
+
+**7.5 Generic historical compatibility.** An event that does not claim the T12
+producer is generic historical evidence. It remains readable and is never
+validated, rewritten, or invalidated by T12 rules, even when it carries D35
+fields.
+
+### 8. Duplicate history
+
+For each historical T12 slot:
+
+    0 records   -> missing candidate
+    1 record    -> exact or conflicting per section 6
+    2+ records  -> corruption; fail closed even if byte-for-byte identical
+
+No dedupe, no first/last selection, no repair. Duplicate detection scans all
+historical T12 records before any planned append.
+
+### 9. Complete preflight
+
+Before the first EventLog append in a producer run, in this exact order:
+
+1. entry gate of section 2;
+2. re-validate the sealed planned object through its issuing seal, re-running
+   its full payload and companion validation;
+3. validate the complete triple history through the single existing authority,
+   retaining one in-memory snapshot;
+4. validate planned-event correspondence against that snapshot per section 7.4;
+5. perform the strict EventLog history read of section 4;
+6. partition history into T12 producer records and generic historical records,
+   applying the envelope version gate of section 5;
+7. validate every historical T12 payload with the exact frozen producer
+   validator, dispatched by channel;
+8. build the slot index and detect every duplicate slot;
+9. validate every historical T12 event-to-durable-authority correspondence
+   against the same snapshot;
+10. validate S companion consistency across all history;
+11. classify every planned slot as missing, exact, or conflicting;
+12. for speech, apply the section 11 state matrix to the classification pair.
+
+Nothing is appended unless the entire preflight succeeds.
+
+Preflight validates all history, not only the planned slots.
+
+### 10. Text JUDGE rerun
+
+    missing slot         -> append exactly one JUDGE
+    one exact slot       -> append zero
+    conflicting slot     -> append zero, fail closed
+    duplicate slot       -> append zero, fail closed
+
+Re-judging the same attempt with a changed payload is a conflict. No overwrite,
+no supersession, no automatic retry. A full producer rerun performs complete
+preflight again before deciding.
+
+### 11. Speech SPEAK to JUDGE state matrix
+
+    SPEAK missing, JUDGE missing
+        append SPEAK
+        require normal return from the durable EventLog append
+        perform a confirmation read using the same strict helper of section 4
+        require exactly one exact SPEAK for the planned slot
+            and zero JUDGE records for the attempt
+        then append JUDGE
+
+    SPEAK exact, JUDGE missing
+        legal crash-resume; append JUDGE only
+
+    SPEAK missing, JUDGE present
+        forbidden producer corruption; append zero
+
+    SPEAK exact, JUDGE exact
+        exact rerun; append zero
+
+    SPEAK conflicting                 -> append zero, fail closed
+    JUDGE conflicting                 -> append zero, fail closed
+    duplicate SPEAK                   -> append zero, fail closed
+    duplicate JUDGE                   -> append zero, fail closed
+    companion inconsistency           -> append zero, fail closed
+
+The confirmation read is a full strict read: trailing-newline check, corruption
+warning promoted to an exception, ordinary decoder errors fatal. A tolerant read
+is forbidden at this boundary. It must observe, within the T12 producer
+partition only, exactly one t12-assessment producer-version-1 SPEAK slot exact
+for the planned slot, and zero t12-assessment producer-version-1 JUDGE records
+for that attempt, before the companion JUDGE is appended. Generic historical
+non-T12 events are governed solely by the historical-compatibility rule of
+section 7.5, are not counted in this confirmation, and do not block crash-resume
+merely because they contain a coincident attempt-like value. If the confirmation
+read fails for any reason, the companion JUDGE is not appended.
+
+Every missing, exact, conflicting, and duplicate term in this section and in
+section 10 ranges over t12-assessment producer-version-1 records only.
+
+Companion consistency is validated in preflight, before any append, for both the
+planned pair and every historical S pair.
+
+The only legal incomplete S history is exactly one exact SPEAK with its
+companion JUDGE missing. The reverse partial state is never auto-repaired.
+
+### 12. Append-failure semantics
+
+An exception is never proof that an event is absent.
+
+On any append failure the producer raises a typed error, appends nothing further
+in that operation, and performs no retry, repair, truncation, or deletion. If
+the SPEAK append raises, the companion JUDGE is not appended in that run even if
+SPEAK may in fact be durable.
+
+A later explicit producer run performs complete preflight and determines the
+actual durable state:
+
+    complete durable record -> classified exact
+    nothing written         -> classified missing
+    torn or malformed tail  -> fail closed, no repair
+
+### 13. Timestamp authority
+
+ts and day are generated exclusively inside the existing EventLog append, from
+its existing clock seam, at append time.
+
+The producer supplies no timestamp, accepts no clock parameter, and accepts no
+caller-supplied historical timestamp. Planned objects contain no v, ts, day, or
+EventLog path, so no clock input can affect slot identity or planned payload
+identity.
+
+SPEAK and its companion JUDGE may carry different append timestamps, including
+across a crash boundary of arbitrary length. That difference is truthful
+append-time metadata and is never corrected or backdated.
+
+### 14. Scope
+
+T12.3 emits evidence only. It never writes state_*, emits STATE, calls Anki
+lifecycle mutation, suspends or unsuspends cards, or invokes T9 state
+materialization.
+
+T12.3 does not revalidate the D65 transcription ledger at emission. Per the D67
+section 3 scope limit and the D57 preflight enumeration, that boundary retains
+its own authority; the transcription provenance was sealed into the SPEAK/JUDGE
+payloads at planning time from a durable D65 receipt.
+
+T12.3 assumes a single writer for a producer run. Preflight immediately precedes
+the first append, all four T12 ledgers are append-only with unique slot
+identity, and every planned and historical payload is bound to one freshly
+validated durable snapshot — but a durable change landing between preflight and
+append is not handled. Concurrent writers remain out of scope per D55 and D57.
+
+**Reason:** D57 requires complete preflight before the first append, but the
+generic EventLog decoder deliberately tolerates a malformed final record, and a
+torn append that loses only its trailing newline produces no warning at all.
+Without an explicitly strict producer read, a crashed SPEAK append could be
+misread as absent and duplicated into false independent lifecycle evidence.
+Sealed planned objects carry no durable binding, so without explicit
+planned-event correspondence a plan sealed against one history could be emitted
+against another. The concrete EventLog is reachable in production only through
+structural ports, so without exact-type acceptance a subclass or duck type could
+defeat strict preflight and durability while every static call site remained
+approved. Freezing call sites by path and scope alone would leave an in-place
+event-type edit fully approved, so the static authority is frozen by exact
+path/scope/event-type triple with a literal event argument. The decoder registry
+is explicitly extensible, so a producer-side envelope version gate is required
+to keep a v1 producer from silently inheriting a future v2 decoder. D60, D65,
+and D67 further added durable authorities that D57 could not name, and the D67
+policy JUDGE payload can only be distinguished from a corrupt captured-text
+JUDGE by reading the disposition ledger.
+
+**Out of scope:** producer supersession, event deletion, whole-EventLog deletion
+or tamper detection, automatic tail repair or truncation, automatic retry loops,
+concurrent writers, EventLog schema v2, STATE emission, Anki mutation, new
+semantic assessment, new capture/disposition/transcription semantics, and paid
+model APIs.
