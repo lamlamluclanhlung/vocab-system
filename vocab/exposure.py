@@ -174,24 +174,37 @@ def read_exposure_ledger(
     return tuple(records)
 
 
-def novelty_for_reserved_attempt(
-    exposure_path: str | os.PathLike[str],
+def novelty_for_reserved_attempt_history(
+    exposures: tuple[ExposureReservation, ...],
     attempt_id: object,
 ) -> bool:
-    """Compute D55 novelty only for one verified physical reservation."""
+    """Compute D55 novelty purely from one already read exposure history.
+
+    This is the single D55 novelty rule. It performs no I/O and reads no path,
+    so a caller that already holds a validated exposure snapshot cannot silently
+    resolve novelty against a different, later snapshot.
+    """
+    if type(exposures) is not tuple:
+        raise ExposureLedgerError("exposure history must be a tuple")
+    for record in exposures:
+        if type(record) is not ExposureReservation:
+            raise ExposureLedgerError(
+                "exposure history must contain ExposureReservation values only"
+            )
     if type(attempt_id) is not str or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None:
         raise ExposureLedgerError("attempt_id is invalid")
-    history = read_exposure_ledger(exposure_path)
     matching_indexes = [
-        index for index, record in enumerate(history) if record.attempt_id == attempt_id
+        index
+        for index, record in enumerate(exposures)
+        if record.attempt_id == attempt_id
     ]
     if len(matching_indexes) != 1:
         raise ExposureLedgerError(
             "novelty requires exactly one durable current reservation"
         )
     current_index = matching_indexes[0]
-    current = history[current_index]
-    for earlier in history[:current_index]:
+    current = exposures[current_index]
+    for earlier in exposures[:current_index]:
         if (
             earlier.unit_key == current.unit_key
             and earlier.channel == current.channel
@@ -199,6 +212,19 @@ def novelty_for_reserved_attempt(
         ):
             return False
     return True
+
+
+def novelty_for_reserved_attempt(
+    exposure_path: str | os.PathLike[str],
+    attempt_id: object,
+) -> bool:
+    """Compute D55 novelty only for one verified physical reservation."""
+    if type(attempt_id) is not str or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None:
+        raise ExposureLedgerError("attempt_id is invalid")
+    return novelty_for_reserved_attempt_history(
+        read_exposure_ledger(exposure_path),
+        attempt_id,
+    )
 
 
 def reserve_exposure(
