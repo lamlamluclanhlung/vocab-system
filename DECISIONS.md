@@ -7605,3 +7605,473 @@ or tamper detection, automatic tail repair or truncation, automatic retry loops,
 concurrent writers, EventLog schema v2, STATE emission, Anki mutation, new
 semantic assessment, new capture/disposition/transcription semantics, and paid
 model APIs.
+
+## D69 — T12.4 invariant probes, real smoke, and lifecycle enablement
+
+**Date:** 2026-08-26
+**Status:** Accepted
+**Blocks:** T12.4, T12 lifecycle enablement
+
+D69 discharges the D58 gate for T12. It does not alter D35, D53, D55, D56,
+D57, D58, D59, D60, D61, D62, D63, D64, D65, D66, D67, or D68. It adds no
+producer behavior and does not reopen D68's producer architecture.
+
+### 1. Purpose
+
+The T12 producer (D68) is closed against its own contract but unproven as an
+input to lifecycle mutation, and the consumer that acts on its output performs
+no producer-aware validation. The seam is already live:
+reconcile._lifecycle_assessment parses any JUDGE carrying the D35 field set
+with no awareness of producer identity, producer version, envelope version, or
+outcome; both of reconcile's full-history reads tolerate a corrupt final
+record that the producer itself refuses to read; and removing a single field
+from a genuine T12 JUDGE silently demotes it to the legacy path. D69 defines
+the evidence required before T12 JUDGE records may mutate lifecycle and closes
+the consumer-side gaps that evidence exposes.
+
+### 2. Authority
+
+D58 governs. D35 and D53 define lifecycle eligibility and outcome semantics.
+D61 fixes outcome authority. D67 fixes the operational disposition inventory.
+D68 fixes producer emission, the EventLog authority matrix, and the concrete
+EventLog import allowlist. vocab/contracts.py and vocab/models.py remain
+highest precedence.
+
+### 3. Probe definition
+
+A D58 invariant probe is a deterministic pytest node explicitly registered in
+the D58 probe inventory, regardless of which test module contains it.
+Registration, not file membership, confers probe status. A probe executes
+real repository components on a real filesystem, asserts an explicit outcome,
+count, or exception, carries no skip condition, requires no network, LLM,
+audio hardware, Anki, or production data, and never compares against stored
+expected bytes. Controlled fault injection is permitted in probes and
+forbidden in smoke.
+
+### 4. Probe inventory, parametrization, and unskippability
+
+tests/d58_probe_inventory.py freezes the mandatory D58 clause list, a
+clause-to-selector registry, and the per-channel required clause set.
+Registry entries are base pytest selectors, never parametrized ids.
+Collection resolves each registered selector to one or more concrete items,
+where an item matches selector S iff its nodeid equals S or begins with
+"S[" (S followed immediately by an opening bracket); zero matches is a gate
+failure. Every matched concrete item — every parametrization — must execute
+and pass; a representative subset is not sufficient, and real-smoke
+parametrizations obey the same rule.
+
+Statically enforced:
+
+    every clause has at least one registered selector
+    every registered selector resolves to a concrete item
+    every channel in T12_LIFECYCLE_ENABLED_CHANNELS has its complete
+        required clause set registered and resolvable
+    no registered node or its module declares pytest.mark.skip, skipif,
+        xfail, pytestmark, or unittest.skip*, or calls pytest.skip,
+        pytest.xfail, or pytest.importorskip, matched by attribute name so
+        import aliasing cannot evade it
+
+Dynamically enforced, by a conftest.py plugin:
+
+    pytest_collection_modifyitems computes the required concrete item set
+        from the registered selectors against the full collected item list
+    pytest_deselected records any required item that is removed from the run
+    pytest_runtest_logreport records the outcome and wasxfail status of every
+        required item for each of its setup, call, and teardown phases
+    pytest_sessionfinish forces a non-zero session exit unless, for every
+        required item, all three phases report outcome == "passed" with
+        wasxfail absent
+
+SKIP is failure. XFAIL is failure. XPASS is failure even though its outcome
+is "passed", because wasxfail is present in that case. A required item that
+did not run, or that was deselected during the official run, is failure. This
+detects fixture-level and helper-raised dynamic skips, which static analysis
+cannot see, because a skip originating anywhere surfaces as a skipped outcome
+on that item's setup or call phase. Gate evaluation is never a human reading
+a pytest summary.
+
+The official acceptance run is the exact unfiltered command:
+
+    .\.venv\Scripts\python.exe -m pytest
+
+with no -k, -m, --deselect, --lf, --ff, --nf, explicit path, or node
+selector. A filtered session cannot certify the gate and reports that it is
+not an official acceptance run.
+
+### 5. Smoke definition
+
+Real smoke drives the complete production chain in production order with a
+real ArtifactStore, real exposure/capture/disposition ledgers, a real
+SessionManifest, a real EventLog, real planners, the real producer, and the
+real lifecycle computation. No durability-bearing component may be
+monkeypatched, subclassed, stubbed, or substituted. Anki card and revlog
+observation uses a deterministic in-process stand-in; that boundary is
+D33/T9-owned, independently validated, and orthogonal to the seam under test.
+Fault injection is permitted only in probes, never in smoke.
+
+Scenarios:
+
+    S1  text PASS, lifecycle-bearing
+    S2  policy ABSTAIN, lifecycle-inert, parametrized over every value in
+        DISPOSITION_CODES
+    S3  speech happy path: real SPEAK+JUDGE pair, JUDGE lifecycle-bearing,
+        SPEAK inert
+    S4  exact rerun of S1 and S3, appending zero bytes, yielding an
+        identical ReconcileDecision
+
+Durable-SPEAK failure, JUDGE-append failure, and resume-after-crash scenarios
+are adversarial crash probes, not smoke, because they require fault
+injection.
+
+### 6. Lifecycle-bearing T12 events
+
+Exactly one: a JUDGE with outcome in {PASS, FAIL}, the complete D35 set,
+novel == True, on a channel in T12_LIFECYCLE_ENABLED_CHANNELS. SPEAK,
+ENCOUNTER, OMITTED, and ABSTAIN are lifecycle-inert without exception.
+PASS/FAIL with novel=False is parsed evidence and lifecycle-inert.
+
+### 7. Frozen T12 lifecycle envelope authority
+
+T12_LIFECYCLE_EVENT_SCHEMA_VERSION is frozen at 1 in vocab/contracts.py.
+Historical T12 lifecycle evidence is gated against this frozen constant and
+never against the mutable repository-wide EVENT_SCHEMA_VERSION, so advancing
+the generic schema to v2 does not make historical T12-v1 lifecycle evidence
+unreadable or retroactively invalid. A test-enforced invariant asserts:
+
+    T12_LIFECYCLE_EVENT_SCHEMA_VERSION == T12_PRODUCER_EVENT_SCHEMA_VERSION == 1
+
+preventing producer/consumer envelope drift. Any future generic decoder
+registration must retain the v1 decoder; a registered probe asserts that a v1
+T12 JUDGE remains decodable and lifecycle-bearing. Advancing the T12
+lifecycle envelope requires a new accepted decision.
+
+### 8. Consumer-side classification and fail-closed rules
+
+Every JUDGE is classified into exactly one of three partitions, evaluated in
+order.
+
+**(a) Exact T12** — payload["producer"] == T12_ASSESSMENT_PRODUCER_ID: the
+full T12 gate applies.
+
+**(b) Malformed or downgraded** — a producer key is present with any other
+value, or any field in T12_ONLY_JUDGE_MARKER_FIELDS is present without an
+exact T12 producer identity: fail closed. This closes identity-downgrade, in
+which a genuine T12 JUDGE has its producer stripped or corrupted while its
+D35 fields remain and would otherwise silently demote to the legacy path,
+bypassing every T12 gate. A missing producer identity is never reconstructed
+or inferred, because that would be inventing provenance.
+
+**(c) Genuine legacy generic** — no producer key and no T12-only marker: the
+existing D35 path applies, unchanged, preserving historical compatibility.
+
+T12_ONLY_JUDGE_MARKER_FIELDS is frozen as exactly:
+
+    producer_version
+    attempt_id
+    presented_stimulus_ref
+    outcome
+    authority_kind
+    provenance
+
+the fields emitted by every T12 JUDGE issuance path and absent from the
+generic D35 surface. response_artifact_ref and reason_code are deliberately
+excluded because they are not emitted on every T12 JUDGE.
+
+For partition (a), before lifecycle parsing:
+
+    event.v == T12_LIFECYCLE_EVENT_SCHEMA_VERSION
+    payload.producer_version == T12_ASSESSMENT_PRODUCER_VERSION
+    payload.outcome in ASSESSMENT_OUTCOMES
+    payload.passed == (payload.outcome == "PASS")
+
+Then: OMITTED and ABSTAIN must carry zero D35 fields and are lifecycle-inert
+— channel enablement is not required for them, so audit-only evidence may be
+collected on any channel; PASS and FAIL must carry the complete D35 set and
+must be on an enabled channel. A lifecycle-eligible PASS or FAIL on a channel
+absent from T12_LIFECYCLE_ENABLED_CHANNELS fails closed with a raise, never a
+silent skip: silent inertness would let such records accumulate unobserved
+and begin counting the day a channel is enabled, which is exactly the
+retroactive regrading D58 forbids, whereas a raise makes the condition
+immediately visible and any later enablement an explicit, reviewable
+decision.
+
+Every violation raises, naming unit_key, event index, and the violated rule.
+No history is truncated, repaired, deduplicated, reordered, or regraded.
+Already-committed historical transitions remain readable as journal and
+state provenance, but are never reopened, re-decided, rewritten, or
+regraded.
+
+### 9. Strict lifecycle and recovery history reading
+
+Lifecycle mutation must never consume a non-newline-terminated non-empty
+EventLog or a malformed final record, matching D68 section 4 producer
+semantics. Every full EventLog history read in vocab/reconcile.py that can
+feed a lifecycle decision, a recovery decision, a lifecycle mutation, or a
+STATE finalization must use the same strict structural read capability;
+tolerant read() is forbidden in vocab/reconcile.py without exception. This
+binds both existing read sites — _load_event_history and
+_read_recovery_transactions. The recovery site is not optional: recovery
+executes before observation in reconcile_unit and can append STATE and
+return without ever reaching observe_unit, and a tolerantly-dropped torn
+terminal record makes a finalized T9 transaction read as still pending,
+re-entering recovery on a completed transaction.
+
+vocab/events.py gains EventLog.read_strict(), which refuses a non-empty
+history whose final byte is not a newline, escalates
+EventLogCorruptionWarning to failure, reuses the existing decoder via
+self.read(), creates no second JSON parser, and normalizes the escalated
+warning to EventLogCorruptionError; without that normalization the warning,
+being a UserWarning and not a ValueError, would escape reconcile's existing
+handlers. The reconcile._EventLogReader structural Protocol is explicitly
+evolved to require read_strict, and _EventLogJournal inherits it.
+reconcile.py adds no import, so the D68 concrete-import allowlist is neither
+engaged nor circumvented. Generic EventLog.read() and EventLog.log()
+semantics are unchanged for historical consumers. The producer's own
+strict-read helper is unmodified; a registered equivalence probe asserts
+both readers classify an identical crafted-log table identically.
+
+Two static invariants enforce this lexically, with no alias or points-to
+analysis:
+
+**R1.** Any ast.Attribute whose attr is exactly "read" anywhere in
+vocab/reconcile.py is a violation. This catches aliased receivers such as
+"reader = event_log; reader.read()" without any alias analysis.
+
+**R2.** read_strict is permitted only as the exact direct callee in
+_read_recovery_transactions and _load_event_history, exactly once each. Any
+captured or aliased read_strict authority — assignment, argument,
+getattr(..., "read_strict"), decorator, or container membership — is a
+violation, matching D68's captured-authority rule for .log. No read_strict
+access may appear in any vocab/reconcile.py scope outside this matrix.
+
+### 10. Closed concrete-EventLog import allowlist
+
+D68 section 3.3 permits only vocab/assessment_producer.py to import the
+concrete events module, but the existing checker detects only EventLog,
+wildcard, and module-object imports, so any other named symbol imported from
+vocab.events passes silently. D69 closes this fail-silent gap. Outside
+vocab/assessment_producer.py, any production import whose resolved module is
+"events" or "vocab.events" is rejected regardless of imported symbol, alias,
+relative level, or import form. Module identity is resolved before any
+imported name is inspected, making the rule alias-proof. Structural Protocol
+usage in reconcile.py is preserved and is what allows section 9's strict read
+without any import. Adversarial import probes cover each named exception
+symbol, aliasing, absolute and multi-level relative forms, wildcard, and
+module-object import, with a positive control asserting the producer's own
+import remains accepted.
+
+### 11. Authority boundary
+
+The exposure/capture/disposition ledgers are the sole authority for
+correspondence and novelty; the EventLog payload is the sole authority for
+lifecycle evidence. The T12 producer is the only point at which the two are
+reconciled. The lifecycle consumer has no ledger access and must never
+re-derive novelty, stimulus identity, or capture correspondence —
+re-derivation is regrading, which D58 forbids. The consumer's added checks
+are all self-contained identity, envelope, version, and intra-payload
+consistency checks requiring no second authority. Residual: offline mutation
+of a ledger after a JUDGE is durable is undetectable by the consumer; this is
+bounded by append-only ledgers validated at every write through
+validate_t12_histories, and is accepted.
+
+### 12. STATE materialization call surface and recovery classification
+
+D68's seven-entry matrix proves exactly one low-level EventLog.log("STATE")
+sink; it proves nothing about how many semantic paths reach that sink. D69
+freezes the call surface separately. _append_state_event has exactly seven
+call sites in five enclosing functions, each passing the phase positionally
+as a frozen contracts constant:
+
+    _materialize_ungrouped_plan   : one PREPARE, one COMMIT
+    _materialize_dormancy_plans   : one PREPARE, one COMMIT
+    _recover_ungrouped            : one COMMIT
+    _recover_dormancy_group       : one COMMIT
+    _abort_prepared_plans         : one ABORT
+
+The APPROVED_STATE_MATERIALIZERS matrix freezes (path, scope,
+phase-constant, count) exactly in both directions, so it fails on a call
+added inside an already-approved scope, a removed call, a wrong or
+non-constant phase argument, a call moved to another scope, and any captured
+or indirect reference to _append_state_event. This matrix freezes only the
+STATE materialization call surface; it does not prove dataflow from
+observe_unit and does not establish that any call is gated.
+
+Gating is established separately by classification:
+
+    A  new lifecycle decision and materialization, via
+       reconcile_unit -> observe_unit -> decide_transitions. Freshly gated.
+
+    B  recovery that freshly re-decides — the persisted-source-state
+       branches of _recover_ungrouped and _recover_dormancy_group, which
+       re-observe, re-decide, require the fresh decision to reproduce the
+       pending transition identity, and abort on divergence. Freshly gated.
+
+    C  recovery finalization of already-materialized PREPARE state — the
+       persisted-target-state branches of the same two functions, which
+       verify the note already holds the target state and append COMMIT
+       without any fresh observe or decide pass. These are NOT freshly
+       gated transitions and D69 does not describe them as such.
+
+    D  rollback, via _abort_prepared_plans, which emits only
+       T9_STATE_PHASE_ABORT and never materializes a forward transition.
+
+Class C's safety derives from the PREPARE it finalizes having been gated at
+creation time in Class A or B. Because no durable field distinguishes a
+PREPARE written before D69 from one written after, D69 adds no runtime test
+for record age or origin; the guarantee is established by release ordering
+in section 13 instead, and Classes C and D are left behaviorally unchanged.
+Class C also depends on section 9: it reads its PREPARE and terminal-phase
+facts through _read_recovery_transactions, so a tolerant read could make a
+finalized transaction re-enter Class C.
+
+### 13. Release precondition P1
+
+P1 is a release block, not a runtime mechanism. P1 asserts that no EventLog
+history predating this decision contains a JUDGE bearing
+producer == T12_ASSESSMENT_PRODUCER_ID, or a T9 STATE transaction with a
+PREPARE and no terminal COMMIT or ABORT whose trigger is
+STATE_TRIGGER_MASTERY_ASSESSMENT_PASS or STATE_TRIGGER_ASSESSMENT_FAIL.
+
+    P1 passes -> the T12.4 release may proceed.
+    P1 fails  -> the T12.4 release is BLOCKED; the blocking deployment
+                 history is manually resolved or removed by a human, P1 is
+                 re-run, and implementation and release cannot proceed
+                 until P1 becomes true.
+
+There is no migration engine, no automatic COMMIT, no automatic ABORT, and no
+runtime branch keyed on guessed record age or version. Once P1 holds, every
+assessment-triggered PREPARE that can exist under the released code was
+created under the D69 gate, so ordinary T9 Class-C crash finalization remains
+unchanged.
+
+P1's baseline is established by rule A: this project has never had a
+persistent deployment EventLog. The evidence is structural — no production
+module in vocab/ constructs an EventLog; every construction repo-wide is in
+tests/ under tmp_path; EventLog.__init__ requires an explicit path and
+provides no default, discovery, or fallback; the sole production entrypoint
+"python -m vocab.t8_cli" exposes only export-contexts, import-contexts, and
+hydrate-audio, none of which constructs an EventLog or calls reconcile_unit,
+observe_unit, or emit_scan; vocab/ reads no environment variable and defines
+no EventLog filename constant; no ledger or state file is tracked;
+.gitignore names no ledger directory; and the two untracked repo-root smoke
+artifacts contain only STATE and ENCOUNTER records with no JUDGE and no
+pending assessment-triggered PREPARE.
+
+P1 has two halves and only one is mechanical.
+
+**P1a**, machine-enforced on every suite run: no ast.Call in vocab/ may have
+EventLog as its callee, in any module including
+vocab/assessment_producer.py, so released production code cannot create a
+deployment EventLog and the baseline claim cannot silently decay.
+
+**P1b**, a one-time human attestation recorded at release: no EventLog
+produced by any ad-hoc out-of-band script contains the blocking records
+above. P1b is not machine-verifiable, because no analysis of this repository
+can enumerate files written elsewhere on disk by scripts outside it; D69
+does not claim otherwise.
+
+No P1 preflight tool is written, because under rule A its input universe
+would be empty by construction.
+
+### 14. Lifecycle enablement conditions
+
+T12_LIFECYCLE_ENABLED_CHANNELS is frozen at ("R", "L", "W", "S") in
+vocab/contracts.py. The T12.4 implementation must not be committed or pushed
+unless P1 passes and every mandatory D58 semantic anchor, every registered
+probe including every parametrization, every crash probe, the strict-read
+equivalence probe, all four real-smoke scenarios, the D68 static authority
+invariants, R1 and R2, APPROVED_LIFECYCLE_HISTORY_READS,
+APPROVED_STATE_MATERIALIZERS, the closed import invariant, P1a, the
+envelope-drift invariant, the anti-downgrade probes, and the full regression
+suite pass 100% for all four channels in one official unfiltered acceptance
+run. There is no partial-enablement release. One violation is NO-GO.
+
+### 15. Operational release status
+
+The producer-to-lifecycle seam is already live in baseline ffa5534: a durable
+T12 PASS/FAIL JUDGE is structurally lifecycle-bearing today, with no
+producer, version, envelope, or outcome gate, with tolerant history reads on
+both the lifecycle and recovery arms, and with a one-field
+identity-downgrade path into the ungated legacy branch. The current
+pre-T12.4 baseline is therefore NOT approved for real T12 lifecycle use.
+Until the D69 implementation passes every acceptance criterion in section
+14, T12 lifecycle must not be treated as enabled or released, and real-data
+T12 PASS/FAIL emission followed by reconciliation must not be run. This is a
+release and process rule enforced by this decision and human discipline, not
+a runtime environment flag; no code path reads it, and no flag is added to
+simulate it.
+
+### 16. Evidence and artifact policy
+
+The only normative gate evidence is the executing pytest probe and smoke
+result from the official unfiltered acceptance run. No file is ever a gate.
+A t12-real-smoke-YYYYMMDD.jsonl EventLog dump is written only when
+VOCAB_T12_SMOKE_ARTIFACT_DIR is explicitly set; ordinary pytest writes
+exclusively under tmp_path and never creates a persistent repository-root
+artifact. A missing diagnostic artifact is neither FAIL nor BLOCKED and has
+no effect on the gate. No hash or byte comparison is ever performed against a
+stored artifact; Event.ts is wall-clock and byte reproducibility is
+impossible. The existing t9-real-smoke-20260823.jsonl and
+t10-real-smoke-20260823.jsonl files are non-normative, bind nothing here,
+and are not read as fixtures or modified.
+
+### 17. Failure semantics
+
+FAIL = an invariant was violated. BLOCKED = an invariant could not be
+evaluated, or P1 did not pass. Both deny enablement; only remediation
+differs. Environmental failure is never PASS. On any registered node or
+real-smoke node, a SKIP, XFAIL, XPASS, deselection, or non-execution is a
+gate failure, not a pass. Byte-difference, hash-difference, and missing
+diagnostic artifacts are not criteria.
+
+### 18. Implementation scope
+
+Add tests/d58_probe_inventory.py, tests/test_t12_invariant_probes.py,
+tests/test_t12_real_smoke.py, and the conftest.py acceptance-gate plugin.
+Modify vocab/events.py (add EventLog.read_strict), vocab/contracts.py (add
+T12_LIFECYCLE_ENABLED_CHANNELS, T12_LIFECYCLE_EVENT_SCHEMA_VERSION,
+T12_ONLY_JUDGE_MARKER_FIELDS), and vocab/reconcile.py (evolve
+_EventLogReader, strict read at both sites, the three-way partition and T12
+gate in _lifecycle_assessment). Extend tests/t12_ast_invariants.py with R1,
+R2, APPROVED_STATE_MATERIALIZERS, the tightened import resolution, and P1a.
+Add a delegating read_strict to the two reconcile test fakes.
+vocab/assessment_producer.py, vocab/assessment_planning.py,
+vocab/exposure.py, and vocab/t8_cli.py are not modified. _recover_ungrouped
+and _recover_dormancy_group are not modified; P1's release ordering removes
+any need for a recovery-branch change.
+
+### 19. Out of scope
+
+New producer behavior; reopening D68 producer architecture; a second
+EventLog parser; generic EventLog semantic changes for historical consumers;
+ledger access from reconcile; refactoring the producer's strict-read helper;
+payload signing; a migration engine; a P1 preflight tool; a runtime
+enablement flag; UI; Anki integration; scoring or rubric redesign; model
+calls; transcription redesign; registry DB; concurrency; retroactive
+regrading; statistical accuracy claims from the probe set.
+
+### 20. Acceptance criteria
+
+P1 passes; every registered D58 probe and every one of its parametrizations
+executes and passes with no skip, xfail, xpass, deselection, or
+non-execution; all four smoke scenarios and their parametrizations pass;
+every crash probe passes; the strict-read equivalence probe passes; the
+anti-downgrade partition probes pass; the envelope-drift invariant passes;
+the D68 static invariants, the closed import invariant, R1, R2,
+APPROVED_LIFECYCLE_HISTORY_READS, APPROVED_STATE_MATERIALIZERS, and P1a
+pass; the inventory-binding and unskippability invariants pass; the full
+regression suite passes; all four enabled channels have complete registered
+probe coverage. All of the above in one official unfiltered run of
+.\.venv\Scripts\python.exe -m pytest. One violation is NO-GO.
+
+**Reason:** T12 output is already structurally lifecycle-bearing, and the
+consumer that acts on it is unaware of producer identity, producer version,
+envelope version, and outcome, reads both its lifecycle and its recovery
+history tolerantly, and can be made to demote a genuine T12 record to the
+legacy path by deleting one field. Enablement is therefore not a wiring step
+but a proof obligation plus five closures — outcome and identity
+partitioning, envelope authority, producer version, strict history reading
+on every lifecycle and recovery path, and a genuinely closed import
+allowlist — ordered behind a release precondition rather than a runtime
+heuristic, because no durable field distinguishes pre-gate from post-gate
+history.
