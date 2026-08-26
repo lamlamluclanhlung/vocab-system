@@ -6530,3 +6530,598 @@ SPEAK never contains D35.
 JUDGE PASS/FAIL contains complete D35.
 
 JUDGE OMITTED/ABSTAIN contains zero D35.
+
+## D67 — T12.2c operational dispositions, text classification, and capture-subsystem failure authority
+
+**Date:** 2026-08-26
+**Status:** Accepted
+**Blocks:** T12
+
+D67 covers pre-capture terminal dispositions for R/L/W text attempts whose
+display authority has already been spent, and the routing/classification
+boundary that selects between capture and disposition.
+
+It does not alter D55, D60, D62, D63, D64, D65, or D66.
+
+### 1. Durable OperationalDispositionReceipt
+
+T12 owns another sibling append-only ledger at an explicit runtime path:
+
+    t12-dispositions.jsonl
+
+Its ONE authority is:
+
+    which pre-capture attempt with spent display authority received one
+    terminal operational/policy disposition
+
+It is NOT:
+
+    EventLog
+    lifecycle state
+    novelty state
+    Unit state
+    semantic outcome history
+    a diagnostic or error log
+
+A consumed DisplayPermit remains authority that display authority was spent,
+not proof that the learner perceived the stimulus.
+
+Disposition receipt v1 contains exactly:
+
+    v
+    producer
+    producer_version
+    disposed_at
+    attempt_id
+    disposition_code
+
+Rules:
+
+    v == 1
+
+    producer == "t12-assessment"
+
+    producer_version == 1
+
+    disposed_at:
+        normalized UTC ISO-8601 with explicit +00:00
+        audit metadata only
+
+    attempt_id:
+        frozen attempt:v1 grammar
+
+    disposition_code:
+        exactly one member of the closed set in section 2
+
+No unknown fields.
+
+channel is NOT persisted in the receipt. Channel is derived from the bound
+ExposureReservation, which is the existing channel authority. Persisting
+channel in the receipt would create a second, divergeable copy of that fact.
+
+Disposition-ledger slot identity is exactly:
+
+    producer
+    producer_version
+    attempt_id
+
+A duplicate physical slot fails closed even when byte-for-byte identical.
+
+There is no automatic supersession, correction, rewrite, or second disposition
+receipt for one attempt in v1.
+
+A transient typed ABSTAIN return value is NOT sufficient durable authority.
+
+A terminal operational disposition exists only when its receipt is durably
+appended, fsynced, and exactly read back. An in-memory return value alone can
+never be reconstructed after restart and must never be treated as a
+disposition.
+
+### 2. Closed T12.2c disposition codes
+
+The T12.2c disposition set is exactly:
+
+    refusal
+    explicit_skip
+    no_response
+    invalid_artifact
+    infrastructure_failure
+
+All five are members of the existing frozen ABSTAIN_REASON_CODES in
+vocab/contracts.py. D67 introduces no new reason-code vocabulary.
+
+No other ABSTAIN reason code may be recorded as a T12.2c pre-capture
+disposition.
+
+In particular, these remain owned by their existing boundaries and are never
+T12.2c dispositions:
+
+    off_topic
+    insufficient_lexical_evidence
+    response_unintelligible
+    semantic_uncertainty
+    reviewer_rejected
+        -> post-capture semantic/review boundary (D57/D59/D64)
+
+    audio_unusable
+    transcription_uncertain
+    transcription_failed
+        -> D65 transcription ledger only
+
+### 3. Complete triple-history boundary
+
+Every fresh durable write to the exposure, capture, or disposition history
+boundary must validate the complete:
+
+    exposure + capture + disposition
+
+history.
+
+No such write may validate a subset.
+
+The applicable writers are exactly:
+
+    reserve_exposure
+    capture_response
+    record_refusal
+    record_explicit_skip
+    close_text_submission, when it records a disposition
+    the internal terminal capture-subsystem failure recorder
+
+reserve_exposure is itself a fresh durable write to this boundary and is
+therefore bound by this rule, both before reservation and after
+append/readback.
+
+#### Scope limit
+
+This requirement is scoped to the exposure/capture/disposition history
+boundary only. It is not a general rule about all T12 durable writes.
+
+D67 does NOT require the following to join the triple merely because they are
+T12 durable writes:
+
+    D65 transcription-ledger writes
+    EventLog writes
+    any other unrelated T12 durable artifact, present or future
+
+Those boundaries retain their own existing validation authority unchanged.
+
+#### Legal state matrix
+
+Per attempt, the complete legal state matrix is exactly:
+
+    exposure=1, capture=0, disposition=0
+        -> in flight; after restart the attempt is abandoned
+           (no DisplayPermit may be reconstructed; novelty stays consumed)
+
+    exposure=1, capture=1, disposition=0
+        -> captured path
+           (D63/D64/D66 assessment planning)
+
+    exposure=1, capture=0, disposition=1
+        -> T12.2c policy path
+           (plan_policy_judge)
+
+    exposure=1, capture=1, disposition=1
+        -> corruption; fail closed
+
+    disposition without exactly one exposure reservation
+        -> corruption; fail closed
+
+    disposition bound to an exposure whose channel == "S"
+        -> corruption; fail closed
+
+The S check reads channel from the bound reservation, since channel is not
+persisted in the receipt.
+
+#### Read and resume boundaries are equally bound
+
+Mutual exclusion is not enforced by fresh writes alone.
+
+Every durable read/resume boundary must validate the complete triple history
+and fail closed on capture+disposition coexistence BEFORE issuing or resuming
+any evidence.
+
+At minimum, these boundaries validate the complete triple:
+
+    reserve_exposure
+    capture_response
+    resume_captured_response
+    load_validated_attempt_evidence
+    load_validated_disposition_evidence
+
+A history containing both a CaptureReceipt and an
+OperationalDispositionReceipt for one attempt must fail before either captured
+evidence or disposition evidence can be issued or resumed.
+
+A corrupt coexistence discovered at read time is never silently resolved in
+favor of either record.
+
+### 4. Three-ledger initialization semantics
+
+initialize_t12_ledgers covers exposure, capture, and disposition together.
+
+The three paths must be mutually distinct.
+
+    all three absent
+    + no_historical_t12_state is exactly True
+        -> initialize all three as empty ledgers
+
+    subset present,
+    every present ledger valid AND empty,
+    + no_historical_t12_state is exactly True
+        -> create only the missing ledgers
+
+    any present ledger non-empty
+    while another required ledger is absent
+        -> fail closed
+
+    any present ledger invalid
+        -> fail closed
+
+no_historical_t12_state must be an actual bool and remains the T12.1 bootstrap
+seam only.
+
+It is never producer authority, never disposition authority, and never a
+substitute for complete historical validation.
+
+### 5. Mutual exclusion
+
+A CaptureReceipt and an OperationalDispositionReceipt for the same attempt_id
+may never coexist.
+
+    capture_response
+        must validate that NO disposition receipt exists for that attempt
+        before persisting the response artifact
+
+    disposition recording
+        must validate that NO capture receipt exists for that attempt
+        before appending the receipt
+
+Both checks run against complete validated triple history, not a cached view.
+
+Discovery of coexistence in existing history is corruption and fails closed at
+every boundary listed in section 3.
+
+### 6. Durable reconstruction
+
+ValidatedDispositionEvidence is a sealed immutable snapshot reconstructed
+after restart from all of:
+
+    the exact OperationalDispositionReceipt
+    + exactly one ExposureReservation for that attempt_id
+    + the persisted session manifest item for that reservation
+    + verified stimulus artifact in ArtifactStore
+    + complete valid triple history
+
+The reservation/manifest binding, attempt-identity recomputation, and
+stimulus-artifact verification follow the existing D62/D63 rules unchanged.
+
+Never reconstruct a disposition from reservation + absence alone.
+
+An exposure reservation with no capture receipt and no disposition receipt is
+an abandoned attempt, not a disposition. Absence is never evidence.
+
+ValidatedDispositionEvidence carries no response_artifact_ref, no
+response_bytes, and no novel.
+
+Novelty is not computed for a disposition path: novelty was already consumed
+at reservation, and a disposition can never bear D35 fields.
+
+### 7. Policy planning
+
+    plan_policy_judge(
+        disposition: ValidatedDispositionEvidence,
+        unit: ValidatedUnitEvidence,
+    ) -> PlannedJudge
+
+Pure. No I/O, no clock, no randomness.
+
+It requires the attempt/Unit binding rules already frozen by D63.
+
+For all five disposition codes the planned JUDGE payload is exactly:
+
+    channel                = disposition.channel
+    passed                 = False
+    outcome                = "ABSTAIN"
+    reason_code            = disposition.disposition_code
+    authority_kind         = "policy"
+    model_id               = "t12-assessment-policy"
+    model_version          = "1"
+    producer               = "t12-assessment"
+    producer_version       = 1
+    attempt_id             = disposition.attempt_id
+    presented_stimulus_ref = disposition.presented_stimulus_ref
+    provenance             = policy stage only
+
+provenance contains exactly one stage:
+
+    policy:
+        policy_id      = "t12-assessment-policy"
+        policy_version = 1
+
+No semantic_judge, no human_review, no presence_gate, no transcription.
+
+No semantic request, proposal, or review may exist on this path; none of those
+stages was invoked.
+
+The payload PROHIBITS:
+
+    response_artifact_ref
+    assessment_id
+    stimulus_ref
+    novel
+    failure_code
+
+Unknown payload fields are forbidden.
+
+#### Relationship to D64
+
+D64 requires that all T12.2a paths carry a valid response_artifact_ref, and
+lists these codes as NOT SUPPORTED IN T12.2a.
+
+D67 pre-capture dispositions are T12.2c paths, explicitly outside T12.2a
+scope. No response_artifact_ref exists because no learner response was ever
+captured.
+
+D64 is not modified, and the existing T12.2a payload closure is not relaxed:
+T12.2c adds one separate closed keyset rather than making any existing
+required field optional.
+
+This preserves the D61 mapping: every ABSTAIN has authority_kind == "policy",
+and provenance still contains exactly the stages actually invoked.
+
+### 8. Text classification — E1
+
+#### Classification order
+
+For a pre-capture R/L/W attempt whose DisplayPermit has been consumed,
+close_text_submission accepts:
+
+    raw_bytes: bytes | None
+
+Classification is exactly:
+
+    raw_bytes is None
+        -> no_response disposition
+
+    type(raw_bytes) is not bytes
+        -> TypeError
+
+    strict UTF-8 decode of the exact raw bytes fails
+        -> invalid_artifact disposition
+
+    decoded.strip() == ""
+        -> no_response disposition
+
+    otherwise
+        -> capture_response(..., response_bytes=raw_bytes)
+
+#### No-candidate rule
+
+Classification is exactly:
+
+    None
+        -> no candidate submission
+        -> no_response
+
+    b""
+        -> actual zero-byte candidate
+        -> strict UTF-8 decode succeeds
+        -> decoded.strip() == ""
+        -> no_response
+
+The live classifier distinguishes how the branch was reached.
+
+None must never be normalized into b"" before classification, and b"" must
+never be treated as an absent submission.
+
+Both branches intentionally materialize to the SAME durable
+OperationalDispositionReceipt with:
+
+    disposition_code = "no_response"
+
+T12.2c v1 does NOT durably preserve whether no_response originated from None
+versus an empty or whitespace-only candidate. That distinction exists only in
+the live classifier and is deliberately not persisted.
+
+No later component may infer that distinction from the receipt. Any component
+that reads a no_response receipt must treat the two origins as
+indistinguishable.
+
+Do NOT add a receipt field, subreason, artifact, or new reason code to
+preserve that distinction.
+
+Any value that is neither None nor exact bytes is a caller/API misuse and
+raises TypeError. It is never silently converted into a disposition.
+
+#### Frozen blank predicate
+
+The predicate is exactly:
+
+    decoded.strip() == ""
+
+It is not widened.
+
+No secondary Unicode-whitespace test, codepoint-category check, regex, or
+normalization is substituted for it or layered over it.
+
+Frozen consequences:
+
+    None                            -> no-candidate rule -> no_response
+    empty b""                       -> strip == ""       -> no_response
+    spaces b"   "                   -> strip == ""       -> no_response
+    tab/newline b"\t\n"             -> strip == ""       -> no_response
+    NBSP-only b"\xc2\xa0" (U+00A0)  -> strip == ""       -> no_response
+    ZWSP-only b"\xe2\x80\x8b"       -> strip non-empty   -> capture-eligible
+    NUL-only b"\x00" (U+0000)       -> strip non-empty   -> capture-eligible
+    invalid UTF-8 b"\xff"           -> decode fails      -> invalid_artifact
+    valid non-whitespace bytes      -> strip non-empty   -> captured exactly,
+                                                            unstripped
+    non-bytes, non-None             -> type check        -> TypeError
+
+The exact character set removed is whatever the Python runtime's built-in
+str.strip() removes. It includes U+00A0 and excludes U+200B and U+0000.
+
+No override is permitted.
+
+All rows above are mandatory test coverage.
+
+#### Exact-byte capture
+
+capture_response accepts response_bytes: bytes. Decoding is a classification
+step only.
+
+When classification is capture-eligible, close_text_submission MUST call:
+
+    capture_response(..., response_bytes=raw_bytes)
+
+using the exact original submitted bytes.
+
+    do NOT pass the decoded Python string
+    do NOT decode and re-encode to reconstruct artifact bytes
+
+The response artifact digest is over the exact submitted bytes. Re-encoding
+could alter bytes and therefore alter response identity.
+
+#### Transient bytes — E2
+
+When classification produces invalid_artifact, the undecodable raw bytes:
+
+    may exist transiently in memory during classification only
+
+They are NOT written to:
+
+    ArtifactStore
+    the disposition receipt
+    any other durable diagnostic store in T12.2c v1
+
+No durable failure-evidence ledger is introduced in v1.
+
+### 9. Narrow originating authorities
+
+Each disposition code has exactly one originating authority:
+
+    record_refusal
+        explicit refusal session action only
+
+    record_explicit_skip
+        explicit skip session action only
+
+    close_text_submission
+        deterministically chooses exactly one of:
+            capture
+            no_response
+            invalid_artifact
+        no caller may select among these
+
+    infrastructure_failure
+        capture-subsystem-owned internal terminal-failure path only
+
+record_refusal and record_explicit_skip record an explicit learner/session
+action. They do not classify bytes and never accept a caller-chosen
+disposition code.
+
+#### Attempt authority
+
+Every disposition-recording entry point derives attempt_id from an exact
+issued, consumed DisplayPermit, through a narrow permit accessor analogous to
+the existing capture accessor.
+
+    a caller-supplied attempt_id is NEVER disposition authority
+    an unconsumed permit cannot record a disposition
+    a fabricated permit cannot record a disposition
+    a permit for another attempt cannot dispose this attempt
+
+This mirrors the D62 fresh-capture rule exactly. Reservation existence by
+itself is not disposition authority.
+
+#### infrastructure_failure authority
+
+infrastructure_failure is owned by the capture subsystem. It is not a generic
+public session/UI operation.
+
+The terminal capture-subsystem failure recorder:
+
+    is internal / non-generic
+    is not part of the public session or UI surface
+    has statically allowlisted production call sites
+
+None of the following is authority to record infrastructure_failure:
+
+    catching an arbitrary exception
+    catching an interruption, crash signal, or process exit
+    any session-layer or UI-layer decision
+
+Only the trusted capture-subsystem boundary may explicitly finalize that
+terminal technical failure. Generic session/UI code cannot directly choose
+infrastructure_failure.
+
+There is no public caller-selected failure token in v1.
+
+#### Interruption is NOT a disposition
+
+Consistent with D65:
+
+    process crash before classification
+    process crash after classification but before receipt append
+    session abandoned
+
+produce NO disposition receipt. They do not automatically produce any
+disposition.
+
+Those attempts are abandoned per the section 3 legal state matrix.
+
+### 10. R/L/W routing and allowlist invariant — E3
+
+An AST/static invariant test inspects production call sites and fails closed
+when a new direct R/L/W capture_response path is introduced outside the
+explicitly approved allowlist.
+
+Allowlisted capture_response call sites: exactly one — the body of
+close_text_submission.
+
+Allowlisted terminal capture-subsystem failure recorder call sites: exactly
+the internal capture-subsystem failure path named in the allowlist.
+
+This is enforcement, not documentation. The test walks production source and
+fails with a message naming any unapproved call site.
+
+### 11. S exclusion
+
+There is no pre-capture S disposition in T12.2c.
+
+D56, D65, and D66 remain the sole authorities for speech dispositions.
+
+Speech failures flow through the D65 transcription ledger, never through
+t12-dispositions.jsonl.
+
+A disposition receipt bound to an S exposure reservation is corruption and
+fails closed.
+
+No standalone S JUDGE exists. Speech JUDGE remains available only through the
+sealed D66 PlannedSpeechAssessment pair.
+
+### 12. Serialization and crash semantics
+
+Receipt serialization, append, and readback reuse the existing t12_jsonl.py
+primitives unchanged:
+
+    validate complete triple history
+    validate the exact receipt
+    canonical JSONL serialize
+    append
+    flush
+    fsync
+    exact readback
+
+The ledger is append-only.
+
+T12 v1 never rewrites, deletes, truncates, automatically repairs, or silently
+ignores an interior malformed record.
+
+    receipt durable
+        -> restart may reconstruct exact ValidatedDispositionEvidence
+
+    crash before receipt
+        -> no disposition authority exists; attempt is abandoned
