@@ -10,9 +10,12 @@ from dataclasses import dataclass, field
 from .artifact_json import canonical_json_bytes, strict_json_loads
 from .assessment_evidence import (
     ValidatedAttemptEvidence,
+    ValidatedDispositionEvidence,
     ValidatedUnitEvidence,
     _require_attempt_evidence,
     _require_attempt_unit_binding,
+    _require_disposition_evidence,
+    _require_disposition_unit_binding,
     _require_unit_evidence,
 )
 from .contracts import (
@@ -30,6 +33,7 @@ from .contracts import (
     T12_ASSESSMENT_PRODUCER_VERSION,
     UNIT_KEY_PATTERN,
 )
+from .disposition_ledger import DISPOSITION_CODES
 from .presence_evidence import (
     PRESENCE_GATE_ID,
     PRESENCE_GATE_VERSION,
@@ -107,6 +111,9 @@ _PRESENCE_GATE_FIELDS = frozenset(
     ("gate_id", "gate_version", "target_present")
 )
 _POLICY_FIELDS = frozenset(("policy_id", "policy_version"))
+_POLICY_DISPOSITION_FIELDS = (_COMMON_FIELDS - frozenset(("response_artifact_ref",))) | frozenset(
+    ("reason_code",)
+)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -256,6 +263,37 @@ def plan_text_judge(
     return _issue_planned_judge(validated_unit.unit_key, payload)
 
 
+def plan_policy_judge(
+    *,
+    disposition: ValidatedDispositionEvidence,
+    unit: ValidatedUnitEvidence,
+) -> PlannedJudge:
+    """Plan exactly one pre-capture D67 policy-disposition JUDGE. Pure; no I/O."""
+    validated_disposition = _require_disposition_evidence(disposition)
+    validated_unit = _require_unit_evidence(unit)
+    _require_disposition_unit_binding(validated_disposition, validated_unit)
+    if validated_disposition.channel not in ("R", "L", "W"):
+        raise AssessmentPlanningError("T12.2c planning supports only R/L/W")
+
+    payload = {
+        "channel": validated_disposition.channel,
+        "passed": False,
+        "model_id": POLICY_ID,
+        "model_version": str(POLICY_VERSION),
+        "producer": T12_ASSESSMENT_PRODUCER_ID,
+        "producer_version": T12_ASSESSMENT_PRODUCER_VERSION,
+        "attempt_id": validated_disposition.attempt_id,
+        "presented_stimulus_ref": validated_disposition.presented_stimulus_ref,
+        "outcome": ASSESSMENT_OUTCOME_ABSTAIN,
+        "authority_kind": "policy",
+        "provenance": {
+            "policy": {"policy_id": POLICY_ID, "policy_version": POLICY_VERSION},
+        },
+        "reason_code": validated_disposition.disposition_code,
+    }
+    return _issue_planned_judge(validated_unit.unit_key, payload)
+
+
 def _base_payload(
     *,
     attempt: ValidatedAttemptEvidence,
@@ -372,6 +410,9 @@ def _validated_judge_payload(
         raise AssessmentPlanningError("planned JUDGE payload must be an object")
 
     outcome = payload.get("outcome")
+    if outcome == ASSESSMENT_OUTCOME_ABSTAIN and payload.get("reason_code") in DISPOSITION_CODES:
+        return _validated_policy_disposition_payload(unit_key=unit_key, payload=payload)
+
     expected_fields: frozenset[str]
     if outcome == ASSESSMENT_OUTCOME_PASS:
         expected_fields = _COMMON_FIELDS | _D35_FIELDS
@@ -515,6 +556,63 @@ def _validated_judge_payload(
                     "failure_code is invalid for the planned channel"
                 )
 
+    return _detached_payload(payload)
+
+
+def _validated_policy_disposition_payload(
+    *,
+    unit_key: str,
+    payload: Mapping[object, object],
+) -> dict[str, object]:
+    """Validate the exact closed D67 pre-capture policy-disposition payload."""
+    if set(payload) != _POLICY_DISPOSITION_FIELDS:
+        raise AssessmentPlanningError(
+            "planned policy-disposition JUDGE payload has the wrong key set"
+        )
+    channel = payload["channel"]
+    if type(channel) is not str or channel not in ("R", "L", "W"):
+        raise AssessmentPlanningError(
+            "planned policy-disposition JUDGE channel is unsupported"
+        )
+    if payload["passed"] is not False:
+        raise AssessmentPlanningError(
+            "planned policy-disposition JUDGE passed must be False"
+        )
+    if payload["outcome"] != ASSESSMENT_OUTCOME_ABSTAIN:
+        raise AssessmentPlanningError(
+            "planned policy-disposition JUDGE outcome must be ABSTAIN"
+        )
+    if payload["producer"] != T12_ASSESSMENT_PRODUCER_ID:
+        raise AssessmentPlanningError("planned policy-disposition JUDGE producer is invalid")
+    if (
+        type(payload["producer_version"]) is not int
+        or payload["producer_version"] != T12_ASSESSMENT_PRODUCER_VERSION
+    ):
+        raise AssessmentPlanningError(
+            "planned policy-disposition JUDGE producer_version is invalid"
+        )
+    _require_pattern(payload["attempt_id"], _ATTEMPT_ID_RE, "attempt_id")
+    _require_pattern(
+        payload["presented_stimulus_ref"],
+        _STIMULUS_REF_RE,
+        "presented_stimulus_ref",
+    )
+    if payload["reason_code"] not in DISPOSITION_CODES:
+        raise AssessmentPlanningError(
+            "planned policy-disposition JUDGE reason_code is invalid"
+        )
+    _require_authority(
+        payload,
+        kind="policy",
+        model_id=POLICY_ID,
+        model_version=str(POLICY_VERSION),
+    )
+    provenance = payload["provenance"]
+    if not isinstance(provenance, Mapping) or set(provenance) != {"policy"}:
+        raise AssessmentPlanningError(
+            "planned policy-disposition JUDGE provenance has wrong stages"
+        )
+    _validated_policy_stage(provenance["policy"])
     return _detached_payload(payload)
 
 

@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from .artifact_json import canonical_json_bytes
 from .artifact_store import ArtifactStore
 from .assessment_identity import assessment_attempt_id
-from .capture_ledger import read_capture_ledger, validate_capture_bindings
 from .contracts import (
     ASSESSMENT_ARTIFACT_REF_PATTERN,
     ASSESSMENT_ATTEMPT_ID_PATTERN,
@@ -22,7 +21,8 @@ from .contracts import (
     UNIT_KEY_PATTERN,
     UNIT_TYPE_VALUES,
 )
-from .exposure import novelty_for_reserved_attempt, read_exposure_ledger
+from .disposition_ledger import DISPOSITION_CODES
+from .exposure import novelty_for_reserved_attempt, validate_t12_histories
 from .models import VocabUnit
 from .session import SESSION_ID_PATTERN, load_session_manifest
 from .validators import validate_forge_unit
@@ -35,6 +35,7 @@ class AssessmentEvidenceError(ValueError):
 _EVIDENCE_SEAL = object()
 _UNIT_SNAPSHOT_DOMAIN = "vocab.t12.validated-unit-evidence"
 _ATTEMPT_SNAPSHOT_DOMAIN = "vocab.t12.validated-attempt-evidence"
+_DISPOSITION_SNAPSHOT_DOMAIN = "vocab.t12.validated-disposition-evidence"
 _SNAPSHOT_VERSION = 1
 _UNIT_KEY_RE = re.compile(UNIT_KEY_PATTERN)
 _ATTEMPT_ID_RE = re.compile(ASSESSMENT_ATTEMPT_ID_PATTERN)
@@ -90,6 +91,33 @@ class ValidatedAttemptEvidence:
         )
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class ValidatedDispositionEvidence:
+    """One pre-capture terminal disposition reconstructed from durable T12 authorities."""
+
+    attempt_id: str
+    session_id: str
+    item_ordinal: int
+    unit_key: str
+    channel: str
+    task_kind: str
+    presented_stimulus_ref: str
+    stimulus_artifact_ref: str
+    disposition_code: str
+    _snapshot_bytes: bytes = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __new__(
+        cls,
+        *_args: object,
+        **_kwargs: object,
+    ) -> ValidatedDispositionEvidence:
+        raise TypeError(
+            "ValidatedDispositionEvidence can only be issued by "
+            "load_validated_disposition_evidence"
+        )
+
+
 def validate_unit_evidence(unit: VocabUnit) -> ValidatedUnitEvidence:
     """Validate the existing Unit boundary and return a detached snapshot."""
     if not isinstance(unit, VocabUnit):
@@ -118,6 +146,7 @@ def load_validated_attempt_evidence(
     *,
     exposure_path: str | os.PathLike[str],
     capture_path: str | os.PathLike[str],
+    disposition_path: str | os.PathLike[str],
     artifact_store: ArtifactStore,
     session_root: str | os.PathLike[str],
     attempt_id: object,
@@ -126,11 +155,10 @@ def load_validated_attempt_evidence(
     if not isinstance(artifact_store, ArtifactStore):
         raise TypeError("artifact_store must be an ArtifactStore")
 
-    exposures = read_exposure_ledger(exposure_path)
-    captures = read_capture_ledger(capture_path)
-    validate_capture_bindings(
-        captures,
-        exposure_attempt_ids=tuple(item.attempt_id for item in exposures),
+    exposures, captures, _dispositions = validate_t12_histories(
+        exposure_path=exposure_path,
+        capture_path=capture_path,
+        disposition_path=disposition_path,
         artifact_store=artifact_store,
     )
 
@@ -222,6 +250,114 @@ def load_validated_attempt_evidence(
     )
 
 
+def load_validated_disposition_evidence(
+    *,
+    exposure_path: str | os.PathLike[str],
+    capture_path: str | os.PathLike[str],
+    disposition_path: str | os.PathLike[str],
+    artifact_store: ArtifactStore,
+    session_root: str | os.PathLike[str],
+    attempt_id: object,
+) -> ValidatedDispositionEvidence:
+    """Reconstruct one D67 pre-capture disposition from complete durable T12 history."""
+    if not isinstance(artifact_store, ArtifactStore):
+        raise TypeError("artifact_store must be an ArtifactStore")
+
+    exposures, _captures, dispositions = validate_t12_histories(
+        exposure_path=exposure_path,
+        capture_path=capture_path,
+        disposition_path=disposition_path,
+        artifact_store=artifact_store,
+    )
+
+    if type(attempt_id) is not str:
+        raise AssessmentEvidenceError("attempt_id selector must be a string")
+    matching_exposures = [
+        item for item in exposures if item.attempt_id == attempt_id
+    ]
+    if len(matching_exposures) != 1:
+        raise AssessmentEvidenceError(
+            "disposition evidence requires exactly one exposure reservation"
+        )
+    reservation = matching_exposures[0]
+    if reservation.channel not in ("R", "L", "W"):
+        raise AssessmentEvidenceError(
+            "disposition evidence requires an R/L/W exposure channel"
+        )
+
+    manifest = load_session_manifest(session_root, reservation.session_id)
+    manifest_data = manifest.to_dict()
+    items = manifest_data["items"]
+    if type(items) is not list:  # pragma: no cover - manifest import guarantees it
+        raise AssertionError("validated session items are not an array")
+    matching_items = [
+        item
+        for item in items
+        if type(item) is dict
+        and item.get("item_ordinal") == reservation.item_ordinal
+    ]
+    if len(matching_items) != 1:
+        raise AssessmentEvidenceError(
+            "persisted session does not contain exactly one reserved item"
+        )
+    item = matching_items[0]
+    expected_item_binding = (
+        manifest.session_id,
+        item["item_ordinal"],
+        item["unit_key"],
+        item["channel"],
+        item["presented_stimulus_ref"],
+        item["stimulus_artifact_ref"],
+    )
+    reservation_binding = (
+        reservation.session_id,
+        reservation.item_ordinal,
+        reservation.unit_key,
+        reservation.channel,
+        reservation.presented_stimulus_ref,
+        reservation.stimulus_artifact_ref,
+    )
+    if expected_item_binding != reservation_binding:
+        raise AssessmentEvidenceError(
+            "exposure reservation does not match the persisted session item"
+        )
+
+    expected_attempt_id = assessment_attempt_id(
+        session_id=manifest.session_id,
+        item_ordinal=reservation.item_ordinal,
+        unit_key=reservation.unit_key,
+        channel=reservation.channel,
+        presented_stimulus_ref=reservation.presented_stimulus_ref,
+    )
+    if expected_attempt_id != reservation.attempt_id:
+        raise AssessmentEvidenceError(
+            "attempt identity does not match the persisted session item"
+        )
+
+    artifact_store.read(reservation.stimulus_artifact_ref)
+
+    matching_dispositions = [
+        receipt for receipt in dispositions if receipt.attempt_id == reservation.attempt_id
+    ]
+    if len(matching_dispositions) != 1:
+        raise AssessmentEvidenceError(
+            "disposition evidence requires exactly one disposition receipt"
+        )
+    receipt = matching_dispositions[0]
+
+    return _issue_disposition_evidence(
+        attempt_id=reservation.attempt_id,
+        session_id=reservation.session_id,
+        item_ordinal=reservation.item_ordinal,
+        unit_key=reservation.unit_key,
+        channel=reservation.channel,
+        task_kind=ASSESSMENT_TASK_KIND_BY_CHANNEL[reservation.channel],
+        presented_stimulus_ref=reservation.presented_stimulus_ref,
+        stimulus_artifact_ref=reservation.stimulus_artifact_ref,
+        disposition_code=receipt.disposition_code,
+    )
+
+
 def _issue_unit_evidence(
     *,
     unit_key: str,
@@ -296,6 +432,47 @@ def _issue_attempt_evidence(
             response_artifact_ref=response_artifact_ref,
             novel=novel,
             response_bytes=response_bytes,
+        ),
+    )
+    object.__setattr__(evidence, "_seal", _EVIDENCE_SEAL)
+    return evidence
+
+
+def _issue_disposition_evidence(
+    *,
+    attempt_id: str,
+    session_id: str,
+    item_ordinal: int,
+    unit_key: str,
+    channel: str,
+    task_kind: str,
+    presented_stimulus_ref: str,
+    stimulus_artifact_ref: str,
+    disposition_code: str,
+) -> ValidatedDispositionEvidence:
+    evidence = object.__new__(ValidatedDispositionEvidence)
+    object.__setattr__(evidence, "attempt_id", attempt_id)
+    object.__setattr__(evidence, "session_id", session_id)
+    object.__setattr__(evidence, "item_ordinal", item_ordinal)
+    object.__setattr__(evidence, "unit_key", unit_key)
+    object.__setattr__(evidence, "channel", channel)
+    object.__setattr__(evidence, "task_kind", task_kind)
+    object.__setattr__(evidence, "presented_stimulus_ref", presented_stimulus_ref)
+    object.__setattr__(evidence, "stimulus_artifact_ref", stimulus_artifact_ref)
+    object.__setattr__(evidence, "disposition_code", disposition_code)
+    object.__setattr__(
+        evidence,
+        "_snapshot_bytes",
+        _disposition_snapshot_bytes(
+            attempt_id=attempt_id,
+            session_id=session_id,
+            item_ordinal=item_ordinal,
+            unit_key=unit_key,
+            channel=channel,
+            task_kind=task_kind,
+            presented_stimulus_ref=presented_stimulus_ref,
+            stimulus_artifact_ref=stimulus_artifact_ref,
+            disposition_code=disposition_code,
         ),
     )
     object.__setattr__(evidence, "_seal", _EVIDENCE_SEAL)
@@ -431,6 +608,81 @@ def _require_attempt_evidence(value: object) -> ValidatedAttemptEvidence:
     return value
 
 
+def _require_disposition_evidence(value: object) -> ValidatedDispositionEvidence:
+    if type(value) is not ValidatedDispositionEvidence:
+        raise TypeError("disposition must be a ValidatedDispositionEvidence")
+    try:
+        seal = value._seal
+    except AttributeError:
+        raise TypeError(
+            "disposition evidence was not issued by load_validated_disposition_evidence"
+        ) from None
+    if seal is not _EVIDENCE_SEAL:
+        raise TypeError(
+            "disposition evidence was not issued by load_validated_disposition_evidence"
+        )
+    _require_snapshot_pattern(value.attempt_id, _ATTEMPT_ID_RE, "attempt_id")
+    _require_snapshot_pattern(value.session_id, _SESSION_ID_RE, "session_id")
+    if type(value.item_ordinal) is not int or value.item_ordinal < 0:
+        raise AssessmentEvidenceError(
+            "disposition evidence item_ordinal must be an actual non-negative integer"
+        )
+    _require_snapshot_pattern(value.unit_key, _UNIT_KEY_RE, "unit_key")
+    if value.channel not in ("R", "L", "W"):
+        raise AssessmentEvidenceError("disposition evidence channel is invalid")
+    if (
+        type(value.task_kind) is not str
+        or value.task_kind != ASSESSMENT_TASK_KIND_BY_CHANNEL[value.channel]
+    ):
+        raise AssessmentEvidenceError(
+            "disposition channel/task_kind binding is incoherent"
+        )
+    _require_snapshot_pattern(
+        value.presented_stimulus_ref,
+        _STIMULUS_REF_RE,
+        "presented_stimulus_ref",
+    )
+    _require_snapshot_pattern(
+        value.stimulus_artifact_ref,
+        _ARTIFACT_REF_RE,
+        "stimulus_artifact_ref",
+    )
+    if (
+        type(value.disposition_code) is not str
+        or value.disposition_code not in DISPOSITION_CODES
+    ):
+        raise AssessmentEvidenceError("disposition evidence disposition_code is invalid")
+    expected_attempt_id = assessment_attempt_id(
+        session_id=value.session_id,
+        item_ordinal=value.item_ordinal,
+        unit_key=value.unit_key,
+        channel=value.channel,
+        presented_stimulus_ref=value.presented_stimulus_ref,
+    )
+    if expected_attempt_id != value.attempt_id:
+        raise AssessmentEvidenceError(
+            "disposition evidence identity does not match its public fields"
+        )
+    if type(value._snapshot_bytes) is not bytes:
+        raise AssessmentEvidenceError("disposition evidence issuance snapshot is invalid")
+    current_snapshot = _disposition_snapshot_bytes(
+        attempt_id=value.attempt_id,
+        session_id=value.session_id,
+        item_ordinal=value.item_ordinal,
+        unit_key=value.unit_key,
+        channel=value.channel,
+        task_kind=value.task_kind,
+        presented_stimulus_ref=value.presented_stimulus_ref,
+        stimulus_artifact_ref=value.stimulus_artifact_ref,
+        disposition_code=value.disposition_code,
+    )
+    if current_snapshot != value._snapshot_bytes:
+        raise AssessmentEvidenceError(
+            "disposition evidence runtime fields disagree with its issuance snapshot"
+        )
+    return value
+
+
 def _unit_snapshot_bytes(
     *,
     unit_key: str,
@@ -485,6 +737,35 @@ def _attempt_snapshot_bytes(
     )
 
 
+def _disposition_snapshot_bytes(
+    *,
+    attempt_id: str,
+    session_id: str,
+    item_ordinal: int,
+    unit_key: str,
+    channel: str,
+    task_kind: str,
+    presented_stimulus_ref: str,
+    stimulus_artifact_ref: str,
+    disposition_code: str,
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "domain": _DISPOSITION_SNAPSHOT_DOMAIN,
+            "v": _SNAPSHOT_VERSION,
+            "attempt_id": attempt_id,
+            "session_id": session_id,
+            "item_ordinal": item_ordinal,
+            "unit_key": unit_key,
+            "channel": channel,
+            "task_kind": task_kind,
+            "presented_stimulus_ref": presented_stimulus_ref,
+            "stimulus_artifact_ref": stimulus_artifact_ref,
+            "disposition_code": disposition_code,
+        }
+    )
+
+
 def _response_ref(response_bytes: bytes) -> str:
     return "sha256:" + hashlib.sha256(response_bytes).hexdigest()
 
@@ -520,3 +801,15 @@ def _require_attempt_unit_binding(
         raise AssessmentEvidenceError("attempt and Unit unit_key do not match")
     if validated_attempt.channel not in validated_unit.enabled_channels:
         raise AssessmentEvidenceError("attempt channel is not enabled in the Unit")
+
+
+def _require_disposition_unit_binding(
+    disposition: ValidatedDispositionEvidence,
+    unit: ValidatedUnitEvidence,
+) -> None:
+    validated_disposition = _require_disposition_evidence(disposition)
+    validated_unit = _require_unit_evidence(unit)
+    if validated_disposition.unit_key != validated_unit.unit_key:
+        raise AssessmentEvidenceError("disposition and Unit unit_key do not match")
+    if validated_disposition.channel not in validated_unit.enabled_channels:
+        raise AssessmentEvidenceError("disposition channel is not enabled in the Unit")

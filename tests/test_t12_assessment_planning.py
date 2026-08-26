@@ -92,6 +92,7 @@ class Runtime:
     store: ArtifactStore
     exposure_path: Path
     capture_path: Path
+    disposition_path: Path
     session_root: Path
     manifest: SessionManifest
     item: dict[str, object]
@@ -102,6 +103,7 @@ class Runtime:
         return load_validated_attempt_evidence(
             exposure_path=self.exposure_path,
             capture_path=self.capture_path,
+            disposition_path=self.disposition_path,
             artifact_store=self.store,
             session_root=self.session_root,
             attempt_id=self.attempt_id,
@@ -168,10 +170,12 @@ def make_runtime(
     store = ArtifactStore(tmp_path / "artifacts")
     exposure_path = tmp_path / "t12-exposures.jsonl"
     capture_path = tmp_path / "t12-captures.jsonl"
+    disposition_path = tmp_path / "t12-dispositions.jsonl"
     session_root = tmp_path / "sessions"
     initialize_t12_ledgers(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path,
         artifact_store=store,
         no_historical_t12_state=True,
     )
@@ -194,6 +198,7 @@ def make_runtime(
         permit = reserve_exposure(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path,
             artifact_store=store,
             session_root=session_root,
             session_id=manifest.session_id,
@@ -205,6 +210,7 @@ def make_runtime(
             capture_response(
                 exposure_path=exposure_path,
                 capture_path=capture_path,
+                disposition_path=disposition_path,
                 artifact_store=store,
                 captured_at=CAPTURED_AT,
                 display_permit=permit,
@@ -214,6 +220,7 @@ def make_runtime(
         store=store,
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path,
         session_root=session_root,
         manifest=manifest,
         item=item,
@@ -235,6 +242,7 @@ def append_attempt(runtime: Runtime) -> Runtime:
     permit = reserve_exposure(
         exposure_path=runtime.exposure_path,
         capture_path=runtime.capture_path,
+        disposition_path=runtime.disposition_path,
         artifact_store=runtime.store,
         session_root=runtime.session_root,
         session_id=manifest.session_id,
@@ -245,6 +253,7 @@ def append_attempt(runtime: Runtime) -> Runtime:
     capture_response(
         exposure_path=runtime.exposure_path,
         capture_path=runtime.capture_path,
+        disposition_path=runtime.disposition_path,
         artifact_store=runtime.store,
         captured_at=CAPTURED_AT,
         display_permit=permit,
@@ -254,6 +263,7 @@ def append_attempt(runtime: Runtime) -> Runtime:
         store=runtime.store,
         exposure_path=runtime.exposure_path,
         capture_path=runtime.capture_path,
+        disposition_path=runtime.disposition_path,
         session_root=runtime.session_root,
         manifest=manifest,
         item=runtime.item,

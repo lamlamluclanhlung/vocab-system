@@ -99,15 +99,21 @@ def make_manifest_and_attempt(
     return manifest, item, attempt_id
 
 
+def disposition_path_for(exposure_path: Path) -> Path:
+    return exposure_path.parent / "t12-dispositions.jsonl"
+
+
 def initialized_runtime(
     tmp_path: Path,
 ) -> tuple[ArtifactStore, Path, Path, session_module.SessionManifest, dict[str, object], str]:
     store = ArtifactStore(tmp_path / "artifacts")
     exposure_path = tmp_path / "t12-exposures.jsonl"
     capture_path = tmp_path / "t12-captures.jsonl"
+    disposition_path = tmp_path / "t12-dispositions.jsonl"
     initialize_t12_ledgers(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path,
         artifact_store=store,
         no_historical_t12_state=True,
     )
@@ -129,6 +135,7 @@ def reserve(
     permit = reserve_exposure(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         session_root=exposure_path.parent / "sessions",
         session_id=manifest.session_id,
@@ -369,6 +376,7 @@ def test_orphan_artifact_has_no_attempt_binding(tmp_path: Path) -> None:
     assert resume_captured_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         attempt_id=attempt_id,
     ) is None
@@ -380,6 +388,7 @@ def test_initialization_requires_explicit_empty_history_authority(tmp_path: Path
         initialize_t12_ledgers(
             exposure_path=tmp_path / "t12-exposures.jsonl",
             capture_path=tmp_path / "t12-captures.jsonl",
+            disposition_path=tmp_path / "t12-dispositions.jsonl",
             artifact_store=store,
             no_historical_t12_state=False,
         )
@@ -389,19 +398,27 @@ def test_initialization_creates_and_validates_both_empty_ledgers(tmp_path: Path)
     store = ArtifactStore(tmp_path / "artifacts")
     exposure_path = tmp_path / "t12-exposures.jsonl"
     capture_path = tmp_path / "t12-captures.jsonl"
+    disposition_path = tmp_path / "t12-dispositions.jsonl"
     assert initialize_t12_ledgers(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path,
         artifact_store=store,
         no_historical_t12_state=True,
-    ) == ((), ())
-    assert exposure_path.read_bytes() == capture_path.read_bytes() == b""
+    ) == ((), (), ())
+    assert (
+        exposure_path.read_bytes()
+        == capture_path.read_bytes()
+        == disposition_path.read_bytes()
+        == b""
+    )
     assert initialize_t12_ledgers(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path,
         artifact_store=store,
         no_historical_t12_state=False,
-    ) == ((), ())
+    ) == ((), (), ())
 
 
 def test_self_consistent_fake_session_identity_cannot_authorize_reservation(
@@ -421,6 +438,7 @@ def test_self_consistent_fake_session_identity_cannot_authorize_reservation(
         reserve_exposure(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             session_root=tmp_path / "sessions",
             session_id=fake_session_id,
@@ -439,6 +457,7 @@ def test_unpersisted_session_manifest_cannot_authorize_reservation(
         reserve_exposure(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             session_root=tmp_path / "sessions",
             session_id=unpersisted.session_id,
@@ -470,6 +489,7 @@ def test_persisted_manifest_missing_ordinal_fails_before_append(tmp_path: Path) 
         reserve_exposure(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             session_root=tmp_path / "sessions",
             session_id=manifest.session_id,
@@ -491,6 +511,7 @@ def test_tampered_persisted_manifest_fails_before_exposure_append(tmp_path: Path
         reserve_exposure(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             session_root=tmp_path / "sessions",
             session_id=manifest.session_id,
@@ -515,6 +536,7 @@ def test_manifest_stimulus_artifact_must_verify_before_reservation(
         reserve_exposure(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             session_root=tmp_path / "sessions",
             session_id=manifest.session_id,
@@ -575,6 +597,7 @@ def test_restart_cannot_recreate_display_permit_from_reservation(tmp_path: Path)
         capture_response(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             captured_at=CAPTURED_AT,
             response_bytes=b"restart cannot freshly capture",
@@ -730,6 +753,7 @@ def test_two_attempts_with_same_response_share_bytes_but_not_capture_slot(
     first_receipt = capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         captured_at=CAPTURED_AT,
         display_permit=first_permit,
@@ -738,6 +762,7 @@ def test_two_attempts_with_same_response_share_bytes_but_not_capture_slot(
     second_receipt = capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         captured_at=CAPTURED_AT,
         display_permit=second_permit,
@@ -768,6 +793,7 @@ def test_crash_after_artifact_before_receipt_leaves_inert_orphan(
         capture_response(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             captured_at=CAPTURED_AT,
             display_permit=permit,
@@ -779,6 +805,7 @@ def test_crash_after_artifact_before_receipt_leaves_inert_orphan(
     assert resume_captured_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         attempt_id=attempt_id,
     ) is None
@@ -795,6 +822,7 @@ def test_valid_capture_is_resumable_without_creating_redisplay_authority(
     receipt = capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         captured_at=CAPTURED_AT,
         display_permit=permit,
@@ -803,6 +831,7 @@ def test_valid_capture_is_resumable_without_creating_redisplay_authority(
     resumed = resume_captured_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         attempt_id=attempt_id,
     )
@@ -822,6 +851,7 @@ def test_artifact_without_capture_receipt_is_not_captured(tmp_path: Path) -> Non
     assert resume_captured_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         attempt_id=attempt_id,
     ) is None
@@ -838,6 +868,7 @@ def test_unconsumed_permit_fails_before_artifact_or_receipt_write(
         capture_response(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             captured_at=CAPTURED_AT,
             display_permit=permit,
@@ -861,6 +892,7 @@ def test_fabricated_display_capability_is_rejected(tmp_path: Path) -> None:
         capture_response(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             captured_at=CAPTURED_AT,
             display_permit=fabricated,
@@ -881,6 +913,7 @@ def test_second_capture_for_same_attempt_fails_closed(tmp_path: Path) -> None:
     capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         captured_at=CAPTURED_AT,
         display_permit=permit,
@@ -890,6 +923,7 @@ def test_second_capture_for_same_attempt_fails_closed(tmp_path: Path) -> None:
         capture_response(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             captured_at=CAPTURED_AT,
             display_permit=permit,
@@ -910,6 +944,7 @@ def test_capture_receipt_with_missing_or_corrupt_artifact_fails_closed(
     receipt = capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         captured_at=CAPTURED_AT,
         display_permit=permit,
@@ -924,6 +959,7 @@ def test_capture_receipt_with_missing_or_corrupt_artifact_fails_closed(
         resume_captured_response(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             attempt_id=attempt_id,
         )
@@ -942,6 +978,7 @@ def test_nonempty_exposure_with_missing_capture_ledger_fails_closed(
         initialize_t12_ledgers(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             no_historical_t12_state=True,
         )
@@ -956,6 +993,7 @@ def test_capture_history_with_missing_exposure_ledger_fails_closed(tmp_path: Pat
     capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         captured_at=CAPTURED_AT,
         display_permit=permit,
@@ -966,6 +1004,7 @@ def test_capture_history_with_missing_exposure_ledger_fails_closed(tmp_path: Pat
         initialize_t12_ledgers(
             exposure_path=exposure_path,
             capture_path=capture_path,
+            disposition_path=disposition_path_for(exposure_path),
             artifact_store=store,
             no_historical_t12_state=True,
         )
@@ -980,6 +1019,7 @@ def test_duplicate_physical_capture_slot_fails_even_if_identical(tmp_path: Path)
     capture_response(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path_for(exposure_path),
         artifact_store=store,
         captured_at=CAPTURED_AT,
         display_permit=permit,
@@ -1018,6 +1058,7 @@ def test_t12_foundation_has_no_anki_reconcile_t9_or_eventlog_dependency() -> Non
         "session.py",
         "exposure.py",
         "response_capture.py",
+        "disposition_ledger.py",
         "t12_jsonl.py",
     ):
         tree = ast.parse((root / name).read_text(encoding="utf-8"))

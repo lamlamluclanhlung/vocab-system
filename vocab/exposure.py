@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from .artifact_store import ArtifactStore
 from .assessment_identity import assessment_attempt_id
-from .capture_ledger import read_capture_ledger, validate_capture_bindings
+from .capture_ledger import CaptureReceipt, read_capture_ledger, validate_capture_bindings
 from .contracts import (
     ASSESSMENT_ARTIFACT_REF_PATTERN,
     ASSESSMENT_ATTEMPT_ID_PATTERN,
@@ -17,6 +17,11 @@ from .contracts import (
     T12_ASSESSMENT_PRODUCER_ID,
     T12_ASSESSMENT_PRODUCER_VERSION,
     UNIT_KEY_PATTERN,
+)
+from .disposition_ledger import (
+    OperationalDispositionReceipt,
+    read_disposition_ledger,
+    validate_disposition_bindings,
 )
 from .session import SESSION_ID_PATTERN, load_session_manifest
 from .t12_jsonl import (
@@ -132,6 +137,21 @@ class DisplayPermit:
             )
         return self._attempt_id
 
+    def _validated_attempt_id_for_disposition(self) -> str:
+        try:
+            issuer = object.__getattribute__(self, "_issuer")
+        except AttributeError:
+            raise TypeError(
+                "display_permit was not issued by reserve_exposure"
+            ) from None
+        if type(self) is not DisplayPermit or issuer is not _PERMIT_ISSUER:
+            raise TypeError("display_permit was not issued by reserve_exposure")
+        if not self._consumed:
+            raise ExposureLedgerError(
+                "DisplayPermit must be consumed before disposition recording"
+            )
+        return self._attempt_id
+
 
 def read_exposure_ledger(
     path: str | os.PathLike[str],
@@ -185,6 +205,7 @@ def reserve_exposure(
     *,
     exposure_path: str | os.PathLike[str],
     capture_path: str | os.PathLike[str],
+    disposition_path: str | os.PathLike[str],
     artifact_store: ArtifactStore,
     session_root: str | os.PathLike[str],
     session_id: object,
@@ -194,9 +215,10 @@ def reserve_exposure(
     """Reserve one exact persisted manifest item, then issue a permit."""
     if not isinstance(artifact_store, ArtifactStore):
         raise TypeError("artifact_store must be an ArtifactStore")
-    history = _validate_paired_histories(
+    history, _, _ = validate_t12_histories(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path,
         artifact_store=artifact_store,
     )
     if type(item_ordinal) is not int or item_ordinal < 0:
@@ -250,9 +272,10 @@ def reserve_exposure(
 
     artifact_store.read(record.stimulus_artifact_ref)
     _append_exposure_record(exposure_path, record)
-    _validate_paired_histories(
+    validate_t12_histories(
         exposure_path=exposure_path,
         capture_path=capture_path,
+        disposition_path=disposition_path,
         artifact_store=artifact_store,
     )
     novel = novelty_for_reserved_attempt(exposure_path, record.attempt_id)
@@ -268,12 +291,28 @@ def _issue_display_permit(attempt_id: str, novel: bool) -> DisplayPermit:
     return permit
 
 
-def _validate_paired_histories(
+def validate_t12_histories(
     *,
     exposure_path: str | os.PathLike[str],
     capture_path: str | os.PathLike[str],
+    disposition_path: str | os.PathLike[str],
     artifact_store: ArtifactStore,
-) -> tuple[ExposureReservation, ...]:
+) -> tuple[
+    tuple[ExposureReservation, ...],
+    tuple[CaptureReceipt, ...],
+    tuple[OperationalDispositionReceipt, ...],
+]:
+    """Validate the complete D55+D60+D67 triple history as one shared boundary.
+
+    Every fresh durable write at the exposure/capture/disposition boundary
+    must validate through this one function: it is the sole authority for
+    exposure-ledger validity, capture-ledger validity and artifact bindings,
+    disposition-ledger validity and exposure/channel bindings, and
+    capture/disposition mutual exclusion. It does not validate D65
+    transcription-ledger writes or future EventLog writes.
+    """
+    if not isinstance(artifact_store, ArtifactStore):
+        raise TypeError("artifact_store must be an ArtifactStore")
     exposures = read_exposure_ledger(exposure_path)
     captures = read_capture_ledger(capture_path)
     validate_capture_bindings(
@@ -281,7 +320,16 @@ def _validate_paired_histories(
         exposure_attempt_ids=tuple(item.attempt_id for item in exposures),
         artifact_store=artifact_store,
     )
-    return exposures
+    dispositions = read_disposition_ledger(disposition_path)
+    validate_disposition_bindings(
+        dispositions,
+        exposure_attempt_ids=tuple(item.attempt_id for item in exposures),
+        exposure_channel_by_attempt_id={
+            item.attempt_id: item.channel for item in exposures
+        },
+        capture_attempt_ids=tuple(item.attempt_id for item in captures),
+    )
+    return exposures, captures, dispositions
 
 
 def _append_exposure_record(
