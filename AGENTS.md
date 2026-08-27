@@ -14,6 +14,8 @@ If these sources conflict, STOP and report the conflict. Do not resolve it by mo
 The following files are human-owned and must be treated as read-only unless the human explicitly says otherwise:
 
 - `vocab/contracts.py`
+- `vocab/card_contract.py`
+- `vocab/media_contract.py`
 - `vocab/models.py`
 - `vocab/validators.py`
 - `tests/test_contract_alignment.py`
@@ -63,6 +65,21 @@ Do not introduce:
 - silent fallback values
 - automatic slug generation for approved vocabulary units
 
+Do not automatically mutate Anki note types. In particular, do not call:
+
+- `updateModelTemplates`
+- `updateModelStyling`
+- `createModel`
+
+Deck configuration is human-owned. Never automatically create, update, delete,
+or assign Anki deck option presets, and never invoke deck-config mutation
+actions such as:
+
+- `saveDeckConfig`
+- `setDeckConfigId`
+- `cloneDeckConfigId`
+- `removeDeckConfigId`
+
 Anki is the source of truth for vocabulary notes.
 
 ## Data safety
@@ -77,6 +94,22 @@ When lifecycle logic requires dormancy:
 - clear only explicitly specified media fields
 
 Never invent missing identifiers, state, model metadata, source references, or vocabulary fields.
+
+## T8 hydration safety
+
+T8 makes no programmatic LLM call. ChatGPT context generation uses a
+human-mediated deterministic batch-file workflow. T8 uses no paid AI or TTS
+API; new Listening media is local Kokoro `audio_1` only.
+
+`audio_2` and `audio_3` are reserved opaque compatibility fields. T8 must
+never parse, validate, require, generate, clear, overwrite, or include them in
+a stale guard.
+
+For T8: never write a partial context bank; never use
+`VocabUnit.to_note_fields()` for partial hydration; never mutate `VisualCue`;
+never emit EventLog events in v0; never delete media automatically; never
+regenerate accepted context/audio automatically; and use no retries or
+fallbacks. Normal Anki review performs no AI or TTS work.
 
 ## Task scope
 

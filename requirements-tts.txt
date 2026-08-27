@@ -1,0 +1,2 @@
+kokoro==0.9.4
+lameenc==1.8.4

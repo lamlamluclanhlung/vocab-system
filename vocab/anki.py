@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import http.client
 import json
 import math
@@ -11,7 +12,17 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .contracts import ANKI_NOTE_TYPE_NAME, CARD_TEMPLATE_NAMES, NOTE_FIELDS
+from .anki_template import AnkiTemplateViolation, verify_model_snapshot
+from .contracts import (
+    ANKI_NOTE_TYPE_NAME,
+    IMMUTABLE_NOTE_FIELDS,
+    NOTE_FIELDS,
+)
+from .leech import (
+    LeechConfigViolation,
+    verify_leech_config as verify_leech_config_snapshot,
+)
+
 from .models import VocabUnit
 
 
@@ -83,6 +94,37 @@ class AnkiNoteCreationError(AnkiConnectError):
 
 class AnkiNoteTypeMismatchError(AnkiConnectError):
     """Raised when the installed VocabularyUnit note type violates contracts."""
+
+
+class AnkiCardTemplateError(AnkiNoteTypeMismatchError):
+    """Raised with all deterministic note-type semantic violations."""
+
+    def __init__(
+        self,
+        violations: Sequence[AnkiTemplateViolation],
+    ) -> None:
+        self.violations = tuple(violations)
+        super().__init__(
+            "Anki note type semantic verification failed: "
+            + "; ".join(str(violation) for violation in self.violations)
+        )
+
+
+class AnkiLeechConfigMismatchError(AnkiConnectError):
+    """Raised with all deterministic leech-configuration violations."""
+
+    def __init__(
+        self,
+        violations: Sequence[LeechConfigViolation],
+    ) -> None:
+        self.violations = tuple(violations)
+        super().__init__(
+            "Anki leech configuration verification failed: "
+            + "; ".join(
+                f"{violation.code}: {violation.message}"
+                for violation in self.violations
+            )
+        )
 
 
 class AnkiConnectClient:
@@ -213,6 +255,20 @@ class AnkiConnectClient:
             )
         return result
 
+    def cards_info(self, card_ids: Sequence[int]) -> list[dict[str, Any]]:
+        """Return current Anki card information for explicit card IDs."""
+        cards = self._normalize_ids("card_ids", card_ids)
+        result = self._invoke("cardsInfo", {"cards": cards})
+        if not isinstance(result, list) or any(
+            not isinstance(item, dict) for item in result
+        ):
+            raise AnkiResponseError(
+                "cardsInfo",
+                "result must be a list of card objects",
+                response=result,
+            )
+        return result
+
     def update_note_fields(
         self,
         note_id: int,
@@ -230,6 +286,14 @@ class AnkiConnectClient:
             raise ValueError(
                 f"unknown VocabularyUnit fields: {tuple(sorted(unknown_fields))}"
             )
+        
+        immutable_fields = set(fields).intersection(IMMUTABLE_NOTE_FIELDS)
+        if immutable_fields:
+            raise ValueError(
+                "immutable VocabularyUnit fields cannot be updated: "
+                f"{tuple(sorted(immutable_fields))}"
+            )
+        
         if any(not isinstance(value, str) for value in fields.values()):
             raise TypeError("field values must be strings")
 
@@ -297,51 +361,82 @@ class AnkiConnectClient:
             )
         return result
 
+    def retrieve_media_file(self, filename: str) -> bytes | None:
+        """Retrieve exact media bytes, or None when Anki reports no file."""
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("filename must be a non-empty string")
+
+        result = self._invoke(
+            "retrieveMediaFile",
+            {"filename": filename},
+        )
+        if result is False:
+            return None
+        if not isinstance(result, str):
+            raise AnkiResponseError(
+                "retrieveMediaFile",
+                "result must be false or a base64 string",
+                response=result,
+            )
+        try:
+            return base64.b64decode(result, validate=True)
+        except (binascii.Error, ValueError):
+            raise AnkiResponseError(
+                "retrieveMediaFile",
+                "result must be strict base64",
+                response=result,
+            ) from None
+
+    def get_deck_config(self, deck_name: str) -> dict[str, Any]:
+        """Return one caller-selected deck's Anki option configuration."""
+        if not isinstance(deck_name, str) or not deck_name:
+            raise ValueError("deck_name must be a non-empty string")
+
+        result = self._invoke("getDeckConfig", {"deck": deck_name})
+        if not isinstance(result, Mapping):
+            raise AnkiResponseError(
+                "getDeckConfig",
+                "result must be a deck configuration object",
+                response=result,
+            )
+        return dict(result)
+
+    def verify_leech_config(self, deck_name: str) -> bool:
+        """Read and verify one deck's leech options without mutation."""
+        config = self.get_deck_config(deck_name)
+        violations = verify_leech_config_snapshot(config)
+        if violations:
+            raise AnkiLeechConfigMismatchError(violations)
+        return True
+
+    def verified_note_type_snapshot(self) -> dict[str, Any]:
+        """Return the complete verified VocabularyUnit model snapshot."""
+        models = self._invoke(
+            "findModelsByName",
+            {"modelNames": [ANKI_NOTE_TYPE_NAME]},
+        )
+        if not isinstance(models, list) or any(
+            not isinstance(model, dict) for model in models
+        ):
+            raise AnkiResponseError(
+                "findModelsByName",
+                "result must be a list of model objects",
+                response=models,
+            )
+        if len(models) != 1:
+            raise AnkiNoteTypeMismatchError(
+                f"findModelsByName must return exactly one "
+                f"{ANKI_NOTE_TYPE_NAME!r} model, received {len(models)}"
+            )
+
+        violations = verify_model_snapshot(models[0])
+        if violations:
+            raise AnkiCardTemplateError(violations)
+        return models[0]
+
     def verify_note_type(self) -> bool:
-        """Verify the frozen field order and template-name set without repair."""
-        fields = self._invoke(
-            "modelFieldNames",
-            {"modelName": ANKI_NOTE_TYPE_NAME},
-        )
-        if not isinstance(fields, list) or any(
-            not isinstance(field_name, str) for field_name in fields
-        ):
-            raise AnkiResponseError(
-                "modelFieldNames",
-                "result must be a list of field names",
-                response=fields,
-            )
-        if tuple(fields) != NOTE_FIELDS:
-            missing = tuple(field for field in NOTE_FIELDS if field not in fields)
-            extra = tuple(field for field in fields if field not in NOTE_FIELDS)
-            raise AnkiNoteTypeMismatchError(
-                f"Anki note type {ANKI_NOTE_TYPE_NAME!r} field order does not "
-                f"match NOTE_FIELDS; missing={missing}, extra={extra}, "
-                f"expected={NOTE_FIELDS}, actual={tuple(fields)}"
-            )
-
-        templates = self._invoke(
-            "modelTemplates",
-            {"modelName": ANKI_NOTE_TYPE_NAME},
-        )
-        if not isinstance(templates, dict) or any(
-            not isinstance(template_name, str) for template_name in templates
-        ):
-            raise AnkiResponseError(
-                "modelTemplates",
-                "result must be an object keyed by template name",
-                response=templates,
-            )
-
-        actual_names = set(templates)
-        expected_names = set(CARD_TEMPLATE_NAMES)
-        if actual_names != expected_names:
-            raise AnkiNoteTypeMismatchError(
-                f"Anki note type {ANKI_NOTE_TYPE_NAME!r} template names do not "
-                f"match CARD_TEMPLATE_NAMES; missing="
-                f"{tuple(sorted(expected_names - actual_names))}, extra="
-                f"{tuple(sorted(actual_names - expected_names))}"
-            )
+        """Read and verify the complete note-type snapshot without repair."""
+        self.verified_note_type_snapshot()
         return True
 
     @staticmethod

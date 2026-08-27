@@ -13,13 +13,23 @@ import pytest
 import vocab.anki as anki_module
 from vocab.anki import (
     AnkiAPIError,
+    AnkiCardTemplateError,
     AnkiConnectClient,
     AnkiConnectionError,
+    AnkiLeechConfigMismatchError,
     AnkiNoteCreationError,
     AnkiNoteTypeMismatchError,
     AnkiResponseError,
 )
-from vocab.contracts import ANKI_NOTE_TYPE_NAME, CARD_TEMPLATE_NAMES, NOTE_FIELDS
+from vocab.card_contract import GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME
+from vocab.contracts import (
+    ANKI_NOTE_TYPE_NAME,
+    ANKI_SORT_FIELD,
+    CARD_TEMPLATE_NAMES,
+    IMMUTABLE_NOTE_FIELDS,
+    NOTE_FIELDS,
+    TARGET_FIELD_BY_CHANNEL,
+)
 from vocab.models import VocabUnit
 
 
@@ -233,6 +243,21 @@ def test_update_note_fields_maps_explicit_subset(monkeypatch) -> None:
     }
 
 
+@pytest.mark.parametrize("field_name", IMMUTABLE_NOTE_FIELDS)
+def test_update_note_fields_rejects_immutable_identity_before_http(
+    monkeypatch,
+    field_name,
+) -> None:
+    calls = install_responses(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="immutable"):
+        AnkiConnectClient().update_note_fields(
+            17,
+            {field_name: "changed-identity"},
+        )
+
+    assert calls == []
+
 def test_suspend_uses_card_ids(monkeypatch) -> None:
     calls = install_responses(monkeypatch, [response_body(True)])
 
@@ -261,6 +286,123 @@ def test_get_revlog_maps_to_get_reviews_of_cards(monkeypatch) -> None:
         "version": 6,
         "params": {"cards": [201]},
     }
+
+
+def valid_deck_config() -> dict[str, Any]:
+    return {
+        "id": 1723456789,
+        "name": "Runtime preset",
+        "lapse": {"leechFails": 4, "leechAction": 1},
+    }
+
+
+def test_get_deck_config_uses_exact_action_and_supplied_deck(
+    monkeypatch,
+) -> None:
+    config = valid_deck_config()
+    calls = install_responses(monkeypatch, [response_body(config)])
+
+    assert AnkiConnectClient().get_deck_config("Vocabulary Runtime") == config
+    assert len(calls) == 1
+    assert request_envelope(calls[0]) == {
+        "action": "getDeckConfig",
+        "version": 6,
+        "params": {"deck": "Vocabulary Runtime"},
+    }
+
+
+@pytest.mark.parametrize("result", [False, None, [], "bad result"])
+def test_get_deck_config_rejects_non_mapping_result(
+    monkeypatch,
+    result,
+) -> None:
+    install_responses(monkeypatch, [response_body(result)])
+
+    with pytest.raises(AnkiResponseError) as captured:
+        AnkiConnectClient().get_deck_config("Vocabulary Runtime")
+
+    assert captured.value.action == "getDeckConfig"
+    assert captured.value.response == result
+
+
+def test_get_deck_config_connection_error_remains_connection_error(
+    monkeypatch,
+) -> None:
+    cause = urllib.error.URLError("connection refused")
+
+    def fail(*args, **kwargs):
+        raise cause
+
+    monkeypatch.setattr(anki_module.urllib.request, "urlopen", fail)
+
+    with pytest.raises(AnkiConnectionError) as captured:
+        AnkiConnectClient().get_deck_config("Vocabulary Runtime")
+
+    assert captured.value.action == "getDeckConfig"
+    assert captured.value.cause is cause
+
+
+def test_get_deck_config_does_not_retry(monkeypatch) -> None:
+    attempts = 0
+
+    def fail(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(anki_module.urllib.request, "urlopen", fail)
+
+    with pytest.raises(AnkiConnectionError):
+        AnkiConnectClient().get_deck_config("Vocabulary Runtime")
+
+    assert attempts == 1
+
+
+@pytest.mark.parametrize("deck_name", ["", None])
+def test_get_deck_config_rejects_invalid_deck_name_before_http(
+    monkeypatch,
+    deck_name,
+) -> None:
+    calls = install_responses(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        AnkiConnectClient().get_deck_config(deck_name)
+
+    assert calls == []
+
+
+def test_verify_leech_config_accepts_valid_readback(monkeypatch) -> None:
+    calls = install_responses(
+        monkeypatch,
+        [response_body(valid_deck_config())],
+    )
+
+    assert AnkiConnectClient().verify_leech_config("Vocabulary Runtime") is True
+    assert [request_envelope(call)["action"] for call in calls] == [
+        "getDeckConfig"
+    ]
+
+
+def test_verify_leech_config_exposes_all_violations_without_writes(
+    monkeypatch,
+) -> None:
+    config = valid_deck_config()
+    config["lapse"]["leechFails"] = 8
+    config["lapse"]["leechAction"] = 0
+    calls = install_responses(monkeypatch, [response_body(config)])
+
+    with pytest.raises(AnkiLeechConfigMismatchError) as captured:
+        AnkiConnectClient().verify_leech_config("Vocabulary Runtime")
+
+    assert tuple(
+        violation.code for violation in captured.value.violations
+    ) == (
+        "L7_THRESHOLD_MISMATCH",
+        "L7_ACTION_SUSPEND",
+    )
+    assert [request_envelope(call)["action"] for call in calls] == [
+        "getDeckConfig"
+    ]
 
 
 def test_store_media_file_encodes_bytes_and_disables_overwrite(monkeypatch) -> None:
@@ -309,28 +451,146 @@ def test_add_notes_fails_closed_for_partial_or_failed_creation(
     assert captured.value.result == result
 
 
-def install_valid_note_type(monkeypatch, templates=None):
-    if templates is None:
-        templates = {name: {} for name in CARD_TEMPLATE_NAMES}
+def valid_note_type_snapshot() -> dict[str, Any]:
+    field_ordinals = {name: index for index, name in enumerate(NOTE_FIELDS)}
+    templates = []
+    requirements = []
+    for ordinal, name in enumerate(CARD_TEMPLATE_NAMES):
+        target = TARGET_FIELD_BY_CHANNEL[name]
+        content = {
+            "R": "Ctx_1",
+            "L": "audio_1",
+        }.get(name, "lemma")
+        templates.append(
+            {
+                "name": name,
+                "ord": ordinal,
+                "qfmt": (
+                    f"{{{{#{target}}}}}{{{{{content}}}}}"
+                    f"{{{{/{target}}}}}"
+                ),
+                "afmt": "{{FrontSide}}{{definition_en}}",
+            }
+        )
+        generation_fields = GENERATION_REQUIREMENTS_BY_TEMPLATE_NAME[name]
+        requirements.append(
+            [
+                ordinal,
+                "all" if len(generation_fields) > 1 else "any",
+                [field_ordinals[field] for field in generation_fields],
+            ]
+        )
+    return {
+        "id": 1704387367119,
+        "name": ANKI_NOTE_TYPE_NAME,
+        "sortf": field_ordinals[ANKI_SORT_FIELD],
+        "flds": [
+            {"name": name, "ord": ordinal}
+            for ordinal, name in enumerate(NOTE_FIELDS)
+        ],
+        "tmpls": templates,
+        "req": requirements,
+        "css": ".card { color: black; }",
+    }
+
+
+def test_retrieve_media_file_decodes_strict_base64(monkeypatch) -> None:
+    raw = b"\x00audio\xff"
+    calls = install_responses(
+        monkeypatch,
+        [response_body(base64.b64encode(raw).decode("ascii"))],
+    )
+
+    assert AnkiConnectClient().retrieve_media_file("clip.mp3") == raw
+    assert request_envelope(calls[0]) == {
+        "action": "retrieveMediaFile",
+        "version": 6,
+        "params": {"filename": "clip.mp3"},
+    }
+
+
+def test_retrieve_media_file_false_means_missing(monkeypatch) -> None:
+    install_responses(monkeypatch, [response_body(False)])
+
+    assert AnkiConnectClient().retrieve_media_file("missing.mp3") is None
+
+
+def test_retrieve_media_file_empty_base64_is_empty_bytes(monkeypatch) -> None:
+    install_responses(monkeypatch, [response_body("")])
+
+    assert AnkiConnectClient().retrieve_media_file("empty.mp3") == b""
+
+
+@pytest.mark.parametrize("result", [True, None, [], {}, 7])
+def test_retrieve_media_file_rejects_non_string_results(
+    monkeypatch,
+    result,
+) -> None:
+    install_responses(monkeypatch, [response_body(result)])
+
+    with pytest.raises(AnkiResponseError, match="base64 string"):
+        AnkiConnectClient().retrieve_media_file("clip.mp3")
+
+
+def test_retrieve_media_file_rejects_invalid_base64(monkeypatch) -> None:
+    install_responses(monkeypatch, [response_body("not base64!")])
+
+    with pytest.raises(AnkiResponseError, match="strict base64"):
+        AnkiConnectClient().retrieve_media_file("clip.mp3")
+
+
+def test_retrieve_media_file_connection_failure_has_one_attempt(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    def fail_urlopen(_request, *, timeout):
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(anki_module.urllib.request, "urlopen", fail_urlopen)
+
+    with pytest.raises(AnkiConnectionError):
+        AnkiConnectClient().retrieve_media_file("clip.mp3")
+
+    assert attempts == 1
+
+
+@pytest.mark.parametrize("filename", ["", None])
+def test_retrieve_media_file_rejects_invalid_filename_before_http(
+    monkeypatch,
+    filename,
+) -> None:
+    calls = install_responses(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        AnkiConnectClient().retrieve_media_file(filename)
+
+    assert calls == []
+
+
+def install_valid_note_type(monkeypatch, model=None):
+    if model is None:
+        model = valid_note_type_snapshot()
     return install_responses(
         monkeypatch,
-        [response_body(list(NOTE_FIELDS)), response_body(templates)],
+        [response_body([model])],
     )
 
 
 def test_verify_note_type_accepts_frozen_contract(monkeypatch) -> None:
+    # Deliberate contract hardening: empty template dictionaries used to pass
+    # this test, which was the semantic-verification gap addressed by D25.
     calls = install_valid_note_type(monkeypatch)
 
     assert AnkiConnectClient().verify_note_type() is True
     assert [request_envelope(call)["action"] for call in calls] == [
-        "modelFieldNames",
-        "modelTemplates",
+        "findModelsByName",
     ]
-    assert all(
-        request_envelope(call)["params"]
-        == {"modelName": ANKI_NOTE_TYPE_NAME}
-        for call in calls
-    )
+    assert request_envelope(calls[0])["params"] == {
+        "modelNames": [ANKI_NOTE_TYPE_NAME]
+    }
 
 
 @pytest.mark.parametrize(
@@ -343,37 +603,88 @@ def test_verify_note_type_accepts_frozen_contract(monkeypatch) -> None:
     ids=["missing", "extra", "reordered"],
 )
 def test_verify_note_type_rejects_field_mismatch(monkeypatch, fields) -> None:
-    install_responses(monkeypatch, [response_body(fields)])
+    model = valid_note_type_snapshot()
+    model["flds"] = [
+        {"name": name, "ord": ordinal}
+        for ordinal, name in enumerate(fields)
+    ]
+    install_valid_note_type(monkeypatch, model)
 
     with pytest.raises(AnkiNoteTypeMismatchError, match="field order"):
         AnkiConnectClient().verify_note_type()
 
 
 @pytest.mark.parametrize(
-    "templates",
+    "change",
     [
-        {name: {} for name in CARD_TEMPLATE_NAMES[:-1]},
-        {**{name: {} for name in CARD_TEMPLATE_NAMES}, "Extra": {}},
+        "missing",
+        "extra",
+        "renamed",
     ],
-    ids=["missing", "extra"],
+    ids=["missing", "extra", "renamed"],
 )
 def test_verify_note_type_rejects_template_name_mismatch(
     monkeypatch,
-    templates,
+    change,
 ) -> None:
-    install_responses(
-        monkeypatch,
-        [response_body(list(NOTE_FIELDS)), response_body(templates)],
-    )
+    model = valid_note_type_snapshot()
+    templates = model["tmpls"]
+    if change == "missing":
+        templates.pop()
+    elif change == "extra":
+        templates.append(
+            {
+                "name": "Extra",
+                "ord": 99,
+                "qfmt": "extra",
+                "afmt": "extra",
+            }
+        )
+    else:
+        templates[0]["name"] = "Renamed"
+    install_valid_note_type(monkeypatch, model)
 
     with pytest.raises(AnkiNoteTypeMismatchError, match="template names"):
         AnkiConnectClient().verify_note_type()
 
 
-def test_verify_note_type_ignores_template_ordinal_and_response_order(
+def test_verify_note_type_ignores_template_response_order(
     monkeypatch,
 ) -> None:
-    templates = {name: {} for name in ("S", "W", "R", "L")}
-    install_valid_note_type(monkeypatch, templates)
+    model = valid_note_type_snapshot()
+    model["tmpls"] = list(reversed(model["tmpls"]))
+    install_valid_note_type(monkeypatch, model)
 
     assert AnkiConnectClient().verify_note_type() is True
+
+
+def test_verify_note_type_exposes_all_semantic_violations(monkeypatch) -> None:
+    model = valid_note_type_snapshot()
+    model["tmpls"][0]["qfmt"] = ""
+    model["tmpls"][0]["afmt"] = ""
+    install_valid_note_type(monkeypatch, model)
+
+    with pytest.raises(AnkiCardTemplateError) as captured:
+        AnkiConnectClient().verify_note_type()
+
+    violation_codes = tuple(
+        violation.code for violation in captured.value.violations
+    )
+    assert "TEMPLATE_FRONT_EMPTY" in violation_codes
+    assert "TEMPLATE_BACK_EMPTY" in violation_codes
+
+
+def test_verify_note_type_does_not_fallback_when_rich_api_is_unsupported(
+    monkeypatch,
+) -> None:
+    calls = install_responses(
+        monkeypatch,
+        [response_body(None, "unsupported action")],
+    )
+
+    with pytest.raises(AnkiAPIError, match="unsupported action"):
+        AnkiConnectClient().verify_note_type()
+
+    assert [request_envelope(call)["action"] for call in calls] == [
+        "findModelsByName"
+    ]

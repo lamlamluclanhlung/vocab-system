@@ -6,6 +6,8 @@ from dataclasses import fields
 from vocab.contracts import (
     CARD_TEMPLATE_NAMES,
     CHANNEL_BY_TEMPLATE_NAME,
+    EVENT_SCHEMA_VERSION,
+    EVENT_TYPES,
     EVENT_REQUIRED_FIELDS,
     NOTE_FIELDS,
     STATE_FIELDS,
@@ -17,6 +19,8 @@ from vocab.contracts import (
     ANKI_SORT_FIELD,
     NOVEL_CONTEXT_FIELDS,
     TARGET_FLAG_VALUE,
+    T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS,
+    T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS,
     EVENT_PAYLOAD_REQUIRED_FIELDS,
     SOURCE_REF_KINDS,
     STABLE_MIN_AGE_DAYS,
@@ -24,7 +28,15 @@ from vocab.contracts import (
     STATE_EVENT_REQUIRED_PAYLOAD_FIELDS,
     UNIT_TYPE_VALUES,
 )
-from vocab.models import ChannelProgress, ForgeCandidate, UnitProgress, VocabUnit
+from vocab.models import (
+    ChannelProgress,
+    ForgeCandidate,
+    PlannedTransition,
+    ReconcileDecision,
+    ReconcileRunResult,
+    UnitProgress,
+    VocabUnit,
+)
 
 
 def make_unit() -> VocabUnit:
@@ -177,20 +189,68 @@ def test_card_template_names_map_stably_to_channels() -> None:
 
 
 def test_per_channel_transition_gate_data_lives_on_channel_progress() -> None:
-    channel_field_names = {item.name for item in fields(ChannelProgress)}
-    unit_field_names = {item.name for item in fields(UnitProgress)}
+    channel_field_names = tuple(item.name for item in fields(ChannelProgress))
+    unit_field_names = tuple(item.name for item in fields(UnitProgress))
 
-    per_channel_gate_fields = {
-        "session_passes_consecutive",
-        "last_session_date",
-        "last_session_result",
-        "encountered_and_failed",
-        "corpus_misuse_detected",
-    }
+    assert channel_field_names == (
+        "channel",
+        "state",
+        "card_id",
+        "template_name",
+        "template_ordinal",
+        "interval_days",
+        "lapses_total",
+        "lapses_last_30_days",
+        "age_days",
+        "is_suspended",
+        "first_lifecycle_review_id",
+        "latest_lifecycle_review_id",
+        "latest_lapse_review_id",
+        "state_episode_id",
+        "state_entered_at",
+        "first_lifecycle_review_after_state_entry_id",
+        "first_lapse_after_state_entry_id",
+        "assessments",
+    )
+    assert unit_field_names == (
+        "unit_key",
+        "channels",
+        "all_active_channels_mastered_at",
+        "has_leech_tag",
+    )
+    assert "state" not in unit_field_names
 
-    assert per_channel_gate_fields.issubset(channel_field_names)
-    assert per_channel_gate_fields.isdisjoint(unit_field_names)
-    assert "failed_channels" not in unit_field_names
+
+def test_reconcile_decision_does_not_persist_aggregate_state() -> None:
+    assert tuple(item.name for item in fields(PlannedTransition)) == (
+        "channel",
+        "from_state",
+        "to_state",
+        "trigger",
+        "from_episode_id",
+        "evidence",
+        "transition_id",
+        "transition_group_id",
+    )
+    decision_fields = tuple(item.name for item in fields(ReconcileDecision))
+    assert decision_fields == (
+        "unit_key",
+        "transitions",
+        "suspend_card_ids",
+        "reactivation_required_card_ids",
+        "leech_rescue_channels",
+    )
+    assert "state" not in decision_fields
+    run_result_fields = tuple(item.name for item in fields(ReconcileRunResult))
+    assert run_result_fields == (
+        "unit_key",
+        "committed_transition_ids",
+        "recovered_transition_ids",
+        "aborted_transition_ids",
+        "reactivation_required_card_ids",
+        "leech_rescue_channels",
+    )
+    assert "state" not in run_result_fields
 
 def test_anki_note_type_contract_is_stable() -> None:
     assert ANKI_NOTE_TYPE_NAME == "VocabularyUnit"
@@ -254,6 +314,26 @@ def test_event_payload_minimums_are_frozen() -> None:
     assert (
         STATE_EVENT_REQUIRED_PAYLOAD_FIELDS
         == EVENT_PAYLOAD_REQUIRED_FIELDS["STATE"]
+    )
+
+
+def test_t10_encounter_requirements_extend_generic_v1_without_changing_it() -> None:
+    generic_fields = EVENT_PAYLOAD_REQUIRED_FIELDS["ENCOUNTER"]
+    assert generic_fields == ("count", "source", "month")
+    assert T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS[:3] == generic_fields
+    assert set(generic_fields) < set(T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS)
+    assert set(T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS) == set(
+        T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+    )
+    assert "registry_snapshot_digest" not in T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+    assert EVENT_SCHEMA_VERSION == 1
+    assert EVENT_TYPES == (
+        "REVIEW",
+        "JUDGE",
+        "FORGE",
+        "STATE",
+        "SPEAK",
+        "ENCOUNTER",
     )
 
 

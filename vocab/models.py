@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .contracts import (
+    ASSESSMENT_OUTCOME_PASS,
     DERIVED_STATE_PRIORITY,
     STATE_UNKNOWN,
     STATES,
@@ -328,6 +329,20 @@ class ForgeRejection:
 
 
 @dataclass(frozen=True, slots=True)
+class LifecycleAssessment:
+    """One channel-scoped JUDGE observation eligible for T9 evaluation."""
+
+    channel: str
+    passed: bool
+    assessment_id: str
+    stimulus_ref: str
+    novel: bool
+    ts: str
+    model_id: str
+    model_version: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChannelProgress:
     """
     Observed review/assessment state for one enabled target channel.
@@ -339,16 +354,23 @@ class ChannelProgress:
 
     channel: str
     state: str
+    card_id: int
+    template_name: str
+    template_ordinal: int
     interval_days: int
+    lapses_total: int
     lapses_last_30_days: int
     age_days: int
+    is_suspended: bool
 
-    session_passes_consecutive: int = 0
-    last_session_date: str = ""
-    last_session_result: str = "NONE"  # PASS | FAIL | NONE
-
-    encountered_and_failed: bool = False
-    corpus_misuse_detected: bool = False
+    first_lifecycle_review_id: int | None = None
+    latest_lifecycle_review_id: int | None = None
+    latest_lapse_review_id: int | None = None
+    state_episode_id: str = ""
+    state_entered_at: str = ""
+    first_lifecycle_review_after_state_entry_id: int | None = None
+    first_lapse_after_state_entry_id: int | None = None
+    assessments: tuple[LifecycleAssessment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,8 +384,45 @@ class UnitProgress:
 
     unit_key: str
     channels: tuple[ChannelProgress, ...] = ()
-    days_all_active_channels_mastered: int = 0
+    all_active_channels_mastered_at: str = ""
     has_leech_tag: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedTransition:
+    """One deterministic, unmaterialized per-channel lifecycle transition."""
+
+    channel: str
+    from_state: str
+    to_state: str
+    trigger: str
+    from_episode_id: str
+    evidence: dict[str, Any]
+    transition_id: str
+    transition_group_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileDecision:
+    """Pure one-step T9 reconciliation output with no persistence effects."""
+
+    unit_key: str
+    transitions: tuple[PlannedTransition, ...] = ()
+    suspend_card_ids: tuple[int, ...] = ()
+    reactivation_required_card_ids: tuple[int, ...] = ()
+    leech_rescue_channels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileRunResult:
+    """Materialization/recovery outcome for one automatic reconciliation run."""
+
+    unit_key: str
+    committed_transition_ids: tuple[str, ...] = ()
+    recovered_transition_ids: tuple[str, ...] = ()
+    aborted_transition_ids: tuple[str, ...] = ()
+    reactivation_required_card_ids: tuple[int, ...] = ()
+    leech_rescue_channels: tuple[str, ...] = ()
 
 
 # ============================================================
@@ -382,7 +441,27 @@ class EncounterResult:
 
 
 # ============================================================
-# 7. JUDGE RESULTS
+# 7. T11 ASSESSMENT RESULT
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class T11AssessmentResult:
+    """Pure result for the D51-D58 T11 assessment protocol."""
+
+    unit_key: str
+    channel: str
+    outcome: str
+    failure_code: str = ""
+    reason_code: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.outcome == ASSESSMENT_OUTCOME_PASS
+
+
+# ============================================================
+# 8. JUDGE RESULTS
 # ============================================================
 
 

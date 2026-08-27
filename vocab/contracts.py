@@ -32,9 +32,9 @@ UNIT_KEY_SEPARATOR: Final[str] = "::"
 # - alphanumeric segments separated by "-"
 # - lemma_slug and sense_slug are human-approved once at creation time;
 #   no automatic slug regeneration is allowed later.
-_SLUG_PATTERN: Final[str] = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+SLUG_PATTERN: Final[str] = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 UNIT_KEY_PATTERN: Final[str] = (
-    rf"^{_SLUG_PATTERN}{re.escape(UNIT_KEY_SEPARATOR)}{_SLUG_PATTERN}$"
+    rf"^{SLUG_PATTERN}{re.escape(UNIT_KEY_SEPARATOR)}{SLUG_PATTERN}$"
 )
 
 
@@ -79,6 +79,15 @@ NOTE_FIELDS: Final[tuple[str, ...]] = (
 
 UNIQUE_NOTE_FIELD: Final[str] = "unit_key"
 
+# Stable note identity is assigned once at creation time.
+# Changing any of these fields would change the identity of the Unit rather
+# than update its mutable learning state.
+IMMUTABLE_NOTE_FIELDS: Final[tuple[str, ...]] = (
+    "unit_key",
+    "lemma_slug",
+    "sense_slug",
+)
+
 CHANNELS: Final[tuple[str, ...]] = ("R", "L", "W", "S")
 
 TARGET_FIELDS: Final[tuple[str, ...]] = (
@@ -120,10 +129,21 @@ CHANNEL_BY_TEMPLATE_NAME: Final[dict[str, str]] = {
 
 DEFAULT_TARGET_FIELD: Final[str] = "Target_R"
 TARGET_FLAG_VALUE: Final[str] = "1"
+TARGET_FLAG_VALUES: Final[tuple[str, ...]] = (
+    "",
+    TARGET_FLAG_VALUE,
+)
+# Productive-channel targeting requires explicit provenance from FORGE.
+# The justification is NOT stored in the Anki note. It belongs in the
+# FORGE event payload so the note keeps current state while the event log
+# preserves why W/S was enabled.
+TARGET_CHANNELS_REQUIRING_JUSTIFICATION: Final[tuple[str, ...]] = (
+    "W",
+    "S",
+)
 
-TARGET_FIELDS_REQUIRING_JUSTIFICATION: Final[tuple[str, ...]] = (
-    "Target_W",
-    "Target_S",
+FORGE_TARGET_JUSTIFICATION_PAYLOAD_FIELD: Final[str] = (
+    "target_justification"
 )
 
 CONTEXT_FIELDS: Final[tuple[str, ...]] = (
@@ -164,9 +184,124 @@ UNIT_TYPE_VALUES: Final[tuple[str, ...]] = (
     "frame",
 )
 
+# Shared deterministic Unit-matching contract for T5 validation and
+# T10 corpus scanning.
+
+TEXT_NORMALIZATION_FORM: Final[str] = "NFKC"
+
+# Normalize these common Unicode apostrophe forms to ASCII apostrophe
+# before tokenization.
+APOSTROPHE_EQUIVALENTS: Final[tuple[str, ...]] = (
+    "\u2018",  # LEFT SINGLE QUOTATION MARK
+    "\u2019",  # RIGHT SINGLE QUOTATION MARK
+    "\u02bc",  # MODIFIER LETTER APOSTROPHE
+    "\uff07",  # FULLWIDTH APOSTROPHE
+)
+
+CANONICAL_APOSTROPHE: Final[str] = "'"
+
+# One lexical token:
+# - Unicode letters/digits are allowed;
+# - underscore is not lexical content;
+# - apostrophe may occur only inside the token.
+#
+# Examples:
+# don't -> one token
+# state-of-the-art -> four tokens
+LEXICAL_TOKEN_PATTERN: Final[str] = (
+    r"[^\W_]+(?:'[^\W_]+)*"
+)
+
+CHUNK_MAX_INSERTED_TOKENS: Final[int] = 2
+
+FRAME_PLACEHOLDER: Final[str] = "___"
+FRAME_PLACEHOLDER_COUNT: Final[int] = 1
+FRAME_MIN_FIXED_TOKENS: Final[int] = 2
+FRAME_SLOT_MIN_TOKENS: Final[int] = 1
+FRAME_SLOT_MAX_TOKENS: Final[int] = 6
+
 SOURCE_REF_KINDS: Final[tuple[str, ...]] = (
     "dictionary",
     "corpus",
+)
+
+# Internal evidence reference:
+# <kind>:<namespace>:<resource-id>
+#
+# Examples:
+# dictionary:cambridge:subtle
+# corpus:ragtrust-papers:2405-12345
+#
+# This contract validates reference syntax only. Validators must not resolve
+# the reference or require the underlying resource to exist.
+_SOURCE_REF_KIND_PATTERN: Final[str] = "|".join(
+    re.escape(kind) for kind in SOURCE_REF_KINDS
+)
+
+_SOURCE_REF_NAMESPACE_PATTERN: Final[str] = (
+    r"[a-z0-9]+(?:-[a-z0-9]+)*"
+)
+
+_SOURCE_REF_RESOURCE_PATTERN: Final[str] = (
+    r"[a-z0-9][a-z0-9._-]*"
+)
+
+SOURCE_REF_PATTERN: Final[str] = (
+    rf"^(?:{_SOURCE_REF_KIND_PATTERN}):"
+    rf"{_SOURCE_REF_NAMESPACE_PATTERN}:"
+    rf"{_SOURCE_REF_RESOURCE_PATTERN}$"
+)
+
+CONTEXT_VIOLATION_CODES: Final[tuple[str, ...]] = (
+    "C_CTX_1_EMPTY",
+    "C_CTX_2_EMPTY",
+    "C_CTX_3_EMPTY",
+    "C_CTX_4_EMPTY",
+    "C_CTX_5_EMPTY",
+    "C_CTX_1_UNIT_MISSING",
+    "C_CTX_2_UNIT_MISSING",
+    "C_CTX_3_UNIT_MISSING",
+    "C_CTX_4_UNIT_MISSING",
+    "C_CTX_5_UNIT_MISSING",
+    "C_CTX_1_TOO_SHORT",
+    "C_CTX_2_TOO_SHORT",
+    "C_CTX_3_TOO_SHORT",
+    "C_CTX_4_TOO_SHORT",
+    "C_CTX_5_TOO_SHORT",
+    "C_CONTEXTS_NOT_DISTINCT",
+    "C_CTX_1_SOURCE_COPY",
+    "C_CTX_2_SOURCE_COPY",
+    "C_CTX_3_SOURCE_COPY",
+    "C_CTX_4_SOURCE_COPY",
+    "C_CTX_5_SOURCE_COPY",
+)   
+
+FORGE_VIOLATION_CODES: Final[tuple[str, ...]] = (
+    "F_LEMMA_SLUG_INVALID",
+    "F_SENSE_SLUG_INVALID",
+    "F_UNIT_KEY_INVALID",
+    "F_UNIT_KEY_MISMATCH",
+    "F_LEMMA_EMPTY",
+    "F_UNIT_TYPE_INVALID",
+    "F_UNIT_SHAPE_INVALID",
+    "F_TARGET_R_INVALID",
+    "F_TARGET_L_INVALID",
+    "F_TARGET_W_INVALID",
+    "F_TARGET_S_INVALID",
+    "F_NO_TARGET_ENABLED",
+    "F_STATE_R_INVALID",
+    "F_STATE_L_INVALID",
+    "F_STATE_W_INVALID",
+    "F_STATE_S_INVALID",
+    "F_TARGET_STATE_R_MISMATCH",
+    "F_TARGET_STATE_L_MISMATCH",
+    "F_TARGET_STATE_W_MISMATCH",
+    "F_TARGET_STATE_S_MISMATCH",
+    "F_REGISTER_INVALID",
+    "F_DEFINITION_EMPTY",
+    "F_SOURCE_REF_INVALID",
+    "F_SOURCE_SENTENCE_EMPTY",
+    "F_SOURCE_UNIT_MISSING",
 )
 
 DEFINITION_FIELD: Final[str] = "definition_en"
@@ -183,6 +318,7 @@ CTX_MUST_BE_PAIRWISE_DISTINCT: Final[bool] = True
 CTX_MAX_SOURCE_TOKEN_OVERLAP: Final[float] = 0.60
 CTX_OVERLAP_EXCLUDES_UNIT_TOKENS: Final[bool] = True
 CTX_MIN_TOKENS: Final[int] = 8
+CTX_MIN_RESIDUAL_TOKENS: Final[int] = 6
 
 # "Different topic" remains a FORGE prompt requirement; it is intentionally
 # not claimed as a deterministic validator invariant.
@@ -213,6 +349,12 @@ EVENT_TYPES: Final[tuple[str, ...]] = (
     "STATE",
     "SPEAK",
     "ENCOUNTER",
+)
+
+# Known event types that remain readable/recognized but must not be emitted
+# through EventLog.log() in v0.
+RESERVED_EVENT_TYPES: Final[tuple[str, ...]] = (
+    "REVIEW",
 )
 
 EVENT_PAYLOAD_REQUIRED_FIELDS: Final[dict[str, tuple[str, ...]]] = {
@@ -247,6 +389,16 @@ EVENT_PAYLOAD_REQUIRED_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     ),
 }
 
+# Additional producer-level requirements for JUDGE evidence that may gate a
+# T9 lifecycle transition. These are deliberately not unconditional v1 event
+# decoder requirements, so historical/non-lifecycle JUDGE records remain
+# readable.
+LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "assessment_id",
+    "stimulus_ref",
+    "novel",
+)
+
 EVENT_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
     "v",
     "ts",
@@ -276,6 +428,243 @@ EVENT_DAY_FORMAT: Final[str] = "%Y-%m-%d"
 # STATE events are channel-scoped; aggregate state is never persisted.
 STATE_EVENT_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
     EVENT_PAYLOAD_REQUIRED_FIELDS["STATE"]
+)
+
+# T9 producer requirements extend the backwards-compatible generic STATE
+# payload without changing the EVENT_SCHEMA_VERSION=1 decoder contract.
+T9_STATE_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "channel",
+    "from",
+    "to",
+    "trigger",
+    "transition_id",
+    "from_episode_id",
+    "phase",
+    "evidence",
+)
+
+T9_STATE_OPTIONAL_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "transition_group_id",
+)
+
+INITIAL_NEW_EPISODE_PREFIX: Final[str] = "initial-new:"
+T9_DORMANCY_GROUP_KIND: Final[str] = "DORMANCY"
+
+T9_STATE_PHASE_PREPARE: Final[str] = "PREPARE"
+T9_STATE_PHASE_COMMIT: Final[str] = "COMMIT"
+T9_STATE_PHASE_ABORT: Final[str] = "ABORT"
+
+T9_STATE_PHASES: Final[tuple[str, ...]] = (
+    T9_STATE_PHASE_PREPARE,
+    T9_STATE_PHASE_COMMIT,
+    T9_STATE_PHASE_ABORT,
+)
+
+
+# ============================================================
+# 5A. T10 CORPUS / ENCOUNTER PRODUCER CONTRACT
+# ============================================================
+
+CORPUS_SCAN_VERSION: Final[int] = 1
+CORPUS_MONTH_PATTERN: Final[str] = r"^\d{4}-(?:0[1-9]|1[0-2])$"
+CORPUS_SOURCE_PATTERN: Final[str] = rf"^{SLUG_PATTERN}$"
+
+CORPUS_EXTENSIONS: Final[tuple[str, ...]] = (
+    ".txt",
+)
+CORPUS_DIRECT_CHILDREN_ONLY: Final[bool] = True
+CORPUS_ALLOW_SYMLINKS: Final[bool] = False
+CORPUS_ALLOW_UTF8_BOM: Final[bool] = True
+CORPUS_RAW_BYTES_DEFINE_FILE_IDENTITY: Final[bool] = True
+
+CORPUS_SENTENCE_TERMINATORS: Final[tuple[str, ...]] = (
+    ".",
+    "!",
+    "?",
+    "…",
+)
+CORPUS_BLANK_LINE_IS_BLOCK_BOUNDARY: Final[bool] = True
+CORPUS_SINGLE_NEWLINE_IS_BLOCK_BOUNDARY: Final[bool] = False
+
+CORPUS_REJECT_URL_PREFIXES: Final[tuple[str, ...]] = (
+    "http://",
+    "https://",
+    "www.",
+)
+
+T10_ENCOUNTER_PRODUCER_ID: Final[str] = "t10-corpus"
+T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    "count",
+    "source",
+    "month",
+    "producer",
+    "scan_version",
+    "encounter_id",
+    "lemma",
+    "unit_type",
+    "corpus_snapshot_digest",
+    "corpus_file_count",
+)
+T10_ENCOUNTER_ALLOWED_PAYLOAD_FIELDS: Final[tuple[str, ...]] = (
+    T10_ENCOUNTER_REQUIRED_PAYLOAD_FIELDS
+)
+T10_ENCOUNTER_EMIT_ZERO_COUNTS: Final[bool] = True
+
+
+# ============================================================
+# 5B. T11 / T12 ASSESSMENT CONTRACT
+# ============================================================
+
+ASSESSMENT_OUTCOME_PASS: Final[str] = "PASS"
+ASSESSMENT_OUTCOME_FAIL: Final[str] = "FAIL"
+ASSESSMENT_OUTCOME_OMITTED: Final[str] = "OMITTED"
+ASSESSMENT_OUTCOME_ABSTAIN: Final[str] = "ABSTAIN"
+
+ASSESSMENT_OUTCOMES: Final[tuple[str, ...]] = (
+    ASSESSMENT_OUTCOME_PASS,
+    ASSESSMENT_OUTCOME_FAIL,
+    ASSESSMENT_OUTCOME_OMITTED,
+    ASSESSMENT_OUTCOME_ABSTAIN,
+)
+
+ASSESSMENT_TASK_KIND_BY_CHANNEL: Final[dict[str, str]] = {
+    "R": "reading_comprehension",
+    "L": "listening_comprehension",
+    "W": "written_production",
+    "S": "spoken_production",
+}
+
+ASSESSMENT_PRODUCTIVE_PRESENCE_CHANNELS: Final[tuple[str, ...]] = (
+    "W",
+    "S",
+)
+
+ASSESSMENT_FAILURE_CODES_BY_CHANNEL: Final[
+    dict[str, tuple[str, ...]]
+] = {
+    "R": (
+        "wrong_meaning",
+    ),
+    "L": (
+        "wrong_interpretation",
+    ),
+    "W": (
+        "semantic_misuse",
+        "collocation_misuse",
+        "form_misuse",
+    ),
+    "S": (
+        "semantic_misuse",
+        "collocation_misuse",
+        "form_misuse",
+    ),
+}
+
+ASSESSMENT_OMITTED_REASON_CODES: Final[tuple[str, ...]] = (
+    "target_absent",
+)
+
+ASSESSMENT_ABSTAIN_REASON_CODES: Final[tuple[str, ...]] = (
+    "off_topic",
+    "refusal",
+    "explicit_skip",
+    "no_response",
+    "insufficient_lexical_evidence",
+    "response_unintelligible",
+    "audio_unusable",
+    "transcription_uncertain",
+    "transcription_failed",
+    "semantic_uncertainty",
+    "reviewer_rejected",
+    "invalid_artifact",
+    "infrastructure_failure",
+)
+
+TRANSCRIPTION_STATUSES: Final[tuple[str, ...]] = (
+    "SUCCESS",
+    "UNCERTAIN",
+    "FAILED",
+)
+
+HUMAN_REVIEW_DECISIONS: Final[tuple[str, ...]] = (
+    "APPROVE",
+    "REJECT",
+)
+
+ASSESSMENT_AUTHORITY_KINDS: Final[tuple[str, ...]] = (
+    "semantic_model",
+    "deterministic_gate",
+    "policy",
+    "human_reviewer",
+)
+
+ASSESSMENT_PROVENANCE_STAGES: Final[tuple[str, ...]] = (
+    "presence_gate",
+    "transcription",
+    "semantic_judge",
+    "human_review",
+    "policy",
+)
+
+T12_ASSESSMENT_PRODUCER_ID: Final[str] = "t12-assessment"
+T12_ASSESSMENT_PRODUCER_VERSION: Final[int] = 1
+
+T12_LIFECYCLE_ENABLED_CHANNELS: Final[tuple[str, ...]] = ("R", "L", "W", "S")
+
+T12_LIFECYCLE_EVENT_SCHEMA_VERSION: Final[int] = 1
+
+T12_ONLY_JUDGE_MARKER_FIELDS: Final[tuple[str, ...]] = (
+    "producer_version",
+    "attempt_id",
+    "presented_stimulus_ref",
+    "outcome",
+    "authority_kind",
+    "provenance",
+)
+
+ASSESSMENT_STIMULUS_REF_PATTERN: Final[str] = (
+    r"^stimulus:v1:[0-9a-f]{64}$"
+)
+ASSESSMENT_ATTEMPT_ID_PATTERN: Final[str] = (
+    r"^attempt:v1:[0-9a-f]{64}$"
+)
+ASSESSMENT_ARTIFACT_REF_PATTERN: Final[str] = (
+    r"^sha256:[0-9a-f]{64}$"
+)
+
+COGNITIVE_STIMULUS_NORMALIZATION_FORM: Final[str] = "NFKC"
+
+T11_ASSESSMENT_RESULT_VIOLATION_CODES: Final[tuple[str, ...]] = (
+    "A_UNIT_KEY_INVALID",
+    "A_CHANNEL_INVALID",
+    "A_OUTCOME_INVALID",
+    "A_OMITTED_CHANNEL_INVALID",
+    "A_FAILURE_CODE_FORBIDDEN",
+    "A_FAIL_FAILURE_CODE_INVALID",
+    "A_REASON_CODE_FORBIDDEN",
+    "A_OMITTED_REASON_CODE_INVALID",
+    "A_ABSTAIN_REASON_CODE_INVALID",
+)
+
+
+STATE_TRIGGER_FIRST_REVIEW: Final[str] = "FIRST_REVIEW"
+STATE_TRIGGER_STABILITY_GATE: Final[str] = "STABILITY_GATE"
+STATE_TRIGGER_REVIEW_LAPSE: Final[str] = "REVIEW_LAPSE"
+STATE_TRIGGER_MASTERY_ASSESSMENT_PASS: Final[str] = (
+    "MASTERY_ASSESSMENT_PASS"
+)
+STATE_TRIGGER_ASSESSMENT_FAIL: Final[str] = "ASSESSMENT_FAIL"
+STATE_TRIGGER_DORMANCY_ELAPSED: Final[str] = "DORMANCY_ELAPSED"
+STATE_TRIGGER_RELAPSE_REVIEW: Final[str] = "RELAPSE_REVIEW"
+
+STATE_TRIGGERS: Final[tuple[str, ...]] = (
+    STATE_TRIGGER_FIRST_REVIEW,
+    STATE_TRIGGER_STABILITY_GATE,
+    STATE_TRIGGER_REVIEW_LAPSE,
+    STATE_TRIGGER_MASTERY_ASSESSMENT_PASS,
+    STATE_TRIGGER_ASSESSMENT_FAIL,
+    STATE_TRIGGER_DORMANCY_ELAPSED,
+    STATE_TRIGGER_RELAPSE_REVIEW,
 )
 
 # ============================================================
@@ -324,6 +713,8 @@ MASTERED_MIN_DELAY_BETWEEN_PASSES_DAYS: Final[int] = 7
 MASTERED_TO_DORMANT_DAYS: Final[int] = 30
 LEECH_LAPSE_THRESHOLD: Final[int] = 4
 PARAMETER_RECALIBRATION_AFTER_DAYS: Final[int] = 90
+
+LIFECYCLE_SECONDS_PER_DAY: Final[int] = 86400
 
 TRANSITION_NEW_TO_LEARNING: Final[tuple[str, str]] = (
     STATE_NEW,
@@ -375,6 +766,15 @@ STATE_TRANSITIONS: Final[tuple[tuple[str, str], ...]] = (
 # Degradation is represented by explicit per-channel state transitions above.
 RELAPSE_REACTIVATE_FAILED_CHANNEL_ONLY: Final[bool] = True
 
+# T9 never silently removes suspension. Reactivation is a separate,
+# human-confirmed action restricted to the failed channel's card.
+T9_AUTO_UNSUSPEND: Final[bool] = False
+T9_UNSUSPEND_REQUIRES_HUMAN_CONFIRMATION: Final[bool] = True
+
+# Leech evidence is diagnostic only in T9 v0.
+T9_LEECH_AUTO_TRANSITION: Final[bool] = False
+T9_LEECH_AUTOCREATE_VISUAL_CUE: Final[bool] = False
+
 # Unit-level dormancy is only valid once every enabled channel has reached
 # MASTERED (and the dormancy timing rule is satisfied by reconcile.py).
 DORMANT_REQUIRES_ALL_ACTIVE_CHANNELS_MASTERED: Final[bool] = True
@@ -384,7 +784,7 @@ DORMANT_REQUIRES_ALL_ACTIVE_CHANNELS_MASTERED: Final[bool] = True
 # 7. RECONCILIATION / RETENTION CONTRACT
 # ============================================================
 
-DORMANT_CLEAR_FIELDS: Final[tuple[str, ...]] = MEDIA_FIELDS
+DORMANT_CLEAR_FIELDS: Final[tuple[str, ...]] = ()
 DORMANT_DELETE_NOTE: Final[bool] = False
 DORMANT_PRESERVE_REVLOG: Final[bool] = True
 
@@ -395,6 +795,24 @@ DORMANT_PRESERVE_REVLOG: Final[bool] = True
 ANKI_NOTE_TYPE_NAME: Final[str] = "VocabularyUnit"
 ANKI_SORT_FIELD: Final[str] = "unit_key"
 
-ANKI_LEECH_THRESHOLD: Final[int] = 4
+ANKI_LEECH_THRESHOLD: Final[int] = LEECH_LAPSE_THRESHOLD
 ANKI_LEECH_ACTION: Final[str] = "tag_only"
 ANKI_LEECH_TAG: Final[str] = "leech"
+
+# Anki revlog type/ease semantics consumed by T9 observation. Cram entries are
+# recognized but are not lifecycle evidence.
+REVLOG_TYPE_LEARNING: Final[int] = 0
+REVLOG_TYPE_REVIEW: Final[int] = 1
+REVLOG_TYPE_RELEARNING: Final[int] = 2
+REVLOG_TYPE_CRAM: Final[int] = 3
+
+REVLOG_LIFECYCLE_TYPES: Final[tuple[int, ...]] = (
+    REVLOG_TYPE_LEARNING,
+    REVLOG_TYPE_REVIEW,
+    REVLOG_TYPE_RELEARNING,
+)
+
+REVLOG_EASE_AGAIN: Final[int] = 1
+
+# Anki cardsInfo queue sentinel. Buried queues are not suspension.
+ANKI_QUEUE_SUSPENDED: Final[int] = -1
