@@ -382,6 +382,9 @@ class FakeEventLog:
         self.read_calls += 1
         return list(self.events)
 
+    def read_strict(self) -> list[Event]:
+        return self.read()
+
     def log(self, *args: object, **kwargs: object) -> None:
         self.log_calls.append((*args, kwargs))
 

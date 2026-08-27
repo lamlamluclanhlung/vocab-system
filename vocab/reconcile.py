@@ -22,6 +22,11 @@ from .contracts import (
     ANKI_LEECH_TAG,
     ANKI_NOTE_TYPE_NAME,
     ANKI_QUEUE_SUSPENDED,
+    ASSESSMENT_OUTCOMES,
+    ASSESSMENT_OUTCOME_ABSTAIN,
+    ASSESSMENT_OUTCOME_FAIL,
+    ASSESSMENT_OUTCOME_OMITTED,
+    ASSESSMENT_OUTCOME_PASS,
     CHANNELS,
     CHANNEL_BY_TEMPLATE_NAME,
     EVENT_SCHEMA_VERSION,
@@ -64,6 +69,11 @@ from .contracts import (
     T9_STATE_PHASE_COMMIT,
     T9_STATE_PHASE_PREPARE,
     T9_STATE_REQUIRED_PAYLOAD_FIELDS,
+    T12_ASSESSMENT_PRODUCER_ID,
+    T12_ASSESSMENT_PRODUCER_VERSION,
+    T12_LIFECYCLE_ENABLED_CHANNELS,
+    T12_LIFECYCLE_EVENT_SCHEMA_VERSION,
+    T12_ONLY_JUDGE_MARKER_FIELDS,
     UNIT_KEY_PATTERN,
 )
 from .models import (
@@ -80,8 +90,8 @@ from .validators import validate_forge_unit
 
 
 class _EventLogReader(Protocol):
-    def read(self) -> list[Event]:
-        """Return decoded events without writing."""
+    def read_strict(self) -> list[Event]:
+        """Return one complete, strictly decoded history without writing."""
 
 
 class _EventLogJournal(_EventLogReader, Protocol):
@@ -1564,7 +1574,7 @@ def _read_recovery_transactions(
     now_utc: datetime,
 ) -> dict[str, dict[str, object]]:
     try:
-        events = event_log.read()
+        events = event_log.read_strict()
     except Exception as exc:
         raise ReconcileRecoveryError("EventLog recovery scan failed") from exc
     if not isinstance(events, list) or any(
@@ -2436,14 +2446,14 @@ def _load_event_history(
     dict[str, datetime | None],
 ]:
     try:
-        events = event_log.read()
+        events = event_log.read_strict()
     except (OSError, TypeError, ValueError) as exc:
         raise ReconcileEventHistoryError("EventLog history cannot be read") from exc
     if not isinstance(events, list) or any(
         not isinstance(event, Event) for event in events
     ):
         raise ReconcileEventHistoryError(
-            "EventLog.read() must return a list of Event values"
+            "EventLog.read_strict() must return a list of Event values"
         )
 
     assessments: dict[
@@ -2484,14 +2494,71 @@ def _lifecycle_assessment(
     now_utc: datetime,
 ) -> tuple[datetime, int, LifecycleAssessment] | None:
     payload = event.payload
+    context = f"JUDGE unit_key={event.unit_key!r} event index={index}"
     claimed_fields = set(payload).intersection(
         LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS
     )
+
+    if payload.get("producer") == T12_ASSESSMENT_PRODUCER_ID:
+        if (
+            type(event.v) is not int
+            or event.v != T12_LIFECYCLE_EVENT_SCHEMA_VERSION
+            or T12_LIFECYCLE_EVENT_SCHEMA_VERSION != 1
+        ):
+            raise ReconcileEventHistoryError(
+                f"{context}: T12 lifecycle envelope version is not 1"
+            )
+        if (
+            type(payload.get("producer_version")) is not int
+            or payload.get("producer_version")
+            != T12_ASSESSMENT_PRODUCER_VERSION
+        ):
+            raise ReconcileEventHistoryError(
+                f"{context}: T12 producer_version is unsupported"
+            )
+        outcome = payload.get("outcome")
+        if outcome not in ASSESSMENT_OUTCOMES:
+            raise ReconcileEventHistoryError(
+                f"{context}: T12 outcome is not in the closed outcome set"
+            )
+        passed = payload.get("passed")
+        if type(passed) is not bool or passed is not (
+            outcome == ASSESSMENT_OUTCOME_PASS
+        ):
+            raise ReconcileEventHistoryError(
+                f"{context}: T12 passed/outcome invariant is violated"
+            )
+        if outcome in (ASSESSMENT_OUTCOME_OMITTED, ASSESSMENT_OUTCOME_ABSTAIN):
+            if claimed_fields:
+                raise ReconcileEventHistoryError(
+                    f"{context}: T12 {outcome} must carry zero D35 fields"
+                )
+            return None
+        if outcome not in (ASSESSMENT_OUTCOME_PASS, ASSESSMENT_OUTCOME_FAIL):
+            raise ReconcileEventHistoryError(
+                f"{context}: T12 outcome cannot enter lifecycle parsing"
+            )
+        if not set(LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS).issubset(payload):
+            raise ReconcileEventHistoryError(
+                f"{context}: T12 {outcome} must carry the complete D35 set"
+            )
+        if payload.get("channel") not in T12_LIFECYCLE_ENABLED_CHANNELS:
+            raise ReconcileEventHistoryError(
+                f"{context}: T12 PASS/FAIL channel is not lifecycle-enabled"
+            )
+    elif "producer" in payload or set(payload).intersection(
+        T12_ONLY_JUDGE_MARKER_FIELDS
+    ):
+        raise ReconcileEventHistoryError(
+            f"{context}: malformed or downgraded T12 producer identity"
+        )
+
     if not claimed_fields:
         return None
     if not set(LIFECYCLE_JUDGE_REQUIRED_PAYLOAD_FIELDS).issubset(payload):
         raise ReconcileEventHistoryError(
-            "JUDGE claiming lifecycle fields must contain the complete D35 set"
+            f"{context}: JUDGE claiming lifecycle fields must contain the "
+            "complete D35 set"
         )
 
     channel = payload.get("channel")
@@ -2503,11 +2570,11 @@ def _lifecycle_assessment(
     model_version = payload.get("model_version")
     if channel not in CHANNELS:
         raise ReconcileEventHistoryError(
-            "lifecycle JUDGE channel must be a frozen channel"
+            f"{context}: lifecycle JUDGE channel must be a frozen channel"
         )
     if type(passed) is not bool or type(novel) is not bool:
         raise ReconcileEventHistoryError(
-            "lifecycle JUDGE passed and novel must be actual booleans"
+            f"{context}: lifecycle JUDGE passed and novel must be actual booleans"
         )
     for field_name, value in (
         ("assessment_id", assessment_id),
@@ -2517,12 +2584,14 @@ def _lifecycle_assessment(
     ):
         if not isinstance(value, str) or not value.strip():
             raise ReconcileEventHistoryError(
-                f"lifecycle JUDGE {field_name} must be a non-empty string"
+                f"{context}: lifecycle JUDGE {field_name} must be a non-empty string"
             )
 
     instant = _event_instant(event.ts, "JUDGE")
     if instant > now_utc:
-        raise ReconcileEventHistoryError("lifecycle JUDGE timestamp is in the future")
+        raise ReconcileEventHistoryError(
+            f"{context}: lifecycle JUDGE timestamp is in the future"
+        )
     return (
         instant,
         index,

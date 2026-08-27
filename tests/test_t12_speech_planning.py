@@ -568,6 +568,25 @@ def test_unknown_receipt_field_fails(tmp_path: Path) -> None:
         read_transcription_ledger(runtime.transcription_path)
 
 
+def test_stt_confidence_field_is_rejected_and_cannot_establish_omission(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    value = build_receipt(
+        runtime,
+        make_stage(
+            runtime,
+            candidate="The results were completely different.",
+            approved="The results were completely different.",
+        ),
+    ).to_dict()
+    value["stt_confidence"] = 1.0
+    runtime.transcription_path.write_bytes(canonical_json_bytes(value) + b"\n")
+
+    with pytest.raises(TranscriptionLedgerError, match="key set"):
+        read_transcription_ledger(runtime.transcription_path)
+
+
 def test_noncanonical_transcription_jsonl_fails(tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
     value = build_receipt(runtime, make_stage(runtime)).to_dict()
@@ -623,6 +642,25 @@ def test_interruption_is_not_auto_materialized_as_infrastructure_failure(
 def test_same_candidate_bytes_have_same_artifact_ref(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts")
     assert store.put("café".encode()) == store.put("café".encode())
+
+
+def test_same_raw_audio_under_changed_transcripts_keeps_attempt_and_assessment_identity(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, attempt, *_ = planned_success(tmp_path)
+    original = read_transcription_ledger(runtime.transcription_path)[0]
+    changed = build_receipt(
+        runtime,
+        make_stage(
+            runtime,
+            candidate="A changed machine transcript.",
+            approved="A changed human-approved transcript.",
+        ),
+    )
+
+    assert original.response_audio_ref == changed.response_audio_ref
+    assert original.attempt_id == changed.attempt_id == attempt.attempt_id
+    assert plan.judge_payload()["assessment_id"] == attempt.attempt_id
 
 
 def test_same_approved_transcript_bytes_have_same_artifact_ref(tmp_path: Path) -> None:
@@ -1220,6 +1258,34 @@ def test_success_present_pass_plans_exact_pair(tmp_path: Path) -> None:
     assert judge["novel"] is True
 
 
+def test_same_attempt_rejudged_keeps_assessment_id(tmp_path: Path) -> None:
+    first, _, attempt, transcription, presence, _ = planned_success(tmp_path)
+    unit = validate_unit_evidence(make_unit())
+    changed_semantic, _ = bind_semantic(
+        attempt=attempt,
+        unit=unit,
+        transcription=transcription,
+        presence=presence,
+        outcome="FAIL",
+        failure_code="semantic_misuse",
+    )
+    second = plan_speech_assessment(
+        attempt=attempt,
+        unit=unit,
+        transcription=transcription,
+        presence=presence,
+        semantic=changed_semantic,
+    )
+
+    assert first.judge_payload()["outcome"] == "PASS"
+    assert second.judge_payload()["outcome"] == "FAIL"
+    assert (
+        first.judge_payload()["assessment_id"]
+        == second.judge_payload()["assessment_id"]
+        == attempt.attempt_id
+    )
+
+
 @pytest.mark.parametrize(
     "failure_code",
     ("semantic_misuse", "collocation_misuse", "form_misuse"),
@@ -1237,6 +1303,22 @@ def test_success_present_fail_plans_exact_pair(
     assert speak["outcome"] == judge["outcome"] == "FAIL"
     assert speak["failure_code"] == judge["failure_code"] == failure_code
     assert judge["assessment_id"] == judge["attempt_id"]
+
+
+def test_speak_passed_tracks_semantic_outcome_not_transcription_success(
+    tmp_path: Path,
+) -> None:
+    passed, *_ = planned_success(tmp_path / "pass")
+    failed, *_ = planned_success(
+        tmp_path / "fail",
+        outcome="FAIL",
+        failure_code="semantic_misuse",
+    )
+
+    assert passed.speak_payload()["passed"] is True
+    assert failed.speak_payload()["passed"] is False
+    assert passed.speak_payload()["outcome"] == "PASS"
+    assert failed.speak_payload()["outcome"] == "FAIL"
 
 
 def test_success_semantic_abstain_plans_exact_pair(tmp_path: Path) -> None:

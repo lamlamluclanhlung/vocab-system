@@ -281,6 +281,9 @@ class FakeEventLog:
         self.operations.append(("event_read",))
         return list(self.events)
 
+    def read_strict(self) -> list[Event]:
+        return self.read()
+
     def log(
         self,
         event: str,

@@ -272,6 +272,22 @@ class EventLog:
             events.append(stored_event)
         return events
 
+    def read_strict(self) -> list[Event]:
+        """Read one complete EventLog, rejecting every malformed record."""
+        raw = self.path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            raise EventLogCorruptionError(
+                "event log final record is not newline-terminated"
+            )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", EventLogCorruptionWarning)
+                return self.read()
+        except EventLogCorruptionWarning as exc:
+            raise EventLogCorruptionError(
+                "event log contains a malformed final record"
+            ) from exc
+
     def _read_lines(self) -> list[bytes]:
         data = self.path.read_bytes()
         if not data:

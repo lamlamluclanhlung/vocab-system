@@ -609,6 +609,19 @@ ASSESSMENT_PROVENANCE_STAGES: Final[tuple[str, ...]] = (
 T12_ASSESSMENT_PRODUCER_ID: Final[str] = "t12-assessment"
 T12_ASSESSMENT_PRODUCER_VERSION: Final[int] = 1
 
+T12_LIFECYCLE_ENABLED_CHANNELS: Final[tuple[str, ...]] = ("R", "L", "W", "S")
+
+T12_LIFECYCLE_EVENT_SCHEMA_VERSION: Final[int] = 1
+
+T12_ONLY_JUDGE_MARKER_FIELDS: Final[tuple[str, ...]] = (
+    "producer_version",
+    "attempt_id",
+    "presented_stimulus_ref",
+    "outcome",
+    "authority_kind",
+    "provenance",
+)
+
 ASSESSMENT_STIMULUS_REF_PATTERN: Final[str] = (
     r"^stimulus:v1:[0-9a-f]{64}$"
 )
