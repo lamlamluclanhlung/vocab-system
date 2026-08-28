@@ -85,6 +85,88 @@ APPROVED_STATE_MATERIALIZERS = frozenset(
 )
 
 
+# D69 section 13 P1a remains in force: no production module may call the
+# journal constructor, which opens in append mode and therefore creates files.
+APPROVED_EVENT_LOG_CONSTRUCTORS: frozenset[tuple[str, str, int]] = frozenset()
+
+# D70 section 7.1: the single approved existing-only acquisition site.
+APPROVED_EVENT_LOG_ACQUISITIONS = frozenset(
+    (
+        (
+            "vocab/runtime/eventlog_authority.py",
+            "open_runtime_event_log",
+            "open_existing",
+            1,
+        ),
+    )
+)
+AUTHORITY_ACQUISITION = "open_existing"
+# D70 section 5: the acquisition seam normalizes exactly these families and no
+# broader one. A generic ValueError catch here would convert defects into
+# refusals, which is what per-seam normalization exists to prevent.
+AUTHORITY_HANDLER_TYPES = frozenset(
+    {"EventLogCorruptionError", "UnsupportedEventVersionError", "OSError"}
+)
+
+# D70 section 2(i): D69 section 10's allowlist grows from one path to two.
+CONCRETE_EVENT_IMPORT_ALLOWLIST = frozenset(
+    {
+        "vocab/assessment_producer.py",
+        "vocab/runtime/eventlog_authority.py",
+    }
+)
+
+# D70 section 7.2: the positive structural allowlist for the approved module.
+AUTHORITY_MODULE_PATH = "vocab/runtime/eventlog_authority.py"
+AUTHORITY_FUNCTION_NAME = "open_runtime_event_log"
+AUTHORITY_IMPORTS = frozenset(
+    {
+        ("__future__", 0, ("annotations",)),
+        ("pathlib", 0, ("Path",)),
+        (
+        "events",
+        2,
+        ("EventLog", "EventLogCorruptionError", "UnsupportedEventVersionError"),
+    ),
+        ("errors", 1, ("RuntimeEventLogError",)),
+    }
+)
+AUTHORITY_STATEMENT_TYPES = (
+    ast.If,
+    ast.Raise,
+    ast.Return,
+    ast.Assign,
+    ast.Try,
+    ast.ExceptHandler,
+    ast.Expr,
+)
+AUTHORITY_EXPRESSION_TYPES = (
+    ast.Name,
+    ast.Attribute,
+    ast.Call,
+    ast.Constant,
+    ast.Compare,
+    ast.BoolOp,
+    ast.UnaryOp,
+    ast.JoinedStr,
+    ast.FormattedValue,
+    ast.Tuple,
+)
+AUTHORITY_BARE_CALLEES = frozenset({"isinstance", "RuntimeEventLogError"})
+AUTHORITY_PARAMETER_CALLEES = frozenset({"is_absolute", "is_file"})
+AUTHORITY_STRICT_READ = "read_strict"
+
+
+@dataclass(frozen=True, slots=True)
+class _ConstructorUse:
+    path: str
+    scope: tuple[tuple[str, str], ...]
+    qualified_scope: str
+    line: int
+    argument_kind: str
+    argument_name: str | None
+
+
 @dataclass(frozen=True, slots=True)
 class _LogUse:
     path: str
@@ -127,7 +209,8 @@ def assert_t12_ast_invariants(repository_root: Path) -> None:
     lifecycle_reads: list[_AttributeUse] = []
     tolerant_reconcile_reads: list[_AttributeUse] = []
     state_materializers: list[_StateMaterializerUse] = []
-    eventlog_constructors: list[tuple[str, str, int]] = []
+    eventlog_constructors: list[_ConstructorUse] = []
+    eventlog_acquisitions: list[_ConstructorUse] = []
 
     for path in sorted(production.rglob("*.py")):
         relative = path.relative_to(root).as_posix()
@@ -141,6 +224,7 @@ def assert_t12_ast_invariants(repository_root: Path) -> None:
         tolerant_reconcile_reads.extend(visitor.tolerant_reconcile_reads)
         state_materializers.extend(visitor.state_materializers)
         eventlog_constructors.extend(visitor.eventlog_constructors)
+        eventlog_acquisitions.extend(visitor.eventlog_acquisitions)
 
     failures: list[str] = []
     observed: Counter[tuple[str, str, str]] = Counter()
@@ -176,7 +260,7 @@ def assert_t12_ast_invariants(repository_root: Path) -> None:
             f"getattr(..., 'log') captures authority: {path}:{line} scope={scope}"
         )
     for path, imported, line in concrete_importers:
-        if path != "vocab/assessment_producer.py":
+        if path not in CONCRETE_EVENT_IMPORT_ALLOWLIST:
             failures.append(
                 f"concrete EventLog import is not allowed: {path}:{line} "
                 f"scope=<module> import={imported}"
@@ -247,15 +331,405 @@ def assert_t12_ast_invariants(repository_root: Path) -> None:
                 f"expected {count}: path={path} scope={scope} phase={phase}"
             )
 
-    for path, scope, line in eventlog_constructors:
+    # D69 P1a: the constructor creates files, so no production call is approved.
+    for use in eventlog_constructors:
         failures.append(
-            f"production EventLog construction is forbidden: "
-            f"{path}:{line} scope={scope}"
+            "production EventLog construction is forbidden: "
+            f"{use.path}:{use.line} scope={use.qualified_scope}"
         )
+
+    approved_acquisitions = {
+        (path, (("function", scope),), attribute): count
+        for path, scope, attribute, count in APPROVED_EVENT_LOG_ACQUISITIONS
+    }
+    observed_acquisitions: Counter[tuple[str, tuple[tuple[str, str], ...], str]] = (
+        Counter()
+    )
+    for use in eventlog_acquisitions:
+        detail = f"{use.path}:{use.line} scope={use.qualified_scope}"
+        key = (use.path, use.scope, AUTHORITY_ACQUISITION)
+        if key not in approved_acquisitions:
+            failures.append(
+                f"production EventLog acquisition is not approved: {detail}"
+            )
+            continue
+        if use.argument_kind != "name":
+            failures.append(
+                "EventLog acquisition must take exactly one parameter "
+                f"argument: {detail} argument={use.argument_kind}"
+            )
+            continue
+        observed_acquisitions[key] += 1
+    for path, scope, attribute, count in sorted(APPROVED_EVENT_LOG_ACQUISITIONS):
+        key = (path, (("function", scope),), attribute)
+        actual_count = observed_acquisitions[key]
+        if actual_count != count:
+            failures.append(
+                f"approved EventLog acquisition count is {actual_count}, "
+                f"expected {count}: path={path} scope={scope} call={attribute}"
+            )
+
+    failures.extend(_authority_module_failures(root))
 
     failures.extend(_producer_failures(root / "vocab" / "assessment_producer.py"))
     if failures:
         raise AssertionError("\n".join(failures))
+
+
+def _constructor_argument_shape(node: ast.Call) -> tuple[str, str | None]:
+    """Classify the argument passed to a deployment journal constructor."""
+    if node.keywords:
+        return ("keyword-arguments", None)
+    if len(node.args) != 1:
+        return (f"{len(node.args)}-positional-arguments", None)
+    argument = node.args[0]
+    if isinstance(argument, ast.Starred):
+        return ("starred-argument", None)
+    if not isinstance(argument, ast.Name):
+        return (type(argument).__name__, None)
+    return ("name", argument.id)
+
+
+def _authority_callee_failure(
+    node: ast.Call, parameter: str, journal: str | None
+) -> str | None:
+    """Return a message when a call in the approved module is not allowed."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        if func.id in AUTHORITY_BARE_CALLEES:
+            return None
+        return f"callee {func.id!r} is not allowed"
+    if isinstance(func, ast.Attribute):
+        if (
+            func.attr in AUTHORITY_PARAMETER_CALLEES
+            and isinstance(func.value, ast.Name)
+            and func.value.id == parameter
+        ):
+            return None
+        if (
+            func.attr == AUTHORITY_STRICT_READ
+            and journal is not None
+            and isinstance(func.value, ast.Name)
+            and func.value.id == journal
+        ):
+            return None
+        if (
+            func.attr == AUTHORITY_ACQUISITION
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "EventLog"
+        ):
+            return None
+        return f"attribute callee {func.attr!r} is not allowed"
+    return f"callee expression {type(func).__name__} is not allowed"
+
+
+def _authority_shape_failures(
+    function: ast.FunctionDef, parameter: str, prefix: str
+) -> tuple[list[str], str | None]:
+    """Freeze the exact body shape of the approved authority function.
+
+    The tail must be exactly one try block that acquires a journal and strictly
+    reads that same object, followed by a return of that same object. A generic
+    node-kind filter cannot express this, because it cannot see the
+    relationship between the acquired name, the read receiver, and the returned
+    name.
+    """
+    failures: list[str] = []
+    body = list(function.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    if len(body) < 3:
+        return [f"{prefix}function body is too short to carry the frozen shape"], None
+
+    guards, (attempt, ending) = body[:-2], body[-2:]
+    for statement in guards:
+        if not isinstance(statement, ast.If):
+            failures.append(
+                f"{prefix}only guard clauses may precede the acquisition, found "
+                f"{type(statement).__name__} at line {statement.lineno}"
+            )
+        elif (
+            statement.orelse
+            or len(statement.body) != 1
+            or not isinstance(statement.body[0], ast.Raise)
+        ):
+            failures.append(
+                f"{prefix}each guard clause must raise exactly once at line "
+                f"{statement.lineno}"
+            )
+
+    if not isinstance(attempt, ast.Try):
+        failures.append(
+            f"{prefix}the acquisition and strict read must sit inside one try "
+            "block that normalizes failure at this seam"
+        )
+        return failures, None
+    if attempt.orelse or attempt.finalbody:
+        failures.append(f"{prefix}the acquisition try may carry no else or finally")
+    if len(attempt.handlers) != 1:
+        failures.append(f"{prefix}the acquisition try needs exactly one handler")
+    else:
+        handler = attempt.handlers[0]
+        if len(handler.body) != 1 or not isinstance(handler.body[0], ast.Raise):
+            failures.append(f"{prefix}the acquisition handler must raise exactly once")
+        caught = handler.type
+        names = (
+            [element for element in caught.elts]
+            if isinstance(caught, ast.Tuple)
+            else [caught]
+        )
+        if not all(isinstance(element, ast.Name) for element in names) or {
+            element.id for element in names if isinstance(element, ast.Name)
+        } != AUTHORITY_HANDLER_TYPES:
+            failures.append(
+                f"{prefix}the acquisition handler must catch exactly "
+                f"{sorted(AUTHORITY_HANDLER_TYPES)}"
+            )
+    if len(attempt.body) != 2:
+        failures.append(
+            f"{prefix}the try body must be exactly the acquisition and the "
+            "strict read"
+        )
+        return failures, None
+
+    assignment, read_statement = attempt.body
+    if (
+        not isinstance(assignment, ast.Assign)
+        or len(assignment.targets) != 1
+        or not isinstance(assignment.targets[0], ast.Name)
+    ):
+        failures.append(f"{prefix}the acquisition must bind exactly one name")
+        return failures, None
+    journal = assignment.targets[0].id
+    if journal == parameter:
+        failures.append(f"{prefix}the acquisition must not rebind the parameter")
+        return failures, None
+
+    value = assignment.value
+    if (
+        not isinstance(value, ast.Call)
+        or not isinstance(value.func, ast.Attribute)
+        or value.func.attr != AUTHORITY_ACQUISITION
+        or not isinstance(value.func.value, ast.Name)
+        or value.func.value.id != "EventLog"
+    ):
+        failures.append(
+            f"{prefix}the acquisition must be exactly "
+            f"EventLog.{AUTHORITY_ACQUISITION}({parameter})"
+        )
+
+    if not isinstance(read_statement, ast.Expr):
+        failures.append(f"{prefix}the strict read must directly follow acquisition")
+        return failures, journal
+    call = read_statement.value
+    if (
+        not isinstance(call, ast.Call)
+        or not isinstance(call.func, ast.Attribute)
+        or call.func.attr != AUTHORITY_STRICT_READ
+        or not isinstance(call.func.value, ast.Name)
+        or call.func.value.id != journal
+        or call.args
+        or call.keywords
+    ):
+        failures.append(
+            f"{prefix}the strict read must be exactly "
+            f"{journal}.{AUTHORITY_STRICT_READ}()"
+        )
+
+    if not isinstance(ending, ast.Return):
+        failures.append(f"{prefix}the function must end with a return")
+    elif not isinstance(ending.value, ast.Name) or ending.value.id != journal:
+        failures.append(
+            f"{prefix}the function must return exactly the acquired journal "
+            f"{journal!r}"
+        )
+
+    for label, node_type, expected in (
+        (AUTHORITY_STRICT_READ, ast.Attribute, 1),
+        ("return", ast.Return, 1),
+        ("assignment", ast.Assign, 1),
+        ("try block", ast.Try, 1),
+    ):
+        if node_type is ast.Attribute:
+            found = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Attribute) and node.attr == AUTHORITY_STRICT_READ
+            ]
+        else:
+            found = [
+                node for node in ast.walk(function) if isinstance(node, node_type)
+            ]
+        if len(found) != expected:
+            failures.append(
+                f"{prefix}{label} must appear exactly {expected} time(s), found "
+                f"{len(found)}"
+            )
+    return failures, journal
+
+
+def _authority_module_failures(root: Path) -> list[str]:
+    """Enforce the D70 section 7.2 positive structural allowlist.
+
+    The approved module's entire tree is restricted, rather than a list of
+    forbidden idioms being enumerated. Because every ``ast.Import`` is
+    rejected and the ``ImportFrom`` set is exact, no dynamic import facility is
+    reachable, so a name composed at run time cannot be resolved to the
+    concrete class from inside this module. Because the callee set is exact,
+    no indirection through ``getattr``, ``vars``, ``globals``, or a module
+    object is expressible.
+    """
+    path = root / AUTHORITY_MODULE_PATH
+    prefix = f"{AUTHORITY_MODULE_PATH}: "
+    if not path.is_file():
+        return [f"{prefix}approved EventLog authority module is missing"]
+
+    failures: list[str] = []
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=AUTHORITY_MODULE_PATH)
+
+    body = list(tree.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+
+    imports: list[ast.ImportFrom] = []
+    functions: list[ast.FunctionDef] = []
+    for statement in body:
+        if isinstance(statement, ast.ImportFrom):
+            imports.append(statement)
+        elif isinstance(statement, ast.FunctionDef):
+            functions.append(statement)
+        else:
+            failures.append(
+                f"{prefix}module body may not contain "
+                f"{type(statement).__name__} at line {statement.lineno}"
+            )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            failures.append(
+                f"{prefix}plain import is forbidden at line {node.lineno}"
+            )
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
+            failures.append(
+                f"{prefix}name {node.id!r} is deleted at line {node.lineno}"
+            )
+
+    observed_imports = set()
+    for node in imports:
+        names = tuple(alias.name for alias in node.names)
+        if any(alias.asname is not None for alias in node.names):
+            failures.append(
+                f"{prefix}aliased import is forbidden at line {node.lineno}"
+            )
+            continue
+        observed_imports.add((node.module, node.level, names))
+    if observed_imports != AUTHORITY_IMPORTS:
+        unexpected = sorted(str(item) for item in observed_imports - AUTHORITY_IMPORTS)
+        absent = sorted(str(item) for item in AUTHORITY_IMPORTS - observed_imports)
+        if unexpected:
+            failures.append(f"{prefix}unapproved imports: {unexpected}")
+        if absent:
+            failures.append(f"{prefix}required imports are absent: {absent}")
+
+    if len(functions) != 1 or functions[0].name != AUTHORITY_FUNCTION_NAME:
+        failures.append(
+            f"{prefix}module must declare exactly one function named "
+            f"{AUTHORITY_FUNCTION_NAME!r}"
+        )
+        return failures
+
+    function = functions[0]
+    arguments = function.args
+    if (
+        arguments.posonlyargs
+        or arguments.kwonlyargs
+        or arguments.vararg is not None
+        or arguments.kwarg is not None
+        or arguments.defaults
+        or arguments.kw_defaults
+        or len(arguments.args) != 1
+    ):
+        failures.append(
+            f"{prefix}{AUTHORITY_FUNCTION_NAME} must take exactly one "
+            "positional-or-keyword parameter with no default"
+        )
+        return failures
+    parameter = arguments.args[0].arg
+    shape_failures, journal = _authority_shape_failures(function, parameter, prefix)
+    failures.extend(shape_failures)
+
+    bound = sorted(
+        {
+            node.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+    )
+    if bound != ([journal] if journal is not None else []):
+        failures.append(
+            f"{prefix}the only name that may be bound is the constructed "
+            f"journal, found {bound}"
+        )
+    if any(
+        isinstance(node, ast.Name)
+        and node.id == parameter
+        and not isinstance(node.ctx, ast.Load)
+        for node in ast.walk(tree)
+    ):
+        failures.append(f"{prefix}parameter {parameter!r} is bound or deleted")
+
+    statements = list(function.body)
+    if (
+        statements
+        and isinstance(statements[0], ast.Expr)
+        and isinstance(statements[0].value, ast.Constant)
+    ):
+        statements = statements[1:]
+    for statement in ast.walk(function):
+        if statement is function:
+            continue
+        if isinstance(statement, ast.stmt) and not isinstance(
+            statement, AUTHORITY_STATEMENT_TYPES
+        ):
+            if statement in function.body and statement is function.body[0]:
+                continue
+            failures.append(
+                f"{prefix}statement {type(statement).__name__} is not allowed "
+                f"at line {statement.lineno}"
+            )
+
+    for node in ast.walk(function):
+        if isinstance(node, ast.expr) and not isinstance(
+            node, AUTHORITY_EXPRESSION_TYPES
+        ):
+            failures.append(
+                f"{prefix}expression {type(node).__name__} is not allowed at "
+                f"line {node.lineno}"
+            )
+        if isinstance(node, ast.UnaryOp) and not isinstance(node.op, ast.Not):
+            failures.append(
+                f"{prefix}only 'not' is allowed as a unary operator at line "
+                f"{node.lineno}"
+            )
+        if isinstance(node, ast.Call):
+            message = _authority_callee_failure(node, parameter, journal)
+            if message is not None:
+                failures.append(f"{prefix}{message} at line {node.lineno}")
+            if isinstance(node.func, ast.Name) and node.func.id == "EventLog":
+                kind, name = _constructor_argument_shape(node)
+                if kind != "name" or name != parameter:
+                    failures.append(
+                        f"{prefix}the journal constructor must receive the "
+                        f"parameter {parameter!r} at line {node.lineno}"
+                    )
+
+    if function.returns is not None:
+        failures.append(
+            f"{prefix}{AUTHORITY_FUNCTION_NAME} must carry no return "
+            "annotation, because naming the journal class there would place a "
+            "second occurrence outside the approved call"
+        )
+    return failures
 
 
 def _literal_assignment(tree: ast.Module, name: str) -> ast.AST | None:
@@ -490,7 +964,8 @@ class _ProductionVisitor(ast.NodeVisitor):
         self.lifecycle_reads: list[_AttributeUse] = []
         self.tolerant_reconcile_reads: list[_AttributeUse] = []
         self.state_materializers: list[_StateMaterializerUse] = []
-        self.eventlog_constructors: list[tuple[str, str, int]] = []
+        self.eventlog_constructors: list[_ConstructorUse] = []
+        self.eventlog_acquisitions: list[_ConstructorUse] = []
 
     def visit(self, node: ast.AST) -> None:
         self.parents.append(node)
@@ -595,13 +1070,38 @@ class _ProductionVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "open_existing"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "EventLog"
+        ):
+            kind, name = _constructor_argument_shape(node)
+            self.eventlog_acquisitions.append(
+                _ConstructorUse(
+                    self.path,
+                    tuple(self.scope),
+                    self._qualified_scope(),
+                    node.lineno,
+                    kind,
+                    name,
+                )
+            )
+        if (
             isinstance(node.func, ast.Name)
             and node.func.id == "EventLog"
             or isinstance(node.func, ast.Attribute)
             and node.func.attr == "EventLog"
         ):
+            kind, name = _constructor_argument_shape(node)
             self.eventlog_constructors.append(
-                (self.path, self._qualified_scope(), node.lineno)
+                _ConstructorUse(
+                    self.path,
+                    tuple(self.scope),
+                    self._qualified_scope(),
+                    node.lineno,
+                    kind,
+                    name,
+                )
             )
         if (
             (

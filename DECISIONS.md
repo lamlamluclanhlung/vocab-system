@@ -8075,3 +8075,664 @@ on every lifecycle and recovery path, and a genuinely closed import
 allowlist — ordered behind a release precondition rather than a runtime
 heuristic, because no durable field distinguishes pre-gate from post-gate
 history.
+
+## D70 — Operational runtime, deployment identity, and EventLog acquisition authority
+
+**Date:** 2026-08-28
+**Status:** Accepted
+**Blocks:** Operational Runtime Wave A, Wave B
+
+D70 introduces the first persistent deployment EventLog. It adds no producer
+behavior, no lifecycle behavior, and no new event type.
+
+### 1. Purpose
+
+Every T6-T12 core is complete and gated, but no released code may obtain an
+EventLog, so none of it can be operated. D70 defines the minimum operational
+layer that lets one human run the system daily without composing internal
+Python APIs, without weakening the authority, provenance, determinism, and
+crash properties established by D57 through D69.
+
+### 2. Authority and supersession
+
+vocab/contracts.py and vocab/models.py remain highest precedence. D62 governs
+the T12.1 bootstrap assertion.
+
+D70 supersedes exactly three clauses, each only to the stated extent:
+
+  (i)   D70 supersedes D69 section 10 only to the extent necessary to admit
+        vocab/runtime/eventlog_authority.py into the concrete events import
+        allowlist, which grows from one path to exactly two:
+        vocab/assessment_producer.py and vocab/runtime/eventlog_authority.py.
+        D69 section 10's closure over every alias, relative level, wildcard,
+        and module-object form, and its exclusion of every other module, are
+        unchanged and apply to both admitted paths.
+
+  (ii)  D70 supersedes D68's guarantee that generic EventLog.log behavior is
+        unchanged, and only for the missing-path-after-construction case: the
+        physical append now opens an existing file without O_CREAT, so a
+        journal that disappears after construction fails loudly instead of
+        being silently recreated. Successful appends are byte-identical.
+
+  (iii) D70 adds the EventLog.open_existing acquisition authority of section 7
+        and the runtime layer of sections 3 through 18.
+
+D69 section 13 P1a REMAINS IN FORCE, unchanged and unweakened: no production
+module may call the EventLog constructor. The constructor opens in append mode
+and therefore creates files, which is precisely the behavior a deployment
+must never have. The runtime obtains its journal through open_existing
+instead.
+
+All other D68 and D69 clauses remain unchanged, including D68's log authority
+matrix, D69 section 9 strict lifecycle reads, section 11 authority boundary,
+section 12 STATE materialization, the section 13 P1b attestation, section 14
+lifecycle enablement, section 16 evidence policy, and section 17 failure
+semantics. D35, D53, D55, D56, D57, D59, D60, D61, D63 through D67 are
+unchanged.
+
+### 3. Deployment, layout, and lifecycle states
+
+A deployment is one data_root directory: one journal, one artifact store, one
+session root, one set of T12 ledgers. The DURABLE LAYOUT is frozen and not
+configurable, and consists of exactly these eight entries:
+
+    runtime-identity.json      file
+    events.jsonl               file
+    artifacts/                 directory
+    sessions/                  directory
+    t12-exposures.jsonl        file
+    t12-captures.jsonl         file
+    t12-dispositions.jsonl     file
+    t12-transcriptions.jsonl   file
+
+runtime.lock at data_root/runtime.lock is an EPHEMERAL COORDINATION PATH. It
+is never a durable layout entry, never deployment state, and never part of a
+layout completeness check or of the bootstrap emptiness check. Its absence
+means unlocked and its presence means locked. Excluding it from the emptiness
+check is what makes O_EXCL, rather than a directory listing, the race
+resolver; it does not weaken section 12.
+
+Three states are named and never conflated:
+
+  INCOMPLETE DATA ROOT   runtime-identity.json absent, or present and failing
+                         full validation against section 4.
+  COMMITTED DEPLOYMENT   runtime-identity.json present and fully valid. States
+                         only that the commit marker exists.
+  OPERATIONALLY VALID    COMMITTED, and the full runtime write-preflight of
+                         section 13 passed while the lock was held.
+
+Only an OPERATIONALLY VALID deployment may be written to.
+
+### 4. Runtime identity
+
+runtime-identity.json is one canonical JSON object encoded by
+canonical_json_bytes and decoded by strict_json_loads. Its keyset is closed and
+exact; unknown keys, missing keys, duplicate keys, and a non-object top level
+all fail.
+
+    identity_version           int, exactly 1, not bool
+    runtime_id                 str, canonical lowercase UUID version 4
+    layout_version             int, exactly 1, not bool
+    created_utc                str, normalized ISO-8601 UTC with +00:00,
+                               per validated_utc_timestamp
+    bootstrap_registry_count   int, >= 0, not bool
+    bootstrap_registry_digest  str, "sha256:" plus 64 lowercase hex digits
+
+No absolute path is recorded, so relocating a complete data_root is legal.
+
+The digest is computed over one frozen projection: the unit_key strings
+returned by read_registry_snapshot, ascending, hashed with canonical_sha256.
+note_id is deliberately excluded because it changes across Anki collection
+export and import, and including it would produce a digest that appears
+comparable but is not. Both registry fields are one-time forensic evidence and
+are never enforced or recompared after bootstrap.
+
+### 5. Durability properties for the commit marker
+
+Four distinct properties, never collapsed into one claim:
+
+  D-1  CONTENT PREPARATION. Exact canonical bytes are written to a temporary
+       file in the same directory as the final identity path.
+  D-2  CONTENT DURABILITY. Those bytes are flushed and fsynced before
+       publication.
+  D-3  ATOMIC VISIBILITY. Publication is atomic; no partially written file may
+       ever be observable at the final path.
+  D-4  NO OVERWRITE. The final path must not preexist. Publication onto an
+       existing path fails.
+  D-5  POST-PUBLICATION VALIDATION. The file is read back from the final path
+       and fully validated against section 4 before success is reported.
+  D-6  NAMESPACE DURABILITY. The created directory entry is made durable
+       before success is reported, using a primitive appropriate to the
+       platform.
+
+No specific system call is mandated. Residual R-1, accepted and bounded: where
+no portable D-6 primitive exists, a crash between publication and namespace
+durability loses the directory entry. The result is a MISSING identity file,
+which is an INCOMPLETE DATA ROOT already fail-closed by B-5 and B-6. A partial
+or corrupt marker can never appear, because D-3 and D-4 forbid it.
+
+### 6. Configuration
+
+One explicit JSON file supplied by --config, decoded by strict_json_loads.
+There is no default path, no working-directory discovery, no environment
+variable, and no fallback. The keyset is closed and exact:
+
+    config_version   int, exactly 1, not bool
+    data_root        str, DEPLOYMENT PATH
+    corpus_root      str, DEPLOYMENT PATH
+    anki             object with the closed keyset below
+
+    anki.endpoint    str, non-empty
+    anki.timeout     int or float, not bool, finite, strictly positive
+    anki.deck_name   str, non-empty, no leading or trailing whitespace
+
+DEPLOYMENT PATH grammar: the literal string must denote an absolute path and
+must contain no "." and no ".." component. The grammar is checked on the text
+the human wrote, not on parsed components, because pathlib silently collapses a
+"." component and would hide it. The path is not resolved, because resolution
+differs across platforms, and D70 makes no symbolic-link claim (residual R-2).
+Two spellings of one directory denote one deployment; mutual exclusion holds
+because O_EXCL operates at the filesystem level rather than on the path string.
+
+corpus_root is validated in Wave A and consumed in Wave B, so a Wave A
+configuration file remains valid for Wave B without edit.
+
+Changing data_root selects a different deployment. It never migrates, adopts,
+or merges one.
+
+### 7. EventLog acquisition authority
+
+#### 7.1 Why acquisition rather than construction
+
+EventLog.__init__ opens its path in append mode, which creates a missing file.
+A deployment must never do that: an empty history reads clean, so a lost
+production history would be reported healthy. D69 P1a therefore remains in
+force and no production module calls the constructor.
+
+vocab/events.py gains EventLog.open_existing, a narrow existing-only
+acquisition primitive. It opens without O_CREAT, verifies through the
+descriptor that the target is a regular file, and constructs the exact
+EventLog instance without invoking __init__. A missing path, a non-regular
+path, or any acquisition failure fails. It never creates, truncates, repairs,
+adopts, or replaces a history. It is not implemented as an existence check
+followed by construction, because that reintroduces a check-then-create race.
+The constructor remains available to legacy and test callers.
+
+#### 7.2 Closed acquisition matrix
+
+    APPROVED_EVENT_LOG_ACQUISITIONS = {
+        ("vocab/runtime/eventlog_authority.py",
+         "open_runtime_event_log", "open_existing", 1)
+    }
+
+enforced in both directions on path, function scope, call name, and count. The
+single positional argument must be an ast.Name bound to the function's
+parameter; a constant, attribute, subscript, call expression, global, keyword,
+or starred argument fails. APPROVED_EVENT_LOG_CONSTRUCTORS is empty, which is
+the machine form of P1a remaining in force.
+
+#### 7.3 Positive structural allowlist for the approved module
+
+Constructor and acquisition authority may not be aliased, captured, assigned,
+returned, passed, stored, obtained through getattr, obtained through a wildcard
+import, or obtained through module-object access. This is enforced by
+restricting the entire abstract syntax tree of the approved module:
+
+  P-1  MODULE BODY. Only an optional docstring, the ImportFrom statements of
+       P-2, and exactly one FunctionDef named open_runtime_event_log. No
+       ast.Import anywhere. No ClassDef, Assign, If, Try, With, For, While, or
+       any other module-level statement.
+  P-2  IMPORTS. Exactly these four ImportFrom statements, each with exactly the
+       names shown and asname None:
+           from __future__ import annotations
+           from pathlib import Path
+           from ..events import EventLog, EventLogCorruptionError,
+                                UnsupportedEventVersionError
+           from .errors import RuntimeEventLogError
+       Any additional, missing, aliased, wildcard, or module-object form fails.
+  P-3  SIGNATURE. Exactly one positional-or-keyword parameter, no default, no
+       positional-only or keyword-only parameters, no *args, no **kwargs. No
+       return annotation, because an annotation naming the journal class would
+       place a second occurrence of that name outside the approved expression.
+  P-4  STATEMENTS. Only a leading docstring, If, Raise, Return, Assign, Try,
+       ExceptHandler, and Expr may appear in the function.
+  P-5  EXPRESSIONS. Only Name, Attribute, Call, Constant, Compare, BoolOp,
+       UnaryOp restricted to Not, Tuple, JoinedStr, and FormattedValue. Every
+       other expression kind fails, including NamedExpr, Lambda, Subscript,
+       Starred, List, Dict, Set, and every comprehension form.
+  P-6  CALLEES. Every call must be one of: the ast.Name "isinstance"; the
+       ast.Name "RuntimeEventLogError"; the ast.Attribute "is_absolute" or
+       "is_file" on the parameter; the ast.Attribute "open_existing" on the
+       ast.Name "EventLog"; or the ast.Attribute "read_strict" on the acquired
+       name. Any other callee fails.
+  P-7  NO PARAMETER REBINDING. The parameter name may not appear in a Store or
+       Del context anywhere in the module, and the acquired journal name is the
+       only name the function may bind.
+
+The parameter type guard uses isinstance rather than an exact type identity
+comparison, because pathlib.Path is a factory returning a platform subclass, so
+an exact identity comparison against Path can never hold. This is not a
+relaxation of the exact-type discipline used at other authority seams, where
+the compared class is a concrete dataclass rather than a factory.
+
+#### 7.4 Frozen body shape
+
+A node-kind filter cannot express what matters here, because it cannot see the
+relationship between the acquired name, the strict-read receiver, and the
+returned name. The body shape is therefore frozen exactly:
+
+  S-1  Every statement preceding the acquisition is an If carrying exactly one
+       Raise and no else.
+  S-2  The last two statements are exactly one Try and then one Return.
+  S-3  The Try carries no else and no finally, and exactly one handler.
+  S-4  The handler catches exactly EventLogCorruptionError,
+       UnsupportedEventVersionError, and OSError, and its body is exactly one
+       Raise. A generic ValueError or Exception catch fails.
+  S-5  The Try body is exactly two statements: one Assign, then one Expr.
+  S-6  The Assign binds exactly one Name, which is not the parameter, to
+       exactly EventLog.open_existing(<parameter>).
+  S-7  The Expr is exactly <acquired>.read_strict(), with no arguments and no
+       keywords.
+  S-8  The Return returns exactly the acquired Name.
+  S-9  read_strict, Return, Assign, and Try each appear exactly once in the
+       function.
+
+Consequently no production journal object can leave this module without having
+been strictly read, and the object acquired, the object read, and the object
+returned are provably the same object.
+
+#### 7.5 Strict reading belongs to the authority
+
+Strict reading is performed by the authority itself, inside the frozen shape,
+not by its callers. Preflight does not supply this guarantee and must not be
+relied upon for it. No second EventLog parser is introduced, in keeping with
+D69 section 19.
+
+#### 7.6 Lock discipline
+
+open_runtime_event_log may be called only while the deployment lock of section
+12 is held. This is a normative code-structure invariant, not a static one
+(residual R-3); its evidence is the behavior required by G-11.
+
+### 8. Relationship to D69 P1
+
+D69 P1 established that every assessment-triggered PREPARE reachable under
+released code was created under the D69 gate, grounded in rule A: no persistent
+deployment EventLog had ever existed. P1b was attested at the T12.4 release and
+is not reopened.
+
+D70 deliberately ends the rule-A baseline by creating the first persistent
+deployment history. The guarantee P1 secured is preserved by a stronger
+argument: the production journal is created empty by bootstrap under code that
+already contains the complete D69 gate, and section 9 forbids adopting any
+pre-existing file. Every record in an authoritative history therefore postdates
+the gate by construction. Where P1b had to assert something it could not
+enumerate, D70 forecloses it.
+
+D58_CLAUSES, the clause-to-selector registry, and the per-channel required
+clause set are unchanged. The registered obligation
+production_eventlog_construction_p1a is unchanged and its existing probe passes
+unmodified, because P1a itself is unmodified.
+
+### 9. Bootstrap protocol
+
+Bootstrap is the only operation that may create a deployment, the only
+operation that may create events.jsonl, and the only operation that may create
+artifacts/. It is the sole exception to the runtime-identity precondition of
+section 11, because it creates that identity. The exception is stated here and
+is not hidden in implementation.
+
+    PHASE 0 - PRECONDITION. Nothing at or beneath data_root is created,
+    modified, or removed, under any outcome.
+     0.1  load and validate the configuration against section 6
+     0.2  require data_root nonexistent, or existing and holding nothing but
+          the ephemeral lock
+     0.3  bootstrap-preflight: AnkiConnect reachability, the VocabularyUnit
+          note type, deck existence, leech configuration. It never requires,
+          reads, or validates a runtime identity.
+     0.4  enumerate the profile registry through read_registry_snapshot,
+          display every row, and compute the registry count and digest
+     0.5  require both --confirm-new-deployment and
+          --confirm-clean-production-profile. If either is absent, the
+          displayed registry stands as the informed record, the command exits
+          nonzero, and nothing has been created.
+
+    The confirmation check is deliberately last in phase 0. Displaying the
+    registry before requiring confirmation is what makes the section 15
+    attestation informed rather than blind; placing all of phase 0 before any
+    side effect is what makes a refused confirmation leave no trace.
+
+    PHASE 1 - CREATION.
+     1.1  create data_root if absent
+     1.2  acquire data_root/runtime.lock with O_EXCL, before any durable
+          content
+     1.3  re-verify data_root holds nothing but the lock
+     1.4  create artifacts/
+     1.5  create sessions/
+     1.6  create events.jsonl exclusively; an existing file fails
+     1.7  create the T12 triple through initialize_t12_ledgers with
+          no_historical_t12_state=True
+     1.8  create the transcription ledger
+     1.9  re-read and validate every created durable artifact from disk
+    1.10  publish runtime-identity.json under D-1 through D-6
+    1.11  release the lock
+
+Step 0.2 is not the race resolver; O_EXCL at 1.2 is. A bootstrap that loses the
+race aborts and must not remove data_root, because it cannot know whether it or
+the winner created it. Bootstrap never removes anything, under any outcome.
+
+Interruption semantics:
+
+    B-1  a partial bootstrap is never auto-resumed
+    B-2  nothing is auto-repaired
+    B-3  no existing file, ledger, or journal is auto-adopted
+    B-4  nothing is auto-deleted
+    B-5  a crash before the identity is published under D-1 through D-6 leaves
+         an INCOMPLETE DATA ROOT, which is not a deployment
+    B-6  the next invocation fails closed and requires a human to inspect and
+         remove the incomplete data root before bootstrapping again
+
+### 10. Interruption boundaries
+
+An INTERRUPTION BOUNDARY is the point immediately after any operation that
+changes observable filesystem state at or beneath data_root:
+
+    I-0   phase 0 complete, before 1.1        I-7   transcription ledger created
+    I-1   data_root created                   I-8   validation at 1.9 complete
+    I-2   runtime.lock acquired               I-9   identity temp written (D-1)
+    I-3   artifacts/ created                  I-10  identity temp fsynced (D-2)
+    I-4   sessions/ created                   I-11  atomic publication (D-3)
+    I-5   events.jsonl created                I-12  namespace durability (D-6)
+    I-6   initialize_t12_ledgers returned     I-13  readback validated (D-5)
+
+Step 1.7 calls existing frozen code whose internal partial states cannot be
+enumerated from outside. D70 treats I-6 as one boundary and additionally
+requires every externally observable partial ledger state, meaning each proper
+subset of the three T12 ledger files, to fail closed on the next invocation.
+
+At every boundary from I-1 through I-12 the identity is absent and the data
+root is INCOMPLETE, so every normal command fails closed. At I-13 it is
+COMMITTED.
+
+B-6 requires human inspection and removal, with exactly one exception:
+
+  I-1 only. The data root is an empty directory holding no durable content and
+  no lock. There is nothing to adopt, resume, or repair, so bootstrap may retry
+  automatically. This is consistent with step 0.2, which already accepts an
+  existing empty data root. Normal commands still fail closed, because no
+  identity exists.
+
+  I-2 is NOT an exception. A runtime.lock surviving an interruption is a stale
+  lock and retains the full authority of section 12: the next invocation fails
+  closed with the lock exit code, the lock is never broken, expired, or deleted
+  automatically, and a human must inspect and explicitly remove it before
+  bootstrapping again. An invocation still alive and holding its own lock at
+  I-2 is not a recovery case and proceeds normally. Section 3's exclusion of
+  the lock from the emptiness check governs only whether a directory counts as
+  empty; it never authorizes proceeding past a lock that O_EXCL refuses.
+
+  From I-3 onward durable content exists and B-6 applies without exception.
+
+### 11. Normal write protocol and lock ordering
+
+Every write-capable command other than bootstrap follows exactly this order:
+
+     1  load configuration and read and fully validate runtime-identity.json,
+        only far enough to identify the committed deployment
+     2  acquire data_root/runtime.lock with O_EXCL
+     3  run the full runtime write-preflight while holding the lock
+     4  run the operation
+     5  release the lock
+
+Preflight is never completed before the lock is acquired, because two processes
+can both pass a preflight taken outside the lock. Step 1 answers only which
+deployment is addressed; it never establishes that writing is safe.
+
+### 12. Lock semantics
+
+The lock is acquired with O_EXCL, records the acquiring process id and an
+ISO-8601 UTC timestamp, and is removed on release, including on an operation
+that raises. A lock surviving a crash is stale. A stale or held lock causes
+every write-capable command to fail closed with the lock exit code and the
+recorded pid and timestamp. There is no force override, no timeout expiry, and
+no automatic breaking. Clearing a stale lock is a human act. The standalone
+preflight never creates, acquires, modifies, or removes the lock.
+
+### 13. Preflight
+
+BOOTSTRAP-PREFLIGHT, at step 0.3, checks AnkiConnect reachability, the note
+type, deck existence, and leech configuration. It never requires or reads a
+runtime identity, because none exists yet.
+
+RUNTIME WRITE-PREFLIGHT runs at section 11 step 3 while the lock is held. It
+verifies configuration validity, full section 4 identity validation, existence
+and correct kind of all eight durable entries, AnkiConnect reachability, note
+type, deck, leech configuration, the journal through the section 7 authority,
+T12 triple consistency, and the transcription ledger. Nothing is repaired. Its
+success is what establishes OPERATIONALLY VALID.
+
+STANDALONE PREFLIGHT is diagnostic. It performs only the subset requiring
+neither the lock nor a journal, and reports journal and ledger consistency as
+NOT EVALUATED, a third outcome distinct from PASS and FAIL. This keeps "another
+process is writing" separate from "the data is corrupt", and prevents a
+concurrently removed journal from being observed at all. A standalone result is
+never authority to write.
+
+ArtifactStore.__init__ calls mkdir(parents=True, exist_ok=True). No preflight
+may therefore construct an ArtifactStore before verifying that artifacts/
+already exists and is a directory; if it does not, the check fails closed and
+no store is constructed. ArtifactStore itself is not modified. Bootstrap
+remains the only path that creates artifacts/.
+
+Neither preflight can determine which Anki profile is open (residual R-5).
+
+### 14. Profile registry enumeration
+
+Bootstrap enumerates the registry through the existing
+vocab.corpus.read_registry_snapshot. No second registry-validation authority is
+created. That function already fails closed on a non-list result, non-integer
+ids, duplicate ids, a notes_info cardinality mismatch, a foreign or repeated
+noteId, a wrong modelName, a field set that does not match NOTE_FIELDS, a
+malformed unit_key, a blank lemma, an invalid unit_type, an invalid D19 Unit
+shape, a duplicate unit_key, and any requested id missing from the response,
+and it returns entries ordered by unit_key.
+
+RegistryEntry carries no note_id and is not modified to carry one; its identity
+deliberately excludes a mutable Anki row id. Bootstrap needs no note_id. Wave B
+target discovery, which does need one, is a separate concern that must not
+duplicate or weaken this validation.
+
+### 15. Anki profile as registry boundary
+
+The Anki profile, not the deck, is the registry isolation boundary. FORGE
+deduplicates on unit_key without a deck or note-type filter, and both the T8
+context exporter and the T10 registry snapshot read the whole profile. The deck
+named Vocab Lab is not a sandbox.
+
+Before the first production write the production profile must not hold smoke or
+test artifacts as real data. The human either uses a clean production profile
+and moves all testing to a separate profile, or backs up and explicitly removes
+those notes. No note is ever deleted automatically. This is enforced only as an
+informed human attestation: bootstrap displays the complete registry and
+requires --confirm-clean-production-profile. Like P1b, the attestation is
+deliberately not machine-verifiable, because no definition of "test note" exists
+that a machine could apply (residual R-6).
+
+### 16. Reconcile targeting and error semantics
+
+Frozen by D70, implemented in Wave B, carrying no Wave A obligation.
+
+Reconcile targeting consumes the section 14 enumeration without adding or
+weakening validation, and an explicit single-note selection passes through the
+same enumeration, so no command writes lifecycle against a registry containing
+a duplicate unit_key. Units are processed independently in unit_key order.
+Every Unit emits exactly one result line. Any Unit failure produces a nonzero
+exit code. The summary always states failed=N. An overall OK is printed only
+when failed == 0. A fail-fast flag is an optional override. An enumeration
+failure is global, not per-Unit.
+
+### 17. FORGE operational bridge
+
+Frozen by D70, implemented in Wave B, carrying no Wave A obligation.
+
+The FORGE operational boundary is human-mediated and two-phase, matching the T8
+and T11 precedent. No paid provider API and no automated model adapter is
+introduced, and the Forge core is not modified. An export command emits a
+closed-schema request artifact carrying the exact ForgeRequest fields,
+FORGE_JSON_SCHEMA, and generation_request_sha256. An import command accepts a
+closed-schema response artifact carrying the matching
+generation_request_sha256. model_id and model_version are declared explicitly by
+the human and never defaulted. prompt_version and prompt_sha256 come from a
+repo-owned prompt artifact hashed at run time. generation_config is the empty
+mapping. The replay adapter satisfies the existing Generator protocol, is
+constructed only from an already strict-validated and request-bound artifact,
+never reads arbitrary JSON, and re-verifies the binding against the
+ForgeRequest that forge() passes it. A mismatch raises, and forge() aborts
+before any durable write.
+
+### 18. Error taxonomy and exit codes
+
+Exit codes are frozen so that distinct failure classes never collapse:
+
+    0   success, printed only when the operation fully succeeded
+    1   fail-closed refusal
+    2   reserved for the argument parser's usage error, never assigned here
+    3   the deployment lock could not be acquired
+    4   the operation ran and reported per-item failures (Wave B only)
+
+There is no global operational exception tuple, and in particular ValueError is
+never treated as operational across arbitrary blocks. Several core errors are
+ValueError subclasses, but that does not make every ValueError a refusal, and a
+defect raising a bare ValueError must surface rather than becoming exit 1.
+
+Normalization happens only at narrow lexical seams, each catching only the
+family its own operation can raise:
+
+    Anki seam                 AnkiConnectError
+    corpus seam               CorpusScanError
+    artifact store seam       ArtifactStoreError
+    ledger seam               CaptureLedgerError, ExposureLedgerError,
+                              TranscriptionLedgerError
+    filesystem seam           OSError, around the exact operation only
+    journal authority seam    EventLogCorruptionError,
+                              UnsupportedEventVersionError, OSError, around the
+                              exact acquisition and strict read, frozen by S-4
+
+Runtime-owned validation raises VocabRuntimeError subclasses directly.
+
+cli.main catches exactly RuntimeLockError, mapped to exit 3, and
+VocabRuntimeError, mapped to exit 1. There is no catch-all handler and no
+generic ValueError catch at the composition root or in the preflight framework.
+Multiple underlying operational classes may map to exit 1, but only through
+this named taxonomy. Anything outside it is a programming defect and surfaces
+with its traceback, because a defect reported as exit 1 would be
+indistinguishable from a deliberate fail-closed refusal.
+
+### 19. Accepted residuals
+
+  R-1  D-6 namespace durability may be unavailable as a portable primitive. The
+       failure mode is a missing commit marker, already fail-closed.
+  R-2  No symbolic-link claim is made. Mutual exclusion rests on the
+       filesystem-level lock, not on path comparison.
+  R-3  Confining the journal authority to the locked path is a code-structure
+       invariant, not a static one. Its evidence is behavioral.
+  R-4  Restoring an older backup over a newer history is not detected. That is
+       backup discipline, and detecting it would need a monotonic counter D70
+       does not add.
+  R-5  No preflight can determine which Anki profile is open.
+  R-6  The section 15 attestation is not machine-verifiable.
+
+### 20. Not changed
+
+vocab/contracts.py, vocab/models.py, vocab/validators.py,
+vocab/card_contract.py, vocab/media_contract.py,
+tests/test_contract_alignment.py, tests/d58_probe_inventory.py, the Forge core,
+vocab/reconcile.py, vocab/corpus.py, vocab/anki.py, vocab/artifact_store.py,
+every T12 module, and vocab/t8_cli.py, which keeps its own CLI in Wave A. In
+vocab/events.py only the two changes of section 2(ii) and 7.1 are made; reading,
+validation, and the D68 log authority matrix are untouched. No roadmap
+checkpoint is created, renamed, or extended. No existing probe is weakened,
+skipped, or deleted.
+
+### 21. Out of scope
+
+T11 and T12 user-facing orchestration; any session runner or reports module; a
+relocation command; a migration engine; backup versioning or rollback
+detection; multi-process concurrency beyond a single advisory lock; a daemon or
+scheduler; a GUI or web interface; a registry database; any paid provider API;
+packaging or distribution; automatic Anki profile detection; symbolic-link
+hardening.
+
+### 22. Wave A release gate
+
+Wave A delivers the runtime foundation only: configuration, layout, identity,
+lock, the journal acquisition authority, bootstrap, the three preflights, the
+bootstrap and preflight CLI, the static invariants of section 7, and the README
+and runbook. It must not be committed or pushed unless all of the following
+hold.
+
+Enforced by one official unfiltered run of pytest with no arguments:
+
+    G-1   D69 acceptance certified, required item count at least 179. Any
+          reduction is NO-GO.
+    G-2   The full suite passes, with no skip, xfail, xpass, deselection, or
+          non-execution on any registered node.
+    G-4   P1a passes unchanged: any EventLog constructor call in any production
+          module fails.
+    G-5   The section 7.2 acquisition matrix passes in both directions, and
+          every non-parameter argument form fails.
+    G-6   The section 7.3 allowlist and the section 7.4 shape pass: every
+          violation of P-1 through P-7 and S-1 through S-9 fails, including a
+          removed, relocated, aliased, argument-bearing, or foreign-object
+          strict read, a second acquisition, and a generic ValueError or
+          Exception handler.
+    G-7   The section 2(i) import allowlist passes with exactly two admitted
+          paths and rejects every indirect form from every other module.
+    G-8   Bootstrap invariants pass: refusal on a non-empty data root, on an
+          existing journal, and on either confirmation being absent; complete
+          creation of all eight durable entries on success; and phase 0
+          creating, modifying, and removing nothing under any outcome.
+    G-9   Interruption invariants B-1 through B-6 pass at every boundary of
+          section 10 and for every proper subset of the T12 ledger files, with
+          the I-1 exception honored and I-2 refused as a stale lock.
+    G-10  Configuration and path invariants pass with no side effects.
+    G-11  Identity invariants pass, including D-1 through D-6, refusal to
+          publish onto an existing path, and full readback validation.
+    G-12  Lock and authority invariants pass: the lock is demonstrably acquired
+          before any write-preflight step executes; a held or stale lock fails
+          closed with exit 3 and is not broken; standalone preflight neither
+          touches the lock nor observes a journal; and the lock is released on
+          both normal and exceptional exit.
+    G-13  EventLog.open_existing refuses a missing or non-regular path and
+          creates nothing; log() refuses to append to a journal that has
+          disappeared and leaves the path absent; and a normal append is
+          unchanged.
+    G-14  A corrupt history fails closed with its bytes unchanged and no new
+          file created anywhere under data_root other than the lock.
+    G-15  Deleting artifacts/ after bootstrap makes both the standalone and the
+          write preflight fail without recreating the directory and without
+          changing any other deployment file.
+    G-16  A synthetic ValueError raised outside a narrow operational seam
+          surfaces as a defect rather than becoming exit 1, and the composition
+          root carries no catch-all handler.
+    G-17  Exit codes match section 18 for every failure class.
+
+Enforced by auxiliary commands rather than by the suite:
+
+    G-3   git diff --stat shows tests/d58_probe_inventory.py unchanged.
+    G-18  python -m compileall over vocab, tests, and conftest.py passes.
+    G-19  git diff --check passes.
+
+The detailed test-case inventory lives in the implementation plan. One
+violation is NO-GO.
+
+**Reason:** The system cannot be operated at all, because no released code may
+obtain a journal, and the invariant forbidding it exists to protect a baseline
+claim rather than to forbid operation permanently. Adding an existing-only
+acquisition primitive keeps P1a fully in force while making the first
+deployment history possible: acquisition cannot create, the append path can no
+longer recreate a lost journal, the sole acquisition site is frozen to a shape
+in which the acquired, read, and returned objects are provably identical, and
+bootstrap refuses to adopt any pre-existing history and commits only on a final
+durable identity marker. The baseline ends deliberately, and its guarantee is
+replaced by a constructive one.

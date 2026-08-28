@@ -18,8 +18,11 @@ import vocab.assessment_producer as producer_module
 import vocab.events as events_module
 import vocab.reconcile as reconcile_module
 from tests.t12_ast_invariants import (
+    APPROVED_EVENT_LOG_ACQUISITIONS,
+    APPROVED_EVENT_LOG_CONSTRUCTORS,
     APPROVED_LIFECYCLE_HISTORY_READS,
     APPROVED_STATE_MATERIALIZERS,
+    CONCRETE_EVENT_IMPORT_ALLOWLIST,
     assert_d58_probe_invariants,
     assert_t12_ast_invariants,
 )
@@ -840,3 +843,153 @@ def test_unrelated_regression_failure_cannot_certify_acceptance(
     assert "D69 acceptance not certified" in output
     assert "full pytest session exit status" in output
     assert "D69 acceptance certified" not in output
+
+
+# ----------------------------------------------------------------------
+# D70 section 7: constructor allowlist and approved-module closure probes
+# ----------------------------------------------------------------------
+
+
+_AUTHORITY = "vocab/runtime/eventlog_authority.py"
+_TAIL = """    try:
+        journal = EventLog.open_existing(path)
+        journal.read_strict()
+    except (
+        EventLogCorruptionError,
+        UnsupportedEventVersionError,
+        OSError,
+    ) as exc:
+        raise RuntimeEventLogError(
+            f"deployment journal could not be acquired and read: {exc}"
+        ) from exc
+    return journal"""
+_HANDLER = """    except (
+        EventLogCorruptionError,
+        UnsupportedEventVersionError,
+        OSError,
+    ) as exc:
+        raise RuntimeEventLogError("x") from exc"""
+
+
+def _mutate(root: Path, relative: str, old: str, new: str) -> None:
+    target = root / relative
+    source = target.read_text(encoding="utf-8")
+    assert source.count(old) == 1, f"anchor is not unique in {relative}"
+    target.write_text(source.replace(old, new, 1), encoding="utf-8")
+
+
+def test_d70_static_invariants_accept_the_real_tree() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    assert APPROVED_EVENT_LOG_CONSTRUCTORS == frozenset()
+    assert len(APPROVED_EVENT_LOG_ACQUISITIONS) == 1
+    assert CONCRETE_EVENT_IMPORT_ALLOWLIST == {
+        "vocab/assessment_producer.py",
+        "vocab/runtime/eventlog_authority.py",
+    }
+    assert_t12_ast_invariants(repository)
+
+
+@pytest.mark.parametrize(
+    ("replacement", "match"),
+    (
+        pytest.param("    journal = EventLog(path)\n    return journal", "construction is forbidden", id="direct-constructor"),
+        pytest.param(_TAIL.replace("        journal.read_strict()", "        journal.read_strict()\n        EventLog(path)"), "construction is forbidden", id="constructor-alongside-acquisition"),
+        pytest.param(_TAIL.replace("EventLog.open_existing(path)", 'EventLog.open_existing("events.jsonl")'), "parameter argument", id="constant-path"),
+        pytest.param(_TAIL.replace("EventLog.open_existing(path)", "EventLog.open_existing(path.parent)"), "parameter argument", id="derived-path"),
+        pytest.param(_TAIL.replace("        journal.read_strict()", "        journal.read_strict()\n        EventLog.open_existing(path)"), "acquisition count is 2", id="second-acquisition"),
+        pytest.param("    acquire = EventLog.open_existing\n    journal = acquire(path)\n    return journal", "acquisition count is 0", id="aliased-acquisition"),
+        pytest.param('    journal = getattr(EventLog, "open_existing")(path)\n    return journal', "acquisition count is 0", id="getattr-acquisition"),
+        pytest.param("    try:\n        journal = EventLog.open_existing(path)\n" + _HANDLER + "\n    return journal", "try body must be exactly", id="strict-read-removed"),
+        pytest.param(_TAIL.replace("        journal.read_strict()", "        other = EventLog.open_existing(path)\n        other.read_strict()"), "acquisition count is 2", id="strict-read-of-another-object"),
+        pytest.param(_TAIL.replace("    return journal", "    return EventLog.open_existing(path)"), "acquisition count is 2", id="returns-another-object"),
+        pytest.param(_TAIL.replace("        journal.read_strict()", "        reader = journal.read_strict\n        reader()"), "try body must be exactly", id="aliased-strict-read"),
+        pytest.param(_TAIL.replace('        raise RuntimeEventLogError(\n            f"deployment journal could not be acquired and read: {exc}"\n        ) from exc', "        pass"), "handler must raise", id="failure-swallowed"),
+        pytest.param(_TAIL.replace("        journal = EventLog.open_existing(path)", "        target = path\n        journal = EventLog.open_existing(target)"), "try body must be exactly", id="extra-binding"),
+        pytest.param(_TAIL.replace("journal.read_strict()", "journal.read_strict(1)"), "strict read must be exactly", id="strict-read-with-arguments"),
+        pytest.param(_TAIL.replace("    except (\n        EventLogCorruptionError,\n        UnsupportedEventVersionError,\n        OSError,\n    ) as exc:", "    except ValueError as exc:"), "must catch exactly", id="generic-value-error"),
+        pytest.param(_TAIL.replace("    except (\n        EventLogCorruptionError,\n        UnsupportedEventVersionError,\n        OSError,\n    ) as exc:", "    except Exception as exc:"), "must catch exactly", id="bare-exception"),
+        pytest.param(_TAIL.replace("        OSError,\n", ""), "must catch exactly", id="narrowed-handler"),
+    ),
+)
+def test_d70_acquisition_shape_cannot_be_bypassed(
+    tmp_path: Path, replacement: str, match: str
+) -> None:
+    root = _copy_vocab(tmp_path)
+    _mutate(root, _AUTHORITY, _TAIL, replacement)
+    with pytest.raises(AssertionError, match=match):
+        assert_t12_ast_invariants(root)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "vocab/assessment_producer.py",
+        "vocab/cli.py",
+        "vocab/artifact_store.py",
+        "vocab/reconcile.py",
+        "vocab/runtime/bootstrap.py",
+    ),
+)
+def test_d70_p1a_still_rejects_every_production_constructor(
+    tmp_path: Path, relative_path: str
+) -> None:
+    root = _copy_vocab(tmp_path)
+    target = root / relative_path
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + "\n\ndef _forbidden_constructor(journal_path):\n"
+        "    return EventLog(journal_path)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="EventLog construction is forbidden"):
+        assert_t12_ast_invariants(root)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ("vocab/assessment_producer.py", "vocab/cli.py", "vocab/runtime/bootstrap.py"),
+)
+def test_d70_acquisition_is_rejected_outside_the_authority(
+    tmp_path: Path, relative_path: str
+) -> None:
+    root = _copy_vocab(tmp_path)
+    target = root / relative_path
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + "\n\ndef _forbidden_acquisition(journal_path):\n"
+        "    return EventLog.open_existing(journal_path)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="acquisition is not approved"):
+        assert_t12_ast_invariants(root)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "from vocab.events import EventLog",
+        "from vocab.events import Event",
+        "from vocab import events",
+        "from ..events import EventLog",
+        "import vocab.events",
+    ),
+)
+def test_d70_import_allowlist_still_rejects_third_modules(
+    tmp_path: Path, statement: str
+) -> None:
+    root = _copy_vocab(tmp_path)
+    target = root / "vocab/artifact_store.py"
+    source = target.read_text(encoding="utf-8")
+    target.write_text(
+        source.replace("import hashlib", f"import hashlib\n{statement}", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="concrete EventLog import is not allowed"):
+        assert_t12_ast_invariants(root)
+
+
+def test_d70_authority_module_absence_is_a_failure(tmp_path: Path) -> None:
+    root = _copy_vocab(tmp_path)
+    (root / _AUTHORITY).unlink()
+    with pytest.raises(AssertionError, match="authority module is missing"):
+        assert_t12_ast_invariants(root)
