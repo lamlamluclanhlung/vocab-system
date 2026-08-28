@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +28,10 @@ from .models import Event
 
 class EventLogCorruptionError(ValueError):
     """Raised when an event log contains data that cannot be trusted."""
+
+
+class EventLogAcquisitionError(OSError):
+    """Raised when an existing event log cannot be acquired at its path."""
 
 
 class EventLogCorruptionWarning(UserWarning):
@@ -187,6 +192,36 @@ class EventLog:
         with self.path.open("a", encoding="utf-8"):
             pass
 
+    @classmethod
+    def open_existing(cls, path: str | os.PathLike[str]) -> "EventLog":
+        """Acquire an already existing journal, never creating or repairing one.
+
+        Acquisition opens without O_CREAT and verifies through the descriptor
+        that the target is a regular file, so there is no check-then-create
+        window: a path that disappears before the open simply fails. Adopting,
+        truncating, and repairing are all impossible here by construction.
+        """
+        if path is None:
+            raise TypeError("path must be explicit")
+        target = Path(path)
+        if not target.name:
+            raise ValueError("path must identify an event log file")
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(target, flags)
+        try:
+            status = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise EventLogAcquisitionError(
+                f"event log path is not a regular file: {target}"
+            )
+
+        journal = cls.__new__(cls)
+        journal.path = target
+        return journal
+
     def log(self, event: str, unit_key: str, payload: dict[str, Any]) -> Event:
         """Validate, construct, and append one complete event record."""
         _validate_event_values(event, unit_key, payload)
@@ -214,7 +249,12 @@ class EventLog:
             allow_nan=False,
         )
         self._validate_trailing_record_for_append()
-        with self.path.open("a", encoding="utf-8", newline="") as handle:
+        # D70: append to an EXISTING file only. Path.open("a") would silently
+        # recreate a journal that disappeared after acquisition, and an empty
+        # history reads clean, so a lost production history would look healthy.
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(self.path, flags)
+        with os.fdopen(descriptor, "a", encoding="utf-8", newline="") as handle:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
