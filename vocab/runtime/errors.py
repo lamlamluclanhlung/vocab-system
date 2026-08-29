@@ -33,3 +33,19 @@ class RuntimeBootstrapError(VocabRuntimeError):
 
 class RuntimePreflightError(VocabRuntimeError):
     """Raised when a preflight obligation fails."""
+
+
+class RuntimeForgeBridgeError(VocabRuntimeError):
+    """Raised when a Forge request/response artifact cannot be trusted."""
+
+
+class RuntimeTargetDiscoveryError(VocabRuntimeError):
+    """Raised when reconcile targets cannot be resolved unambiguously."""
+
+
+class RuntimeReconcileError(VocabRuntimeError):
+    """Raised when one reconcile target fails operationally."""
+
+
+class RuntimeCorpusError(VocabRuntimeError):
+    """Raised when a corpus scan cannot be counted or emitted."""

@@ -90,6 +90,93 @@ create it. This keeps "another process is writing" distinct from
 being recreated empty. Only the write-preflight taken under the lock is
 authority to write.
 
+## The daily loop
+
+```
+  meet a new word or phrase
+        |
+  vocab forge-export   ->  request.json
+        |
+  paste request.json into ChatGPT / Claude by hand, save the reply
+        |
+  vocab forge-import   ->  preview, y/N, Anki note created
+        |
+  python -m vocab.t8_cli export-contexts   (T8 keeps its own CLI in this wave)
+  paste, save the reply
+  python -m vocab.t8_cli import-contexts
+  python -m vocab.t8_cli hydrate-audio
+        |
+  review in Anki as normal
+        |
+  vocab reconcile --all        (once a day, after reviewing)
+        |
+  vocab corpus-scan            (when a new corpus month is ready)
+```
+
+### Creating one Unit
+
+```
+python -m vocab.cli forge-export \
+    --source-ref corpus:bbc:2026-08-01 \
+    --source-sentence "The distinction is subtle but consequential." \
+    --learner-note "met while reading" \
+    --out request.json
+```
+
+Open `request.json`. It contains the prompt text and the JSON schema. Paste both
+into whichever model you use, save the model's JSON reply, and wrap it:
+
+```json
+{
+  "artifact": "vocab.forge.response",
+  "artifact_version": 1,
+  "generation_request_sha256": "<copy from request.json>",
+  "model_id": "<the model you actually used>",
+  "model_version": "<its version>",
+  "structured_output": { ... the model's JSON ... }
+}
+```
+
+`model_id` and `model_version` are yours to state. Nothing defaults them,
+because only you know which model produced the text.
+
+```
+python -m vocab.cli forge-import --config runtime.json \
+    --request request.json --response response.json --actor-id lam
+```
+
+You will see a preview and a `[y/N]` prompt. Anything but `y` declines, and a
+decline writes no note. Exit 0 means the Unit was created; exit 4 means the
+Forge core refused it and told you why.
+
+If you edit the prompt artifact after exporting a request, importing that old
+request fails. Re-export instead: the prompt is part of the generation's
+provenance.
+
+### Reconciling
+
+```
+python -m vocab.cli reconcile --config runtime.json --all
+python -m vocab.cli reconcile --config runtime.json --unit-key subtle::small-difference
+```
+
+Both forms validate the entire VocabularyUnit registry first, so a duplicate
+`unit_key` anywhere in the profile refuses the whole command rather than
+producing a partial run. One line per Unit, then `total=N  failed=N`. Exit 4
+means at least one Unit failed and the line for it says why.
+
+Cards needing reactivation and channels needing leech rescue are **reported,
+never performed**. Do those in Anki yourself.
+
+### Corpus scan
+
+```
+python -m vocab.cli corpus-scan --config runtime.json --source bbc --month 2026-08
+```
+
+Reads `<corpus_root>/<month>`. Rerunning the same source, month, and corpus
+content appends nothing and still exits 0; T10 owns that identity.
+
 ## Release gate
 
 ```

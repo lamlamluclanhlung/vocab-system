@@ -10,9 +10,10 @@ notes. Dormancy suspends cards and preserves the note and its revlog.
 ## Status
 
 Core layers T6 through T12.4 are complete and gated. The operational runtime
-(decision D70) is at Wave A: a deployment can be created and diagnosed. Daily
-commands for FORGE, reconcile, and corpus arrive in Wave B, and assessment
-session orchestration in Wave C.
+(decision D70) is at Wave B: a deployment can be created and diagnosed, Units
+can be forged through a human-mediated bridge, lifecycle can be reconciled, and
+corpus months can be scanned. Assessment session orchestration is Wave C. T8
+keeps its own CLI for now.
 
 ## Requirements
 
@@ -66,7 +67,21 @@ Diagnose at any time. This never locks and never writes:
 python -m vocab.cli preflight --config D:/vocab-data/runtime.json
 ```
 
-T8 keeps its own CLI in Wave A:
+Daily commands:
+
+```
+python -m vocab.cli forge-export --source-ref corpus:bbc:2026-08-01 \
+    --source-sentence "..." --out request.json
+python -m vocab.cli forge-import --config runtime.json \
+    --request request.json --response response.json --actor-id lam
+python -m vocab.cli reconcile --config runtime.json --all
+python -m vocab.cli corpus-scan --config runtime.json --source bbc --month 2026-08
+```
+
+No model is ever called for you. `forge-export` writes an artifact you take to a
+model yourself, and `forge-import` replays the reply you saved.
+
+T8 keeps its own CLI:
 
 ```
 python -m vocab.t8_cli export-contexts | import-contexts | hydrate-audio
