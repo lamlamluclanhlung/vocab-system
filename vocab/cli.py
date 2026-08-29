@@ -139,22 +139,27 @@ def _command_forge_import(arguments: argparse.Namespace) -> int:
     config = load_config(Path(arguments.config))
     anki = _build_anki(config)
 
-    prompt = forge_bridge.load_prompt()
-    request_artifact = forge_bridge.parse_request_artifact(
-        _read_artifact(Path(arguments.request), "request artifact")
-    )
-    response_artifact = forge_bridge.parse_response_artifact(
-        _read_artifact(Path(arguments.response), "response artifact")
-    )
-    bound = forge_bridge.bind_generation(request_artifact, response_artifact, prompt)
-    generator = forge_bridge.ReplayGenerator(bound)
-    confirmation = forge_bridge.TerminalConfirmation(
-        arguments.actor_id,
-        stream_in=_sys.stdin,
-        stream_out=_sys.stdout,
-    )
-
+    # D70 section 11: write authority is established first. Reading, parsing,
+    # and binding the artifacts is operation-specific work, so it may only run
+    # once identity, the lock, and the full write-preflight have all passed.
     with write_operation(config, anki) as layout:
+        prompt = forge_bridge.load_prompt()
+        request_artifact = forge_bridge.parse_request_artifact(
+            _read_artifact(Path(arguments.request), "request artifact")
+        )
+        response_artifact = forge_bridge.parse_response_artifact(
+            _read_artifact(Path(arguments.response), "response artifact")
+        )
+        bound = forge_bridge.bind_generation(
+            request_artifact, response_artifact, prompt
+        )
+        generator = forge_bridge.ReplayGenerator(bound)
+        confirmation = forge_bridge.TerminalConfirmation(
+            arguments.actor_id,
+            stream_in=_sys.stdin,
+            stream_out=_sys.stdout,
+        )
+
         journal = open_runtime_event_log(layout.event_log_path)
         result = forge(
             bound.request,

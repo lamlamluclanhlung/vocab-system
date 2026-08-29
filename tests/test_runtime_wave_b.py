@@ -42,6 +42,7 @@ from tests.test_runtime import (  # reuse the Wave A fixtures unchanged
     bootstrap_deployment,
     make_note,
     snapshot,
+    write_config,
 )
 
 
@@ -1313,3 +1314,217 @@ def test_unedited_prompt_text_still_binds() -> None:
     )
     bound = forge_bridge.bind_generation(artifact, response, prompt)
     assert bound.metadata.prompt_sha256 == prompt.sha256
+
+
+# ----------------------------------------------------------------------
+# PR #4: forge-import establishes write authority before touching artifacts
+# ----------------------------------------------------------------------
+
+
+def trace_forge_import_order(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the real call order of the forge-import command.
+
+    The oracle is ORDER, not co-occurrence. A test that only asserted the lock
+    exists while artifacts are parsed would still pass an implementation that
+    parsed first and locked afterwards.
+    """
+    events: list[str] = []
+    from vocab.runtime import operation
+
+    real_identity = operation.read_identity
+    real_acquire = DeploymentLock.acquire
+    real_preflight = operation.run_runtime_write_preflight
+    real_prompt = forge_bridge.load_prompt
+    real_parse_request = forge_bridge.parse_request_artifact
+    real_parse_response = forge_bridge.parse_response_artifact
+    real_bind = forge_bridge.bind_generation
+    real_forge = cli.forge
+
+    def traced_identity(path):
+        events.append("identity")
+        return real_identity(path)
+
+    def traced_acquire(self):
+        real_acquire(self)
+        events.append("lock")
+
+    def traced_preflight(*args, **kwargs):
+        events.append("preflight")
+        return real_preflight(*args, **kwargs)
+
+    def traced_prompt():
+        events.append("prompt")
+        return real_prompt()
+
+    def traced_parse_request(raw):
+        events.append("parse_request")
+        return real_parse_request(raw)
+
+    def traced_parse_response(raw):
+        events.append("parse_response")
+        return real_parse_response(raw)
+
+    def traced_bind(*args, **kwargs):
+        events.append("bind")
+        return real_bind(*args, **kwargs)
+
+    def traced_forge(request, **kwargs):
+        events.append("forge")
+        return real_forge(request, **kwargs)
+
+    monkeypatch.setattr(operation, "read_identity", traced_identity)
+    monkeypatch.setattr(DeploymentLock, "acquire", traced_acquire)
+    monkeypatch.setattr(operation, "run_runtime_write_preflight", traced_preflight)
+    monkeypatch.setattr(forge_bridge, "load_prompt", traced_prompt)
+    monkeypatch.setattr(forge_bridge, "parse_request_artifact", traced_parse_request)
+    monkeypatch.setattr(forge_bridge, "parse_response_artifact", traced_parse_response)
+    monkeypatch.setattr(forge_bridge, "bind_generation", traced_bind)
+    monkeypatch.setattr(cli, "forge", traced_forge)
+
+    real_open = cli.open_runtime_event_log
+
+    def traced_journal(path):
+        events.append("journal")
+        return real_open(path)
+
+    monkeypatch.setattr(cli, "open_runtime_event_log", traced_journal)
+    return events
+
+
+def forge_import_argv(tmp_path: Path) -> list[str]:
+    request_path, response_path = write_artifacts(tmp_path)
+    return [
+        "forge-import",
+        "--config",
+        str(tmp_path / "runtime.json"),
+        "--request",
+        str(request_path),
+        "--response",
+        str(response_path),
+        "--actor-id",
+        "lam",
+    ]
+
+
+def test_pr4_valid_authority_orders_identity_lock_preflight_then_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap_deployment(tmp_path, FakeAnki([]))
+    argv = forge_import_argv(tmp_path)
+    anki = ForgeAnki([])
+    events = trace_forge_import_order(monkeypatch)
+    monkeypatch.setattr(cli, "_build_anki", lambda cfg: anki)
+    monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+
+    code = cli.main(argv)
+    monkeypatch.undo()
+
+    assert code == cli.EXIT_SUCCESS
+    assert len(anki.added) == 1
+    for earlier, later in (
+        ("identity", "lock"),
+        ("lock", "preflight"),
+        ("preflight", "prompt"),
+        ("preflight", "parse_request"),
+        ("preflight", "parse_response"),
+        ("bind", "journal"),
+        ("journal", "forge"),
+    ):
+        assert events.index(earlier) < events.index(later), events
+
+
+ARTIFACT_STEPS = ("prompt", "parse_request", "parse_response", "bind")
+
+
+def test_pr4_missing_identity_reads_no_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uncommitted data root must refuse before any artifact is touched."""
+    write_config(tmp_path)
+    argv = forge_import_argv(tmp_path)
+    events = trace_forge_import_order(monkeypatch)
+    monkeypatch.setattr(cli, "_build_anki", lambda cfg: ForgeAnki([]))
+
+    code = cli.main(argv)
+    monkeypatch.undo()
+
+    assert code == cli.EXIT_REFUSED
+    assert not any(step in events for step in ARTIFACT_STEPS)
+    assert "forge" not in events
+
+
+def test_pr4_lock_contention_reads_no_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = bootstrap_deployment(tmp_path, FakeAnki([]))
+    argv = forge_import_argv(tmp_path)
+    layout = build_layout(config.data_root)
+    holder = DeploymentLock(layout.lock_path)
+    holder.acquire()
+
+    events = trace_forge_import_order(monkeypatch)
+    monkeypatch.setattr(cli, "_build_anki", lambda cfg: ForgeAnki([]))
+    code = cli.main(argv)
+    monkeypatch.undo()
+    holder.release()
+
+    assert code == cli.EXIT_LOCK_CONTENTION
+    assert not any(step in events for step in ARTIFACT_STEPS)
+    assert "forge" not in events
+
+
+def test_pr4_failed_preflight_reads_no_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    config = bootstrap_deployment(tmp_path, FakeAnki([]))
+    argv = forge_import_argv(tmp_path)
+    layout = build_layout(config.data_root)
+    shutil.rmtree(layout.artifact_root)
+    before = snapshot(config.data_root)
+
+    events = trace_forge_import_order(monkeypatch)
+    monkeypatch.setattr(cli, "_build_anki", lambda cfg: ForgeAnki([]))
+    code = cli.main(argv)
+    monkeypatch.undo()
+
+    assert code == cli.EXIT_REFUSED
+    assert "preflight" in events
+    assert not any(step in events for step in ARTIFACT_STEPS)
+    assert "journal" not in events and "forge" not in events
+    assert snapshot(config.data_root) == before
+
+
+def test_pr4_artifact_binding_failure_still_releases_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Binding now happens under the lock, so the lock must still be released."""
+    config = bootstrap_deployment(tmp_path, FakeAnki([]))
+    layout = build_layout(config.data_root)
+    request_path, _ = write_artifacts(tmp_path)
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text(
+        json.dumps(response_body(generation_request_sha256="f" * 64)),
+        encoding="utf-8",
+    )
+    anki = ForgeAnki([])
+    monkeypatch.setattr(cli, "_build_anki", lambda cfg: anki)
+
+    code = cli.main(
+        [
+            "forge-import",
+            "--config",
+            str(tmp_path / "runtime.json"),
+            "--request",
+            str(request_path),
+            "--response",
+            str(foreign),
+            "--actor-id",
+            "lam",
+        ]
+    )
+    assert code == cli.EXIT_REFUSED
+    assert not layout.lock_path.exists()
+    assert anki.added == []
