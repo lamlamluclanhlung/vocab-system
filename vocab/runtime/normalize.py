@@ -26,6 +26,12 @@ from ..artifact_store import ArtifactStoreError
 from ..capture_ledger import CaptureLedgerError
 from ..corpus import CorpusScanError
 from ..exposure import ExposureLedgerError
+from ..reconcile import (
+    ReconcileDecisionError,
+    ReconcileMaterializationError,
+    ReconcileObservationError,
+    ReconcileReactivationError,
+)
 from ..transcription_ledger import TranscriptionLedgerError
 from .errors import VocabRuntimeError
 
@@ -39,6 +45,21 @@ LEDGER_SEAM: tuple[type[BaseException], ...] = (
     TranscriptionLedgerError,
 )
 FILESYSTEM_SEAM: tuple[type[BaseException], ...] = (OSError,)
+
+# T9 raises a named hierarchy. ReconcileDecisionError subclasses ValueError, but
+# it is a named operational class and is caught as that exact type; this is not
+# a licence to treat every ValueError as operational.
+RECONCILE_SEAM: tuple[type[BaseException], ...] = (
+    ReconcileObservationError,
+    ReconcileDecisionError,
+    ReconcileMaterializationError,
+    ReconcileReactivationError,
+    AnkiConnectError,
+)
+
+# CorpusScanError is the root of every T10 operational failure, including the
+# registry, snapshot, count, encounter, history, and emission families.
+CORPUS_SEAM_SCAN: tuple[type[BaseException], ...] = (CorpusScanError, AnkiConnectError)
 
 
 @contextmanager
