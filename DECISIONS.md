@@ -8736,3 +8736,558 @@ in which the acquired, read, and returned objects are provably identical, and
 bootstrap refuses to adopt any pre-existing history and commits only on a final
 durable identity marker. The baseline ends deliberately, and its guarantee is
 replaced by a constructive one.
+
+## D71 — Operational assessment-session composition and T11 audit-artifact transport
+
+**Date:** 2026-08-30
+**Status:** Accepted
+**Blocks:** Operational Runtime Wave C v1
+
+D71 is a decision only. It is not a roadmap checkpoint, and it creates no T12.5,
+T13, or successor checkpoint.
+
+### 1. Purpose
+
+Every T11 and T12 core is complete and gated, and D70 built the runtime that can
+safely write to a deployment. What no accepted decision yet supplies is the
+operational composition policy that decides what enters an assessment session.
+create_session_manifest accepts caller-supplied items and validates their shape,
+but nothing in the repository selects Units, selects channels, decides session
+size, or authors stimulus text, and no production module calls it. D71 freezes
+that missing composition policy, the process-lifetime rules the existing
+in-memory display authority already implies, and the transport-versus-authority
+rule for T11 audit artifacts, so the existing cores can be invoked without
+invention.
+
+### 2. Authority and relationship to existing decisions
+
+vocab/contracts.py and vocab/models.py remain highest precedence. D19, D53, D54,
+D55, D56, D57, D58, D59, D60, D61, D62, D63, D64, D65, D66, D67, D68, and D69 are
+unchanged. D70 is unchanged, including its section 21 out-of-scope list: D71
+supersedes nothing in D70, and instead supplies the separate composition
+authority that section 21 deliberately withheld.
+
+D71 does not redefine any existing identity, lifecycle, evidence, producer, or
+existing artifact schema.
+
+D71 introduces exactly one new operational input schema: the Wave C v1
+session-plan artifact of section 5. That schema is new, is owned by D71, and did
+not previously exist.
+
+### 3. Wave C v1 channel scope
+
+Operational Wave C v1 supports exactly two channels:
+
+    R    reading_comprehension
+    W    written_production
+
+L and S are deferred. This alters no core and no lifecycle contract:
+T12_LIFECYCLE_ENABLED_CHANNELS remains ("R", "L", "W", "S"), and every L and S
+core keeps its current behavior. Deferral is operational only.
+
+L is deferred because no decision freezes the learner-facing audio rendering and
+provenance path for a new spoken_script assessment stimulus. The L stimulus field
+set is ("spoken_script", "question"), and D53 forbids giving the learner the
+written stimulus text in the ordinary v1 listening task, so an L session cannot
+be operated by supplying text alone.
+
+S is deferred because the repository has no released production raw-audio or
+speech-to-text acquisition path. transcription_evidence requires stt_model_id,
+stt_model_version, and decoder_version, and no production constant supplies them.
+D71 introduces neither media path and adds no default for any of those values.
+
+### 4. Session composition authority
+
+For Wave C v1 the human is the session-composition authority.
+
+There is no automatic Unit selection, channel selection, lifecycle-state
+sampling, random sampling, spaced-assessment scheduling, fixed item-count policy,
+or latest-session discovery. None is introduced, and none may be inferred from
+the historical narrative in docs/VOCAB_SYSTEM_SPEC.md, which is non-normative.
+
+A new session begins from exactly one explicit human-supplied session-plan
+artifact. The number of items in that artifact is the session size. At least one
+item is required. No maximum is imposed, because no higher-precedence contract
+requires one.
+
+Input order is authoritative. The runtime derives item_ordinal as 0, 1, 2, and so
+on, in the order the human supplied. The human never supplies item_ordinal.
+
+### 5. Session-plan artifact, version 1
+
+The artifact is one canonical JSON object, decoded by strict_json_loads and
+encoded by canonical_json_bytes from vocab/artifact_json.py, so duplicate keys and
+non-standard JSON constants fail. The top-level keyset is closed and exact:
+
+    artifact   str, exactly "vocab.t12.session-plan"
+    v          int, exactly 1; bool is forbidden
+    items      list, at least one element
+
+The discriminator and version field names follow the existing T11 and T12
+artifact vocabulary. No second artifact_version convention is introduced.
+
+Each element of items is a closed object whose exact keyset depends on channel.
+
+For channel R:
+
+    unit_key   str, matching UNIT_KEY_PATTERN
+    channel    str, exactly "R"
+    passage    str, non-whitespace, no unpaired surrogate
+    question   str, non-whitespace, no unpaired surrogate
+
+For channel W:
+
+    unit_key              str, matching UNIT_KEY_PATTERN
+    channel               str, exactly "W"
+    production_prompt     str, non-whitespace, no unpaired surrogate
+    semantic_constraints  str, non-whitespace, no unpaired surrogate
+
+The stimulus field names are exactly those the frozen session contract already
+requires per channel. D71 introduces no new stimulus field name.
+
+The following must not appear in a session-plan artifact, because existing
+authorities derive them: session_nonce, session_id, created_at, producer,
+producer_version, task_kind, item_ordinal, presented_stimulus_ref,
+stimulus_artifact_ref, attempt_id, and novelty. Their presence fails.
+
+Unknown keys fail. Missing keys fail. Wrong types fail. No coercion is performed
+at any level.
+
+### 6. Unit resolution and enabled-channel validation
+
+read_registry_snapshot cannot prove channel enablement: RegistryEntry carries
+only unit_key, lemma, and unit_type. Validation therefore proceeds in six steps,
+all of which complete before the first durable session-creation side effect.
+
+    A. Run the complete existing read_registry_snapshot(anki). This remains the
+       global registry validity and unique-unit-key authority.
+
+    B. Resolve every requested unit_key to exactly one authoritative
+       VocabularyUnit note. Zero matches, more than one match, or a malformed
+       note-id result each fail.
+
+    C. Read the full NOTE_FIELDS of that exact note.
+
+    D. Materialize the existing VocabUnit representation from those fields
+       without inventing, repairing, trimming, or defaulting any field value.
+
+    E. Pass it through the existing validate_unit_evidence(...).
+
+    F. Require the requested channel to appear in
+       ValidatedUnitEvidence.enabled_channels.
+
+No second registry, no second Unit validator, and no new enabled-channel rule is
+created.
+
+All requested Units are resolved and validated before the first session
+ArtifactStore.put. A single failure yields zero new session stimulus artifacts
+and no SessionManifest publication.
+
+### 7. Stimulus content authority
+
+The exact human-supplied R and W stimulus text in the validated session plan is
+the assessment-stimulus content authority for Wave C v1.
+
+No model generates or rewrites it. No derivation from a Unit's Ctx_1 through
+Ctx_5 fields is used in v1. Beyond the validation the frozen session and stimulus
+contracts already require, the runtime performs no trimming, Unicode
+normalization, whitespace normalization, punctuation repair, or content
+rewriting.
+
+task_kind and presented_stimulus_ref are derived by the existing D54 identity
+authority through the existing cognitive_stimulus_ref API. No second
+cognitive-stimulus digest is created, and the human never supplies either value.
+
+The canonical-text normalization D54 prescribes applies to identity derivation
+only. It does not alter the stored stimulus text, which the session manifest
+retains verbatim.
+
+### 8. Stimulus artifact bytes
+
+D54 fixes the artifact identity as sha256 of the exact artifact bytes,
+ASSESSMENT_ARTIFACT_REF_PATTERN fixes the ref grammar, and ArtifactStore.put
+verifies stored bytes against that digest. The exact byte representation was not
+previously fixed. D71 fixes it for v1.
+
+The stimulus artifact is the learner-facing rendered UTF-8 text, not canonical
+JSON.
+
+For channel R the exact artifact bytes are:
+
+    passage.encode("utf-8") + b"\n\n" + question.encode("utf-8")
+
+For channel W the exact artifact bytes are:
+
+    production_prompt.encode("utf-8") + b"\n\n"
+        + semantic_constraints.encode("utf-8")
+
+The rules are absolute: UTF-8; no byte-order mark; no prefix; no field labels; no
+suffix; no added final newline; no strip; no NFKC; no newline normalization; no
+whitespace normalization; no punctuation repair; no case folding. The exact
+strings are the already validated session-plan and manifest strings.
+
+The artifact ref is derived purely, before any durable write, as specified in
+section 11.
+
+Before every fresh display, the runtime rederives the expected bytes from the
+persisted manifest stimulus, reads ArtifactStore by stimulus_artifact_ref, and
+requires the stored bytes to equal the expected bytes exactly and the ref to
+equal "sha256:" followed by the SHA-256 hex digest of those exact expected bytes.
+On any mismatch the operation fails closed: nothing is displayed and no new
+exposure is reserved.
+
+This is the v1 rendering rule permanently for sessions already created under v1.
+A future rendering rule requires an explicit later decision and a new version.
+
+### 9. Session created_at clock authority
+
+create_session_manifest requires a caller-supplied created_at, and created_at
+participates in the persisted manifest identity. Wave C v1 therefore freezes it.
+
+After D70 write authority and the full runtime write-preflight are established,
+the runtime captures exactly one current instant from an aware UTC clock and
+serializes it as normalized ISO-8601 with an explicit +00:00 offset, and passes
+that exact value to create_session_manifest.
+
+The human cannot supply created_at. The machine-local timezone is never
+consulted, and no local calendar day is used. Exactly one candidate created_at is
+captured for one session creation; no second instant is taken. The clock is
+injectable for tests.
+
+create_session_manifest remains the authority that generates the fresh session
+nonce.
+
+### 10. Manifest derivation
+
+The operational layer derives SessionManifest items from the validated session
+plan and calls the existing create_session_manifest and persist_session_manifest.
+
+The caller may not supply an arbitrary SessionManifest JSON document as the
+normal Wave C v1 session-creation interface. The runtime owns derivation of
+session_nonce, created_at, producer, producer_version, task_kind, item_ordinal,
+presented_stimulus_ref, stimulus_artifact_ref, and session_id, using the existing
+authorities that already own each.
+
+Persisted manifests are never mutated, overwritten, or edited in place.
+
+### 11. Session-creation ordering and crash semantics
+
+D71 claims no filesystem transactionality that the ArtifactStore and session
+cores do not provide.
+
+Before the first durable session-creation side effect, the runtime performs every
+validation and every derivation purely. For each item it strict-decodes and
+validates the complete session plan, validates the complete registry, resolves
+and validates the full Unit per section 6, derives task_kind, derives
+item_ordinal, derives presented_stimulus_ref, computes
+
+    expected_stimulus_bytes
+
+with the frozen section 8 renderer, and computes purely
+
+    expected_stimulus_artifact_ref =
+        "sha256:" + SHA256(expected_stimulus_bytes).hexdigest()
+
+That expected ref is what the complete candidate SessionManifest item carries.
+Before the first durable write the runtime therefore already knows, for every
+item, its task_kind, item_ordinal, presented_stimulus_ref, expected
+stimulus_artifact_ref, and exact stimulus bytes.
+
+Persistence begins only after every item and every Unit has passed validation.
+For each stimulus the runtime then performs
+
+    actual_ref = ArtifactStore.put(expected_stimulus_bytes)
+
+and requires actual_ref to equal expected_stimulus_artifact_ref. Any mismatch
+fails closed and publishes no SessionManifest. The persisted SessionManifest uses
+the already-derived expected ref.
+
+Because ArtifactStore is immutable and content-addressed, a crash or filesystem
+failure after one or more stimulus puts but before SessionManifest publication
+may leave unreferenced content-addressed artifacts. Those orphan artifacts are
+not a session, are not exposure authority, are not automatically deleted, are not
+automatically adopted, and may safely be reused later only by exact content hash.
+
+Session existence begins only when the derived SessionManifest is durably
+published. No rollback or deletion is implemented.
+
+### 12. Session-plan duplicates
+
+Human session-plan items are never silently deduplicated or reordered. Existing
+SessionManifest contracts do not prohibit repeated unit, channel, or stimulus
+content at different ordinals, so D71 v1 permits it.
+
+Input order remains authoritative, and each ordinal remains its own attempt
+identity. The existing D55 novelty authority decides whether a repeated cognitive
+stimulus is novel. No unique-Unit-per-session rule is added, because no existing
+higher authority requires one.
+
+### 13. Resume authority
+
+Wave C v1 has no latest-session concept, no active-session discovery, and no
+directory scan used as semantic authority. load_session_manifest already forbids
+discovery and requires an exact session_id; D71 preserves that.
+
+Every operation requires an explicit session_id and an explicit item_ordinal.
+Multiple durable session manifests may coexist. The runtime never guesses which
+one the human intends, and no second active-session state or pointer is created.
+
+### 14. A fresh attempt is one operation in one process
+
+DisplayPermit is in-memory, single-use, and non-reconstructible: it can only be
+issued by reserve_exposure, its bindings are immutable, and it cannot be
+serialized or rebuilt. Every capture and disposition entry point requires that
+exact issued permit. A fresh R or W attempt is therefore one operation in one
+process, and Wave C v1 exposes no separate reserve step and no separate capture
+step for a fresh attempt.
+
+D67 owns record_refusal and record_explicit_skip as explicit learner or session
+actions. A terminal action is therefore never preselected at command invocation.
+It is collected only after the stimulus has actually been displayed and its
+permit consumed.
+
+Within one D70 write-operation, addressing one explicit session_id and one
+explicit item_ordinal, the sequence is exactly:
+
+    load the exact persisted manifest item
+    verify the exact stimulus artifact bytes per section 8
+    reserve_exposure(...)
+    receive the exact in-memory DisplayPermit issued after durable reservation
+    display the already verified stimulus successfully
+    consume that exact DisplayPermit
+
+    only now collect exactly one explicit terminal action:
+
+        SUBMIT   read the configured response file exactly once, at this point
+                 only, and pass its exact bytes unchanged to
+                 close_text_submission(...)
+        SKIP     record_explicit_skip(...)
+        REFUSE   record_refusal(...)
+
+    return
+
+The command invocation may supply a response-file path as a transport location
+only. Before successful display, permit consumption, and an explicit post-display
+SUBMIT, the runtime must not read that file, must not stat its contents as
+response evidence, must not hash it, and must not classify it. SUBMIT requires
+that a response-file path was supplied; SKIP and REFUSE do not use it.
+
+There is no preselected skip flag and no preselected refuse flag. The runtime
+waits for the explicit post-display action while the same process and the same
+permit remain alive. No raw-stdin response encoding protocol is invented, and no
+sentinel-delimited learner-response schema is introduced: the response file
+remains the exact-byte transport for SUBMIT, passed unchanged with no decode or
+re-encode in the runtime layer.
+
+The exact permit must not cross a process boundary. There is no permit
+serialization, no permit reconstruction, and no second permit for the same
+reservation.
+
+D71 does not claim that file timestamps, file creation time, or this protocol
+cryptographically prove when the learner authored the contents. The guarantee is
+narrower and exact: the runtime does not read or capture response bytes, and does
+not record a skip or a refusal, until after the exact stimulus has been displayed
+and its permit consumed.
+
+Interruption semantics preserve the existing D58, D62, and D67 rules exactly:
+
+    before durable reservation
+        no attempt authority exists
+
+    after durable reservation but before capture or disposition, including while
+    the process is waiting for the terminal action
+        no capture receipt and no disposition receipt exist; the reservation
+        remains abandoned and the permit is lost; the runtime does not redisplay
+        on restart, does not reserve that attempt again, and does not synthesize
+        no_response, invalid_artifact, infrastructure_failure, or any other
+        terminal disposition
+
+    after durable capture or disposition
+        later processing resumes from the existing durable authorities
+
+### 15. W target-absent path
+
+After durable capture and before any semantic request, the existing D19 presence
+gate is evaluated for W through the existing evaluate_presence_gate authority.
+
+If target_present is false, a semantic request is forbidden, a proposal is
+forbidden, and a human review is forbidden. Wave C uses the existing W OMITTED
+planner and producer path directly.
+
+If target_present is true, the semantic chain of section 16 is required for the
+existing W semantic path.
+
+D64 is not changed. R has no presence gate.
+
+### 16. T11 transport, durable authority, and explicit chaining
+
+The human-mediated T11 protocol is retained exactly: a deterministic semantic
+request, manual submission by the human, a semantic proposal, strict import with
+explicit assessor metadata, an exact human review, a deterministic reviewed
+result, and binding to the exact T12 attempt. No paid API, no browser automation,
+and no provider SDK is introduced.
+
+External filesystem files are transport copies only. They are never deployment
+authority.
+
+There is no Wave C semantic workflow ledger, and none is created. D71 therefore
+forbids any hidden notion of a current semantic request, a current proposal, a
+current review, or a last imported proposal. ArtifactStore directory scanning is
+never semantic authority. Chaining is always explicit.
+
+Semantic request export addresses one explicit session_id and item_ordinal,
+reconstructs the exact captured attempt from the existing durable authorities,
+and for W evaluates the presence gate of section 15 first. When semantic evidence
+is required, it builds the existing semantic request, canonicalizes it with the
+existing prepare_semantic_request_submission authority, stores the canonical
+request bytes in ArtifactStore, and requires
+
+    request_ref == "sha256:" + request_digest
+
+An optional external output path is a transport copy only. The command reports
+request_ref and request_digest to the human.
+
+There is no standalone durable semantic-import state. The final semantic
+assessment operation explicitly receives at least session_id, item_ordinal,
+request_ref, the proposal transport file, assessor_id, assessor_version,
+reviewer_id, reviewer_version, and the review decision. Within one D70-locked
+operation it must:
+
+    load the exact canonical request by request_ref
+    independently reconstruct and bind the attempt and Unit evidence
+    import the proposal with explicit assessor metadata
+    canonicalize the proposal and store its canonical bytes
+    require proposal_ref == "sha256:" + response_digest
+    build or import the exact human review through the existing authority
+    canonicalize the review and store its canonical bytes
+    bind T11 semantic evidence from the exact canonical request, proposal, and
+        review bytes plus the explicit assessor metadata
+    plan through the existing T12 planner
+    obtain the journal only through open_runtime_event_log
+    emit through emit_planned_judge
+
+Where request_digest and response_digest already correspond to canonical SHA-256
+content under existing authorities, those identities are preserved exactly and
+are not redefined. Arbitrary external transport bytes are never preserved as
+authority where an existing canonical representation exists.
+
+The human-review artifact is stored through ArtifactStore without inventing any
+new JUDGE provenance field. D71 does not alter the frozen JUDGE payload or
+provenance schema, and creates no new ledger.
+
+If the operation crashes after canonical T11 artifacts are stored but before
+JUDGE emission, those content-addressed artifacts may remain unreferenced. A
+rerun with the same explicit inputs reuses the same refs, and producer
+idempotency remains the existing authority.
+
+Reviewer metadata and the decision remain inside the existing human-review
+artifact. Assessor metadata remains explicit operational input, because the
+existing canonical semantic-proposal artifact does not carry it.
+
+### 17. Explicit human metadata
+
+There is no default for assessor_id, assessor_version, reviewer_id,
+reviewer_version, or the review decision. The existing T11 importer and review
+authorities already require them, and D71 requires the human to supply each
+explicitly.
+
+The constant value version-unavailable-from-ui is never assigned silently. It is
+used only where an existing accepted decision already mandates that exact value
+for that exact path.
+
+### 18. One attempt per operation, and exit codes
+
+Wave C v1 exposes no command that executes a whole multi-item session as a batch.
+Every operational action addresses one explicit session_id and one explicit
+item_ordinal.
+
+Wave C v1 therefore introduces no per-item failure semantics and no per-item exit
+code. The D70 section 18 exit codes are preserved unchanged:
+
+    0   success
+    1   fail-closed operational refusal
+    2   argument parser usage error
+    3   deployment lock contention
+
+D70 exit code 4 remains Wave B only and is not reused by Wave C.
+
+The D70 error taxonomy is preserved: narrow lexical seams only, no global
+operational exception tuple, no catch-all at the composition root, and no generic
+ValueError catch. A named ValueError subclass may be normalized only where its
+exact family is the intended operational seam. Programming defects surface with a
+traceback.
+
+### 19. Lock and read policy
+
+Wave C v1 introduces no generic read-only ledger or session inspection command,
+and therefore no new unlocked-read concurrency policy.
+
+Every operational Wave C command that reads mutable deployment state in order to
+advance an assessment attempt runs under the existing D70 section 11 write
+protocol: configuration, committed identity, runtime.lock with O_EXCL, the full
+runtime write-preflight while the lock is held, the operation, then release. The
+existing vocab.runtime.operation.write_operation composition is reused.
+
+Any journal use occurs only while the lock is held and only through
+open_runtime_event_log. No Wave C module constructs an EventLog, calls
+EventLog.open_existing, or imports vocab.events. The concrete events import
+allowlist remains exactly vocab/assessment_producer.py and
+vocab/runtime/eventlog_authority.py, and the D68 seven-entry EventLog.log
+authority matrix is unchanged.
+
+ArtifactStore is deployment-owned and its constructor creates its root, so no
+Wave C code constructs one before the runtime write-preflight has verified that
+artifacts/ exists and is a directory.
+
+### 20. T12 and T9 separation
+
+Wave C assessment orchestration ends at durable assessment evidence emission. It
+may call only the existing sealed producer APIs, emit_planned_judge and
+emit_planned_speech_assessment, and for Wave C v1 R and W it uses the existing
+PlannedJudge path.
+
+Wave C must not automatically call reconcile_unit, write any state_ field, emit
+STATE, suspend a card, or unsuspend a card. T9 remains a separate Wave B
+operational command invoked by the human.
+
+### 21. Core ownership is unchanged
+
+D71 does not redefine session identity, attempt identity, cognitive stimulus
+identity, exposure reservation, novelty, response capture, operational
+disposition, the presence gate, the semantic request schema, the semantic
+proposal schema, the human review schema, semantic evidence binding, assessment
+planning, the producer payload, producer idempotency, EventLog authority, or
+lifecycle mutation. It freezes only the operational composition policy required
+to invoke those cores safely, plus the two representations it explicitly owns:
+the section 5 session-plan schema and the section 8 stimulus artifact bytes.
+
+### 22. Out of scope
+
+Automatic Unit or session scheduling; automatic channel selection; automatic
+stimulus generation; Ctx_1 through Ctx_5 derived assessment generation; L
+learner-facing audio generation or rendering; S audio recording; speech to text;
+the speech verification workflow; batch whole-session execution; any Wave C
+exit-code-4 semantics; latest-session discovery; generic read-only ledger
+browsing; reports; a GUI; a daemon; any provider API; and automatic T9
+reconciliation.
+
+### 23. Wave C v1 acceptance
+
+Wave C v1 must not be committed unless one official unfiltered run of pytest with
+no arguments passes in full, reports D69 acceptance certified with a required
+item count of at least 179, and shows no skip, xfail, xpass, or deselection; and
+unless compileall and git diff --check pass. The static authorities of D68, D69,
+and D70 section 7 must pass unchanged, and tests/d58_probe_inventory.py must be
+byte-identical.
+
+**Reason:** The assessment cores are complete but unreachable, because nothing
+decides what enters a session, and the stimulus is the construct being measured
+rather than a presentation detail. Making the human the explicit composition
+authority, validating every requested Unit through the existing evidence boundary
+rather than the registry alone, fixing the rendered stimulus bytes and deriving
+their ref before any durable write so a display can be checked against the
+manifest, keeping a fresh attempt inside the one process that holds its
+non-reconstructible display permit and collecting the terminal action only after
+that stimulus has actually been shown, and keeping external files as transport
+rather than authority, closes that gap without adding any identity, evidence, or
+lifecycle semantics.
