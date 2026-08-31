@@ -9291,3 +9291,56 @@ non-reconstructible display permit and collecting the terminal action only after
 that stimulus has actually been shown, and keeping external files as transport
 rather than authority, closes that gap without adding any identity, evidence, or
 lifecycle semantics.
+
+## D72 — Runtime disposition-ledger normalization clarification
+
+**Date:** 2026-08-31
+**Status:** Accepted
+**Blocks:** Operational Runtime Wave C v1
+
+D72 corrects one omission in D70 section 18. It changes no other authority.
+
+### 1. What was already required
+
+D70 section 13 already requires the runtime write-preflight to validate the
+complete T12 exposure, capture, and disposition boundary through
+validate_t12_histories. That validation reads the disposition ledger, so
+DispositionLedgerError is reachable from a mandatory preflight step.
+
+### 2. The omission
+
+D70 section 18 enumerated the ledger seam as CaptureLedgerError,
+ExposureLedgerError, and TranscriptionLedgerError, and accidentally omitted
+DispositionLedgerError. The omission is corrected: DispositionLedgerError is a
+named operational family of that taxonomy.
+
+### 3. Scope of the correction
+
+DispositionLedgerError may be normalized to the appropriate VocabRuntimeError
+only at an exact lexical operation from which it is directly or transitively
+reachable, which today means an operation that can execute
+read_disposition_ledger or validate_t12_histories. It is forbidden at an
+operation from which it is not reachable, and its presence in one seam never
+justifies its presence in another.
+
+This creates no global operational exception tuple. Bare ValueError, TypeError,
+and every unrelated family continue to surface as programming defects.
+
+### 4. Consequence
+
+In the mandatory runtime write-preflight, a corrupt disposition history is a
+fail-closed refusal with exit code 1 rather than an uncaught traceback.
+
+The D70 section 18 exit codes are unchanged: 0 success, 1 fail-closed refusal,
+2 argument parser usage error, 3 deployment lock contention, and 4 reserved to
+Wave B per-item failure.
+
+### 5. Not changed
+
+D67 disposition semantics; T11 and T12 identity, evidence, and producer
+semantics; EventLog authority; T9 and lifecycle behavior; D71 in every respect;
+and the roadmap. D72 creates no checkpoint.
+
+**Reason:** A mandatory preflight step could raise a named operational family
+that the taxonomy did not list, so a corrupt disposition history surfaced as a
+defect rather than as the fail-closed refusal D70 intends.
