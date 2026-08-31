@@ -98,15 +98,71 @@ EVIDENCE_SEAM: tuple[type[BaseException], ...] = (
 
 # emit_planned_judge owns producer preflight, idempotency, and conflict
 # detection; a conflicting rerun is an operational refusal, not a defect.
+# A PlannedJudge is already sealed before emission, so neither the planner nor
+# the evidence boundary is reachable from emit_planned_judge.
 PRODUCER_SEAM: tuple[type[BaseException], ...] = (
     AssessmentProducerError,
-    AssessmentEvidenceError,
     ExposureLedgerError,
     CaptureLedgerError,
     DispositionLedgerError,
     ArtifactStoreError,
 )
 # evaluate_presence_gate may legitimately reject the attempt-to-Unit binding.
+# validate_t12_histories reads the exposure, capture, and disposition ledgers.
+# It never reads the transcription ledger, so that family is not reachable here.
+T12_HISTORY_SEAM: tuple[type[BaseException], ...] = (
+    CaptureLedgerError,
+    ExposureLedgerError,
+    DispositionLedgerError,
+)
+
+# reserve_exposure validates the T12 triple, reads artifacts, and reads the
+# session manifest.
+RESERVATION_SEAM: tuple[type[BaseException], ...] = (
+    ExposureLedgerError,
+    CaptureLedgerError,
+    DispositionLedgerError,
+    ArtifactStoreError,
+    SessionManifestError,
+)
+
+# close_text_submission, record_explicit_skip, and record_refusal append to the
+# T12 histories and store artifacts. They read no session manifest.
+TERMINAL_CAPTURE_SEAM: tuple[type[BaseException], ...] = (
+    ExposureLedgerError,
+    CaptureLedgerError,
+    DispositionLedgerError,
+    ArtifactStoreError,
+)
+
+# load_validated_attempt_evidence and load_validated_disposition_evidence
+# reconstruct text-channel evidence; no transcription ledger is read.
+TEXT_EVIDENCE_SEAM: tuple[type[BaseException], ...] = (
+    AssessmentEvidenceError,
+    ExposureLedgerError,
+    CaptureLedgerError,
+    DispositionLedgerError,
+    ArtifactStoreError,
+    SessionManifestError,
+)
+
+# Each T11 stage owns exactly its own family.
+SEMANTIC_REQUEST_SEAM: tuple[type[BaseException], ...] = (SemanticRequestError,)
+SEMANTIC_PROPOSAL_SEAM: tuple[type[BaseException], ...] = (SemanticResponseError,)
+HUMAN_REVIEW_SEAM: tuple[type[BaseException], ...] = (HumanReviewError,)
+
+# The composite tuple is justified only at the frozen binder, which genuinely
+# reaches every T11 family plus the evidence and presence boundaries.
+SEMANTIC_BINDING_SEAM: tuple[type[BaseException], ...] = (
+    AssessmentEvidenceError,
+    PresenceEvidenceError,
+    SemanticRequestError,
+    SemanticResponseError,
+    HumanReviewError,
+    T11MaterializationError,
+    SemanticEvidenceError,
+)
+
 # read_transcription_ledger raises only its own family: it never reads the
 # disposition ledger, so the broader ledger seam is not authorized here.
 TRANSCRIPTION_SEAM: tuple[type[BaseException], ...] = (TranscriptionLedgerError,)

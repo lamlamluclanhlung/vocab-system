@@ -166,9 +166,11 @@ def parse_session_plan(raw_bytes: object) -> SessionPlan:
     """
     if type(raw_bytes) is not bytes:
         raise RuntimeSessionPlanError("session plan must be exact bytes")
+    # raw_bytes is already proven to be exact bytes above, so a TypeError from
+    # the decoder would be a defect in this module, not malformed user input.
     try:
         decoded = strict_json_loads(raw_bytes)
-    except (ArtifactJSONError, TypeError) as exc:
+    except ArtifactJSONError as exc:
         raise RuntimeSessionPlanError(
             f"session plan is not strict JSON: {exc}"
         ) from exc

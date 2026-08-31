@@ -13,7 +13,7 @@ from .errors import RuntimePreflightError, VocabRuntimeError
 from .normalize import (
     ANKI_SEAM,
     ARTIFACT_SEAM,
-    LEDGER_SEAM,
+    T12_HISTORY_SEAM,
     TRANSCRIPTION_SEAM,
     normalized,
 )
@@ -174,7 +174,7 @@ def run_runtime_write_preflight(
         with normalized(
             RuntimePreflightError,
             "T12 triple",
-            catching=LEDGER_SEAM + ARTIFACT_SEAM,
+            catching=T12_HISTORY_SEAM + ARTIFACT_SEAM,
         ):
             validate_t12_histories(
                 exposure_path=layout.exposure_path,

@@ -248,20 +248,22 @@ class _TerminalAttemptPort:
         self._out = stream_out
 
     def display_stimulus(self, payload: bytes) -> None:
-        # Exact bytes, with no added newline and no operator text mixed in.
+        # Exact verified bytes, on a binary boundary. There is no text
+        # fallback: decoding and re-encoding could newline-translate or
+        # otherwise alter the artifact the manifest was checked against.
         buffer = getattr(self._out, "buffer", None)
+        if buffer is None:
+            raise RuntimeAttemptError(
+                "terminal does not expose a binary output stream"
+            )
         with normalized(
             RuntimeAttemptError,
             "stimulus could not be displayed",
             catching=FILESYSTEM_SEAM,
         ):
-            if buffer is None:
-                self._out.write(payload.decode("utf-8"))
-                self._out.flush()
-            else:
-                self._out.flush()
-                buffer.write(payload)
-                buffer.flush()
+            self._out.flush()
+            buffer.write(payload)
+            buffer.flush()
 
     def ask_terminal_action(self) -> str:
         with normalized(

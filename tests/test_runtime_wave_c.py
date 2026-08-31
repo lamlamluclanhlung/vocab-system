@@ -1904,13 +1904,35 @@ def test_semantic_export_transport_write_is_bridge_owned(
 # ----------------------------------------------------------------------
 
 
-class BrokenStream:
-    def __init__(self, fail_on: str) -> None:
+class FakeBuffer:
+    def __init__(self, fail_on: str = "none") -> None:
         self.fail_on = fail_on
+        self.written = b""
 
-    def write(self, data) -> int:
+    def write(self, data: bytes) -> int:
+        if self.fail_on == "buffer-write":
+            raise OSError("broken pipe")
+        self.written += data
+        return len(data)
+
+    def flush(self) -> None:
+        if self.fail_on == "buffer-flush":
+            raise OSError("broken pipe")
+
+
+class FakeTextStream:
+    """A text stream exposing a binary boundary, as a real terminal does."""
+
+    def __init__(self, fail_on: str = "none", *, with_buffer: bool = True) -> None:
+        self.fail_on = fail_on
+        self.text = ""
+        if with_buffer:
+            self.buffer = FakeBuffer(fail_on)
+
+    def write(self, data: str) -> int:
         if self.fail_on == "write":
             raise OSError("broken pipe")
+        self.text += data
         return len(data)
 
     def flush(self) -> None:
@@ -1923,19 +1945,46 @@ class BrokenStream:
         return "SKIP\n"
 
 
-@pytest.mark.parametrize("fail_on", ("write", "flush"))
+def test_terminal_writes_exact_bytes_to_the_binary_boundary() -> None:
+    out = FakeTextStream()
+    port = cli._TerminalAttemptPort(FakeTextStream(), out)
+    payload = b"passage line\n\nquestion line"
+    port.display_stimulus(payload)
+    assert out.buffer.written == payload
+    assert out.text == ""
+
+
+def test_terminal_without_a_binary_stream_refuses(monkeypatch) -> None:
+    """No text fallback: decoding could alter the verified artifact."""
+    out = FakeTextStream(with_buffer=False)
+    port = cli._TerminalAttemptPort(FakeTextStream(), out)
+    with pytest.raises(RuntimeAttemptError, match="binary output stream"):
+        port.display_stimulus(b"stimulus")
+    assert out.text == ""
+
+
+@pytest.mark.parametrize("fail_on", ("flush", "buffer-write", "buffer-flush"))
 def test_terminal_display_oserror_is_a_refusal(fail_on: str) -> None:
-    port = cli._TerminalAttemptPort(BrokenStream("none"), BrokenStream(fail_on))
+    port = cli._TerminalAttemptPort(FakeTextStream(), FakeTextStream(fail_on))
     with pytest.raises(RuntimeAttemptError, match="could not be displayed"):
         port.display_stimulus(b"stimulus")
 
 
 def test_terminal_readline_oserror_is_a_refusal() -> None:
     port = cli._TerminalAttemptPort(
-        BrokenStream("readline"), BrokenStream("none")
+        FakeTextStream("readline"), FakeTextStream()
     )
     with pytest.raises(RuntimeAttemptError, match="could not be collected"):
         port.ask_terminal_action()
+
+
+def test_terminal_port_never_decodes_the_payload() -> None:
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    start = source.index("class _TerminalAttemptPort:")
+    end = source.index("\ndef ", start)
+    body = source[start:end]
+    assert "payload.decode" not in body
+    assert ".decode(" not in body
 
 
 def test_terminal_oserror_after_reservation_writes_no_receipt(
@@ -2114,3 +2163,185 @@ def test_no_str_coercion_of_manifest_values(relative: str) -> None:
         r'str\(\s*decoded\[',
     ):
         assert re.search(pattern, source) is None, f"{relative} coerces via {pattern}"
+
+
+# ----------------------------------------------------------------------
+# F3: the plan parser owns malformed JSON only
+# ----------------------------------------------------------------------
+
+
+def test_f3_malformed_json_is_a_plan_refusal() -> None:
+    with pytest.raises(RuntimeSessionPlanError, match="not strict JSON"):
+        parse_session_plan(b"{not json")
+
+
+def test_f3_artifact_json_error_is_a_plan_refusal(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vocab.artifact_json import ArtifactJSONError
+    from vocab.runtime import session_plan
+
+    def raising(raw):
+        raise ArtifactJSONError("duplicate key")
+
+    monkeypatch.setattr(session_plan, "strict_json_loads", raising)
+    with pytest.raises(RuntimeSessionPlanError, match="not strict JSON"):
+        parse_session_plan(plan_bytes(r_item()))
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        pytest.param(TypeError("decoder given the wrong type"), id="TypeError"),
+        pytest.param(ValueError("synthetic bare defect"), id="bare-ValueError"),
+    ),
+)
+def test_f3_decoder_defects_propagate(
+    monkeypatch: pytest.MonkeyPatch, defect: BaseException
+) -> None:
+    """raw_bytes is already type-guarded, so these are defects, not input errors."""
+    from vocab.runtime import session_plan
+
+    def raising(raw):
+        raise defect
+
+    monkeypatch.setattr(session_plan, "strict_json_loads", raising)
+    with pytest.raises(type(defect)):
+        parse_session_plan(plan_bytes(r_item()))
+
+
+# ----------------------------------------------------------------------
+# F2: T12 history preflight excludes the transcription family
+# ----------------------------------------------------------------------
+
+
+def test_f2_transcription_error_from_t12_validation_is_a_defect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """validate_t12_histories cannot raise it, so it must not be swallowed."""
+    from vocab.runtime import preflight
+    from vocab.transcription_ledger import TranscriptionLedgerError
+
+    bootstrap_deployment(tmp_path, FakeAnki([]))
+    plan_path = write_plan(tmp_path, r_item())
+
+    def raising(**kwargs):
+        raise TranscriptionLedgerError("synthetic, unreachable from this call")
+
+    monkeypatch.setattr(preflight, "validate_t12_histories", raising)
+    monkeypatch.setattr(cli, "_build_anki", lambda cfg: assessment_anki())
+    with pytest.raises(TranscriptionLedgerError, match="synthetic"):
+        cli.main(
+            ["session-create", "--config", str(tmp_path / "runtime.json"),
+             "--plan", str(plan_path)]
+        )
+
+
+def test_f2_disposition_error_from_t12_validation_is_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = bootstrap_deployment(tmp_path, FakeAnki([]))
+    layout = build_layout(config.data_root)
+    layout.disposition_path.write_bytes(b'{"torn": true}\n')
+    plan_path = write_plan(tmp_path, r_item())
+    monkeypatch.setattr(cli, "_build_anki", lambda cfg: assessment_anki())
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    assert cli.main(
+        ["session-create", "--config", str(tmp_path / "runtime.json"),
+         "--plan", str(plan_path)]
+    ) == cli.EXIT_REFUSED
+
+
+# ----------------------------------------------------------------------
+# F1/F2/F3/F4 static check, scoped to the exact call sites
+# ----------------------------------------------------------------------
+
+
+def seam_at(relative: str, marker: str) -> str:
+    """Return the catching= argument of the normalized() block for one call."""
+    source = Path(relative).read_text(encoding="utf-8")
+    index = source.index(marker)
+    window = source[:index]
+    block = window.rindex("with normalized(")
+    return source[block:index]
+
+
+@pytest.mark.parametrize(
+    ("relative", "marker", "required", "forbidden"),
+    (
+        pytest.param(
+            "vocab/runtime/semantic_bridge.py", "request = build_semantic_request(",
+            "SEMANTIC_REQUEST_SEAM", ("SEMANTIC_BINDING_SEAM", "SEMANTIC_SEAM"),
+            id="request-construction",
+        ),
+        pytest.param(
+            "vocab/runtime/semantic_bridge.py", "imported = import_semantic_response(",
+            "SEMANTIC_PROPOSAL_SEAM", ("HUMAN_REVIEW_SEAM", "SEMANTIC_BINDING_SEAM"),
+            id="proposal-import",
+        ),
+        pytest.param(
+            "vocab/runtime/semantic_bridge.py", "review = build_human_review(",
+            "HUMAN_REVIEW_SEAM", ("SEMANTIC_PROPOSAL_SEAM", "SEMANTIC_BINDING_SEAM"),
+            id="review-construction",
+        ),
+        pytest.param(
+            "vocab/runtime/semantic_bridge.py", "bundle = bind_t11_semantic_evidence(",
+            "SEMANTIC_BINDING_SEAM", (),
+            id="binder-composite",
+        ),
+        pytest.param(
+            "vocab/runtime/semantic_bridge.py", "appended = emit_planned_judge(",
+            "PRODUCER_SEAM", ("PLANNING_SEAM",),
+            id="producer",
+        ),
+        pytest.param(
+            "vocab/runtime/attempt_runner.py", "permit = reserve_exposure(",
+            "RESERVATION_SEAM", ("ATTEMPT_SEAM",),
+            id="reservation",
+        ),
+        pytest.param(
+            "vocab/runtime/attempt_runner.py", "receipt = close_text_submission(",
+            "TERMINAL_CAPTURE_SEAM", ("RESERVATION_SEAM", "ATTEMPT_SEAM"),
+            id="close-submission",
+        ),
+        pytest.param(
+            "vocab/runtime/preflight.py", "validate_t12_histories(",
+            "T12_HISTORY_SEAM", ("TRANSCRIPTION_SEAM", "LEDGER_SEAM"),
+            id="t12-history-preflight",
+        ),
+        pytest.param(
+            "vocab/runtime/preflight.py", "records = read_transcription_ledger(",
+            "TRANSCRIPTION_SEAM", ("T12_HISTORY_SEAM", "LEDGER_SEAM"),
+            id="transcription-preflight",
+        ),
+    ),
+)
+def test_seam_scoped_to_its_exact_call(
+    relative: str, marker: str, required: str, forbidden: tuple[str, ...]
+) -> None:
+    block = seam_at(relative, marker)
+    assert required in block, f"{marker} should use {required}"
+    for name in forbidden:
+        assert name not in block, f"{marker} must not use {name}"
+
+
+def test_seam_membership_matches_reachability() -> None:
+    from vocab.assessment_evidence import AssessmentEvidenceError
+    from vocab.runtime import normalize as n
+    from vocab.session import SessionManifestError
+    from vocab.transcription_ledger import TranscriptionLedgerError
+
+    assert TranscriptionLedgerError not in n.T12_HISTORY_SEAM
+    assert TranscriptionLedgerError not in n.TEXT_EVIDENCE_SEAM
+    assert SessionManifestError not in n.TERMINAL_CAPTURE_SEAM
+    assert SessionManifestError in n.RESERVATION_SEAM
+    assert AssessmentEvidenceError not in n.PRODUCER_SEAM
+    assert AssessmentEvidenceError in n.TEXT_EVIDENCE_SEAM
+    assert AssessmentEvidenceError in n.SEMANTIC_BINDING_SEAM
+
+
+def test_parse_session_plan_does_not_catch_type_error() -> None:
+    source = Path("vocab/runtime/session_plan.py").read_text(encoding="utf-8")
+    tail = source[source.index("def parse_session_plan("):]
+    assert "except ArtifactJSONError as exc:" in tail
+    assert "TypeError" not in tail.split("def ", 1)[0]

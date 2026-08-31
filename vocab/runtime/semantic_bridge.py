@@ -39,15 +39,18 @@ from .errors import RuntimeAssessmentError, RuntimeSemanticBridgeError
 from .layout import DeploymentLayout
 from .normalize import (
     ANKI_SEAM,
-    MANIFEST_SEAM,
-    PRODUCER_SEAM,
     ARTIFACT_SEAM,
-    EVIDENCE_SEAM,
+    HUMAN_REVIEW_SEAM,
     IDENTITY_SEAM,
-    UNIT_EVIDENCE_SEAM,
+    MANIFEST_SEAM,
     PLANNING_SEAM,
     PRESENCE_SEAM,
-    SEMANTIC_SEAM,
+    PRODUCER_SEAM,
+    SEMANTIC_BINDING_SEAM,
+    SEMANTIC_PROPOSAL_SEAM,
+    SEMANTIC_REQUEST_SEAM,
+    TEXT_EVIDENCE_SEAM,
+    UNIT_EVIDENCE_SEAM,
     normalized,
 )
 from .session_plan import STIMULUS_FIELDS_BY_CHANNEL
@@ -147,7 +150,7 @@ def _load_attempt(layout: DeploymentLayout, artifact_store: ArtifactStore, attem
     with normalized(
         RuntimeAssessmentError,
         "captured attempt could not be reconstructed",
-        catching=EVIDENCE_SEAM,
+        catching=TEXT_EVIDENCE_SEAM,
     ):
         return load_validated_attempt_evidence(
             exposure_path=layout.exposure_path,
@@ -184,7 +187,7 @@ def _expected_request(item, attempt, unit) -> tuple[bytes, str]:
     with normalized(
         RuntimeSemanticBridgeError,
         "semantic request could not be built",
-        catching=SEMANTIC_SEAM,
+        catching=SEMANTIC_REQUEST_SEAM,
     ):
         request = build_semantic_request(
             unit_key=unit.unit_key,
@@ -286,7 +289,7 @@ def emit_policy_assessment(
     with normalized(
         RuntimeAssessmentError,
         "disposition evidence could not be reconstructed",
-        catching=EVIDENCE_SEAM,
+        catching=TEXT_EVIDENCE_SEAM,
     ):
         disposition = load_validated_disposition_evidence(
             exposure_path=layout.exposure_path,
@@ -391,7 +394,7 @@ def emit_semantic_assessment(
     with normalized(
         RuntimeSemanticBridgeError,
         "semantic proposal could not be imported",
-        catching=SEMANTIC_SEAM,
+        catching=SEMANTIC_PROPOSAL_SEAM,
     ):
         from ..artifact_json import strict_json_loads
 
@@ -417,7 +420,7 @@ def emit_semantic_assessment(
     with normalized(
         RuntimeSemanticBridgeError,
         "human review could not be built",
-        catching=SEMANTIC_SEAM,
+        catching=HUMAN_REVIEW_SEAM,
     ):
         review = build_human_review(
             imported_proposal=imported,
@@ -437,7 +440,7 @@ def emit_semantic_assessment(
     with normalized(
         RuntimeSemanticBridgeError,
         "semantic evidence could not be bound",
-        catching=SEMANTIC_SEAM,
+        catching=SEMANTIC_BINDING_SEAM,
     ):
         bundle = bind_t11_semantic_evidence(
             request_raw=request_raw,

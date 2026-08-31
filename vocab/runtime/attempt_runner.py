@@ -26,9 +26,10 @@ from .errors import RuntimeAttemptError
 from .layout import DeploymentLayout
 from .normalize import (
     ARTIFACT_SEAM,
-    ATTEMPT_SEAM,
     FILESYSTEM_SEAM,
     MANIFEST_SEAM,
+    RESERVATION_SEAM,
+    TERMINAL_CAPTURE_SEAM,
     normalized,
 )
 
@@ -151,7 +152,7 @@ def run_fresh_attempt(
     with normalized(
         RuntimeAttemptError,
         "exposure could not be reserved",
-        catching=ATTEMPT_SEAM,
+        catching=RESERVATION_SEAM,
     ):
         permit = reserve_exposure(
             exposure_path=layout.exposure_path,
@@ -197,7 +198,7 @@ def run_fresh_attempt(
         with normalized(
             RuntimeAttemptError,
             "text submission could not be closed",
-            catching=ATTEMPT_SEAM,
+            catching=TERMINAL_CAPTURE_SEAM,
         ):
             receipt = close_text_submission(
                 raw_bytes=raw_bytes,
@@ -209,14 +210,14 @@ def run_fresh_attempt(
         with normalized(
             RuntimeAttemptError,
             "explicit skip could not be recorded",
-            catching=ATTEMPT_SEAM,
+            catching=TERMINAL_CAPTURE_SEAM,
         ):
             receipt = record_explicit_skip(disposed_at=clock(), **common)
     else:
         with normalized(
             RuntimeAttemptError,
             "refusal could not be recorded",
-            catching=ATTEMPT_SEAM,
+            catching=TERMINAL_CAPTURE_SEAM,
         ):
             receipt = record_refusal(disposed_at=clock(), **common)
 
