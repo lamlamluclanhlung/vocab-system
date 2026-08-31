@@ -12,7 +12,7 @@ notes. Dormancy suspends cards and preserves the note and its revlog.
 Core layers T6 through T12.4 are complete and gated. The operational runtime
 (decision D70) is at Wave B: a deployment can be created and diagnosed, Units
 can be forged through a human-mediated bridge, lifecycle can be reconciled, and
-corpus months can be scanned. Assessment session orchestration is Wave C. T8
+corpus months can be scanned. Wave C adds R and W assessment sessions under D71. L and S remain deliberately non-operational. T8
 keeps its own CLI for now.
 
 ## Requirements

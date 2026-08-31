@@ -10,7 +10,13 @@ from ..exposure import validate_t12_histories
 from ..transcription_ledger import read_transcription_ledger
 from .config import RuntimeConfig
 from .errors import RuntimePreflightError, VocabRuntimeError
-from .normalize import ANKI_SEAM, ARTIFACT_SEAM, LEDGER_SEAM, normalized
+from .normalize import (
+    ANKI_SEAM,
+    ARTIFACT_SEAM,
+    LEDGER_SEAM,
+    TRANSCRIPTION_SEAM,
+    normalized,
+)
 from .eventlog_authority import open_runtime_event_log
 from .identity import read_identity
 from .layout import DeploymentLayout, missing_durable_entries
@@ -180,7 +186,9 @@ def run_runtime_write_preflight(
 
     def transcriptions() -> str:
         with normalized(
-            RuntimePreflightError, "transcription ledger", catching=LEDGER_SEAM
+            RuntimePreflightError,
+            "transcription ledger",
+            catching=TRANSCRIPTION_SEAM,
         ):
             records = read_transcription_ledger(layout.transcription_path)
         return f"{len(records)} records"

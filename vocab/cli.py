@@ -22,8 +22,12 @@ from .runtime.bootstrap import create_deployment, evaluate_preconditions
 from .runtime.config import RuntimeConfig, load_config
 from .runtime.corpus_runner import run_corpus_scan
 from .runtime.errors import (
+    RuntimeAssessmentError,
+    RuntimeAttemptError,
     RuntimeForgeBridgeError,
     RuntimeLockError,
+    RuntimeSemanticBridgeError,
+    RuntimeSessionPlanError,
     VocabRuntimeError,
 )
 from .runtime.eventlog_authority import open_runtime_event_log
@@ -32,6 +36,9 @@ from .runtime.normalize import FILESYSTEM_SEAM, normalized
 from .runtime.operation import write_operation
 from .runtime.preflight import run_standalone_preflight
 from .runtime.reconcile_runner import run_reconcile
+from .runtime import assessment_session, attempt_runner, semantic_bridge
+from .runtime.artifact_store_gate import open_deployment_artifact_store
+from .runtime.session_plan import parse_session_plan
 from .runtime.targets import resolve_targets
 
 
@@ -101,11 +108,18 @@ def _command_bootstrap(arguments: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
-def _read_artifact(path: Path, label: str) -> bytes:
+def _read_artifact(
+    path: Path,
+    label: str,
+    error_type: type[VocabRuntimeError] = RuntimeForgeBridgeError,
+) -> bytes:
+    """Read one transport file, owned by the caller's own error family.
+
+    Ownership is passed explicitly rather than inferred from the filename, so a
+    Wave C plan or proposal never surfaces as a Forge bridge failure.
+    """
     with normalized(
-        RuntimeForgeBridgeError,
-        f"{label} could not be read",
-        catching=FILESYSTEM_SEAM,
+        error_type, f"{label} could not be read", catching=FILESYSTEM_SEAM
     ):
         return path.read_bytes()
 
@@ -221,6 +235,174 @@ def _command_corpus_scan(arguments: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+class _TerminalAttemptPort:
+    """The production display and interaction boundary for one attempt.
+
+    Only the exact stream calls are wrapped. A failing terminal after a durable
+    reservation is an operational refusal: the reservation stands, nothing is
+    captured, and nothing is redisplayed.
+    """
+
+    def __init__(self, stream_in, stream_out) -> None:
+        self._in = stream_in
+        self._out = stream_out
+
+    def display_stimulus(self, payload: bytes) -> None:
+        # Exact bytes, with no added newline and no operator text mixed in.
+        buffer = getattr(self._out, "buffer", None)
+        with normalized(
+            RuntimeAttemptError,
+            "stimulus could not be displayed",
+            catching=FILESYSTEM_SEAM,
+        ):
+            if buffer is None:
+                self._out.write(payload.decode("utf-8"))
+                self._out.flush()
+            else:
+                self._out.flush()
+                buffer.write(payload)
+                buffer.flush()
+
+    def ask_terminal_action(self) -> str:
+        with normalized(
+            RuntimeAttemptError,
+            "terminal action could not be collected",
+            catching=FILESYSTEM_SEAM,
+        ):
+            self._out.write(
+                "\n\n--- action required: SUBMIT / SKIP / REFUSE ---\n> "
+            )
+            self._out.flush()
+            answer = self._in.readline()
+        return answer.strip().upper()
+
+
+def _command_session_create(arguments: argparse.Namespace) -> int:
+    config = load_config(Path(arguments.config))
+    anki = _build_anki(config)
+
+    # D70 section 11: reading and parsing the plan is operation-specific work,
+    # so it may only run once identity, the lock, and the full write-preflight
+    # have all passed.
+    with write_operation(config, anki) as layout:
+        plan = parse_session_plan(
+            _read_artifact(
+                Path(arguments.plan), "session plan", RuntimeSessionPlanError
+            )
+        )
+        store = open_deployment_artifact_store(layout)
+        result = assessment_session.create_session(
+            plan,
+            anki=anki,
+            artifact_store=store,
+            session_root=layout.session_root,
+        )
+    print(f"session_id  {result.session_id}")
+    print(f"created_at  {result.created_at}")
+    print(f"items       {result.item_count}")
+    return EXIT_SUCCESS
+
+
+def _command_attempt_run(arguments: argparse.Namespace) -> int:
+    config = load_config(Path(arguments.config))
+    anki = _build_anki(config)
+    response_file = (
+        Path(arguments.response_file) if arguments.response_file else None
+    )
+
+    with write_operation(config, anki) as layout:
+        store = open_deployment_artifact_store(layout)
+        outcome = attempt_runner.run_fresh_attempt(
+            layout,
+            session_id=arguments.session_id,
+            item_ordinal=arguments.item_ordinal,
+            artifact_store=store,
+            port=_TerminalAttemptPort(_sys.stdin, _sys.stdout),
+            response_file=response_file,
+        )
+    print(
+        f"\nattempt {outcome.attempt_id}  {outcome.unit_key}  "
+        f"{outcome.channel}  {outcome.action}  {outcome.receipt_kind}"
+    )
+    return EXIT_SUCCESS
+
+
+def _command_semantic_export(arguments: argparse.Namespace) -> int:
+    config = load_config(Path(arguments.config))
+    anki = _build_anki(config)
+
+    with write_operation(config, anki) as layout:
+        store = open_deployment_artifact_store(layout)
+        result = semantic_bridge.export_semantic_request(
+            layout,
+            session_id=arguments.session_id,
+            item_ordinal=arguments.item_ordinal,
+            artifact_store=store,
+            anki=anki,
+        )
+        if arguments.out:
+            out = Path(arguments.out)
+            with normalized(
+                RuntimeSemanticBridgeError,
+                "transport copy could not be written",
+                catching=FILESYSTEM_SEAM,
+            ):
+                with out.open("xb") as handle:
+                    handle.write(result.canonical_bytes)
+    print(f"attempt_id      {result.attempt_id}")
+    print(f"request_ref     {result.request_ref}")
+    print(f"request_digest  {result.request_digest}")
+    return EXIT_SUCCESS
+
+
+def _command_assess(arguments: argparse.Namespace) -> int:
+    config = load_config(Path(arguments.config))
+    anki = _build_anki(config)
+    proposal = Path(arguments.proposal) if arguments.proposal else None
+
+    with write_operation(config, anki) as layout:
+        store = open_deployment_artifact_store(layout)
+        # The journal is acquired lazily, at the emission boundary only, so a
+        # rejected request, proposal, or plan never reaches the authority.
+        common = {
+            "session_id": arguments.session_id,
+            "item_ordinal": arguments.item_ordinal,
+            "artifact_store": store,
+            "anki": anki,
+            "open_event_log": lambda: open_runtime_event_log(
+                layout.event_log_path
+            ),
+        }
+        if arguments.path == "policy":
+            result = semantic_bridge.emit_policy_assessment(layout, **common)
+        elif arguments.path == "omitted":
+            result = semantic_bridge.emit_omitted_assessment(layout, **common)
+        else:
+            if proposal is None:
+                raise RuntimeAssessmentError(
+                    "the semantic path requires --proposal"
+                )
+            result = semantic_bridge.emit_semantic_assessment(
+                layout,
+                request_ref=arguments.request_ref,
+                proposal_bytes=_read_artifact(
+                    proposal, "semantic proposal", RuntimeSemanticBridgeError
+                ),
+                assessor_id=arguments.assessor_id,
+                assessor_version=arguments.assessor_version,
+                reviewer_id=arguments.reviewer_id,
+                reviewer_version=arguments.reviewer_version,
+                decision=arguments.decision,
+                **common,
+            )
+    print(
+        f"{result.path}  attempt={result.attempt_id}  "
+        f"unit={result.unit_key}  channel={result.channel}  "
+        f"appended={result.appended}"
+    )
+    return EXIT_SUCCESS
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the frozen Wave A command surface."""
     parser = argparse.ArgumentParser(
@@ -293,6 +475,59 @@ def build_parser() -> argparse.ArgumentParser:
     corpus_scan.add_argument("--source", required=True)
     corpus_scan.add_argument("--month", required=True)
     corpus_scan.set_defaults(handler=_command_corpus_scan)
+
+    session_create = subparsers.add_parser(
+        "session-create",
+        help="publish one human-authored R/W assessment session",
+    )
+    session_create.add_argument("--config", required=True)
+    session_create.add_argument("--plan", required=True)
+    session_create.set_defaults(handler=_command_session_create)
+
+    attempt_run = subparsers.add_parser(
+        "attempt-run",
+        help="run one fresh assessment attempt in this process",
+    )
+    attempt_run.add_argument("--config", required=True)
+    attempt_run.add_argument("--session-id", required=True, dest="session_id")
+    attempt_run.add_argument(
+        "--item-ordinal", required=True, type=int, dest="item_ordinal"
+    )
+    attempt_run.add_argument("--response-file", dest="response_file")
+    attempt_run.set_defaults(handler=_command_attempt_run)
+
+    semantic_export = subparsers.add_parser(
+        "semantic-export",
+        help="store one attempt-bound canonical T11 semantic request",
+    )
+    semantic_export.add_argument("--config", required=True)
+    semantic_export.add_argument("--session-id", required=True, dest="session_id")
+    semantic_export.add_argument(
+        "--item-ordinal", required=True, type=int, dest="item_ordinal"
+    )
+    semantic_export.add_argument("--out")
+    semantic_export.set_defaults(handler=_command_semantic_export)
+
+    assess = subparsers.add_parser(
+        "assess",
+        help="emit the final T12 JUDGE for one attempt",
+    )
+    assess.add_argument("--config", required=True)
+    assess.add_argument("--session-id", required=True, dest="session_id")
+    assess.add_argument(
+        "--item-ordinal", required=True, type=int, dest="item_ordinal"
+    )
+    assess.add_argument(
+        "--path", required=True, choices=("policy", "omitted", "semantic")
+    )
+    assess.add_argument("--request-ref", dest="request_ref")
+    assess.add_argument("--proposal")
+    assess.add_argument("--assessor-id", dest="assessor_id")
+    assess.add_argument("--assessor-version", dest="assessor_version")
+    assess.add_argument("--reviewer-id", dest="reviewer_id")
+    assess.add_argument("--reviewer-version", type=int, dest="reviewer_version")
+    assess.add_argument("--decision")
+    assess.set_defaults(handler=_command_assess)
 
     return parser
 

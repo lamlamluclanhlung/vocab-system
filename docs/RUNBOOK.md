@@ -177,6 +177,93 @@ python -m vocab.cli corpus-scan --config runtime.json --source bbc --month 2026-
 Reads `<corpus_root>/<month>`. Rerunning the same source, month, and corpus
 content appends nothing and still exits 0; T10 owns that identity.
 
+## Assessment (R and W only)
+
+L and S are deliberately not operational: no decision freezes the L audio
+rendering path, and the repository has no production speech-to-text.
+
+You author the session. Nothing selects Units, channels, session size, or
+stimulus text for you.
+
+```json
+{
+  "artifact": "vocab.t12.session-plan",
+  "v": 1,
+  "items": [
+    {"unit_key": "subtle::small-difference", "channel": "R",
+     "passage": "...", "question": "..."},
+    {"unit_key": "meticulous::careful", "channel": "W",
+     "production_prompt": "...", "semantic_constraints": "..."}
+  ]
+}
+```
+
+```
+python -m vocab.cli session-create --config runtime.json --plan plan.json
+```
+
+Every requested Unit is validated through the full evidence boundary before
+anything is written, so one bad item creates nothing. Prints the `session_id`.
+
+### Running one attempt
+
+```
+python -m vocab.cli attempt-run --config runtime.json \
+    --session-id <id> --item-ordinal 0 --response-file answer.txt
+```
+
+One attempt, one process. The stimulus is shown first; only then are you asked
+for `SUBMIT`, `SKIP`, or `REFUSE`. There are no `--skip` or `--refuse` flags,
+because a skip and a refusal are learner actions, not invocation options. The
+response file is not opened until you choose SUBMIT.
+
+Interruption depends on how far the attempt got.
+
+Interrupted **after the reservation but before a capture or disposition is
+durable** — including while the stimulus is on screen and while you are being
+asked for the action — that attempt is abandoned. It is never redisplayed, and
+no disposition is invented for it. Move to the next ordinal.
+
+Once a capture or disposition **is** durable, the attempt is not lost. Later
+assessment resumes from that durable record, so do not start a new attempt
+merely because printing or process exit was interrupted after the receipt was
+written. Run `assess` for that same `--item-ordinal`.
+
+### Assessing
+
+For a skip, refusal, empty, or unusable response:
+
+```
+python -m vocab.cli assess --config runtime.json \
+    --session-id <id> --item-ordinal 0 --path policy
+```
+
+For a W response that does not contain the target at all:
+
+```
+python -m vocab.cli assess --config runtime.json \
+    --session-id <id> --item-ordinal 0 --path omitted
+```
+
+Otherwise export the semantic request, take it to ChatGPT yourself, save the
+reply, then assess:
+
+```
+python -m vocab.cli semantic-export --config runtime.json \
+    --session-id <id> --item-ordinal 0 --out request.json
+
+python -m vocab.cli assess --config runtime.json \
+    --session-id <id> --item-ordinal 0 --path semantic \
+    --request-ref sha256:<printed> --proposal proposal.json \
+    --assessor-id <model you used> --assessor-version <its version> \
+    --reviewer-id <you> --reviewer-version 1 --decision APPROVE
+```
+
+You review the model's proposal; `REJECT` produces an ABSTAIN rather than a
+verdict. Nothing defaults the assessor or reviewer identity.
+
+Assessment ends at evidence. Lifecycle only moves when you run `reconcile`.
+
 ## Release gate
 
 ```

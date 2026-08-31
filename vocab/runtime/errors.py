@@ -49,3 +49,23 @@ class RuntimeReconcileError(VocabRuntimeError):
 
 class RuntimeCorpusError(VocabRuntimeError):
     """Raised when a corpus scan cannot be counted or emitted."""
+
+
+class RuntimeSessionPlanError(VocabRuntimeError):
+    """Raised when a Wave C session-plan artifact violates the D71 schema."""
+
+
+class RuntimeSessionCreationError(VocabRuntimeError):
+    """Raised when a Wave C session cannot be composed or published."""
+
+
+class RuntimeAttemptError(VocabRuntimeError):
+    """Raised when a fresh Wave C assessment attempt cannot proceed."""
+
+
+class RuntimeSemanticBridgeError(VocabRuntimeError):
+    """Raised when the Wave C T11 transport or binding cannot be trusted."""
+
+
+class RuntimeAssessmentError(VocabRuntimeError):
+    """Raised when Wave C assessment evidence cannot be planned or emitted."""
